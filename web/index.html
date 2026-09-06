@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>ChessRL</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 45 45'%3E%3Cpath fill='%232b3038' d='M20.5 9.5 22.4 5.6l2.3 4.3 2.9-2.7 1.3 4.3c2.8 3.6 4.7 8.8 4.7 14.7 0 3.2-.4 5.7-1 7.8H13.4c0-3.3 1.1-5.9 3-8.1 1.6-1.9 3.1-3.2 3.1-4.5 0-.9-.6-1.4-1.4-1.4-1.4 0-2.4 1.2-3.6 2.6-1.1 1.3-2.2 2.2-3.4 2.2-1.6 0-2.5-1.2-2.5-3 0-2.6 1.1-5.2 3.1-7.6 2.2-2.7 5.4-4.2 8.8-4.7z'/%3E%3Crect fill='%232b3038' x='10.4' y='33.4' width='24.2' height='3.7' rx='1.3'/%3E%3Crect fill='%232b3038' x='7.3' y='37.1' width='30.4' height='4.5' rx='1.8'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <rect x="1" y="1" width="14" height="14" rx="2.5"/>
+      <rect x="17" y="17" width="14" height="14" rx="2.5"/>
+      <rect class="hollow" x="17.9" y="1.9" width="12.2" height="12.2" rx="2"/>
+      <rect class="hollow" x="1.9" y="17.9" width="12.2" height="12.2" rx="2"/>
+    </svg>
+    <div class="brand-text">
+      <span class="brand-name">ChessRL</span>
+      <span class="brand-sub" id="brand-sub">population self-play</span>
+    </div>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button class="tab is-active" role="tab" id="tab-play"   aria-controls="view-play"   aria-selected="true"  data-view="play">Play</button>
+    <button class="tab"           role="tab" id="tab-watch"  aria-controls="view-watch"  aria-selected="false" data-view="watch">Watch</button>
+    <button class="tab"           role="tab" id="tab-report" aria-controls="view-report" aria-selected="false" data-view="report">Report</button>
+  </nav>
+
+  <div class="topbar-right">
+    <span class="model-chip" id="model-chip" title="Loaded model">
+      <span class="dot" id="model-dot"></span><span id="model-label">connecting…</span>
+    </span>
+    <button class="icon-btn" id="theme-btn" title="Toggle theme" aria-label="Toggle colour theme">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-sun"><circle cx="12" cy="12" r="4.4"/><g class="rays"><path d="M12 1.6v3M12 19.4v3M1.6 12h3M19.4 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M19.4 4.6l-2.1 2.1M6.7 17.3l-2.1 2.1"/></g></svg>
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-moon"><path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.7 8.7 0 1 0 11.1 11.1z"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ============================================================== PLAY -->
+<section class="view view-play is-active" id="view-play" role="tabpanel" aria-labelledby="tab-play">
+  <div class="play-grid">
+
+    <div class="board-column">
+      <div class="player-strip" id="strip-top">
+        <div class="pl-id">
+          <span class="pl-avatar" id="avatar-top"></span>
+          <span class="pl-meta">
+            <span class="pl-name" id="name-top">Champion</span>
+            <span class="pl-sub" id="sub-top">depth 4</span>
+          </span>
+        </div>
+        <div class="tray" id="tray-top" aria-label="Captured pieces"></div>
+        <div class="pl-adv" id="adv-top"></div>
+        <div class="pl-clock" id="clock-top">—</div>
+      </div>
+
+      <div class="board-frame">
+        <div class="board" id="board" tabindex="0" role="application"
+             aria-label="Chess board. Use the move list or the mouse to play.">
+          <div class="layer squares" id="sq-layer"></div>
+          <div class="layer marks"   id="mark-layer"></div>
+          <div class="layer pieces"  id="piece-layer"></div>
+          <div class="layer hints"   id="hint-layer"></div>
+          <div class="layer coords"  id="coord-layer"></div>
+          <div class="promo-overlay" id="promo" hidden></div>
+        </div>
+        <div class="board-banner" id="banner" hidden>
+          <div class="banner-inner">
+            <span class="banner-icon" id="banner-icon"></span>
+            <div class="banner-text">
+              <strong id="banner-title">Checkmate</strong>
+              <span id="banner-sub">White wins</span>
+            </div>
+            <button class="btn btn-sm" id="banner-again">New game</button>
+          </div>
+        </div>
+        <div class="board-veil" id="thinking" hidden><span class="spinner"></span><span>thinking…</span></div>
+      </div>
+
+      <div class="player-strip" id="strip-bottom">
+        <div class="pl-id">
+          <span class="pl-avatar" id="avatar-bot"></span>
+          <span class="pl-meta">
+            <span class="pl-name" id="name-bot">You</span>
+            <span class="pl-sub" id="sub-bot">human</span>
+          </span>
+        </div>
+        <div class="tray" id="tray-bot" aria-label="Captured pieces"></div>
+        <div class="pl-adv" id="adv-bot"></div>
+        <div class="pl-clock" id="clock-bot">—</div>
+      </div>
+    </div>
+
+    <aside class="side-panel">
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>New game</h2>
+        </div>
+        <div class="panel-body form-grid">
+          <label class="field">
+            <span>Play as</span>
+            <select id="sel-color">
+              <option value="white" selected>White</option>
+              <option value="black">Black</option>
+              <option value="random">Random</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Strength</span>
+            <select id="sel-level">
+              <option value="1">1 · Novice</option>
+              <option value="2">2 · Casual</option>
+              <option value="3">3 · Club</option>
+              <option value="4" selected>4 · Strong</option>
+              <option value="5">5 · Champion</option>
+            </select>
+          </label>
+          <button class="btn btn-primary btn-wide" id="btn-new">Start</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Engine</h2>
+          <span class="pill" id="eval-pill">0.00</span>
+        </div>
+        <div class="panel-body">
+          <div class="evalbar" id="evalbar" role="img" aria-label="Evaluation">
+            <div class="evalbar-black"></div>
+            <div class="evalbar-white" id="evalbar-white" style="width:50%"></div>
+            <div class="evalbar-mid"></div>
+          </div>
+          <dl class="stats" id="engine-stats">
+            <div><dt>depth</dt><dd id="st-depth">—</dd></div>
+            <div><dt>nodes</dt><dd id="st-nodes">—</dd></div>
+            <div><dt>time</dt><dd id="st-time">—</dd></div>
+            <div><dt>knps</dt><dd id="st-nps">—</dd></div>
+          </dl>
+          <div class="cand-head">Top candidates</div>
+          <ul class="cands" id="cands">
+            <li class="cand empty"><span class="cand-san">—</span></li>
+            <li class="cand empty"><span class="cand-san">—</span></li>
+            <li class="cand empty"><span class="cand-san">—</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel panel-moves">
+        <div class="panel-head">
+          <h2>Moves</h2>
+          <div class="scrub" id="scrub">
+            <button class="icon-btn sm" id="mv-start" title="First move" aria-label="Go to start">&#124;&#9664;</button>
+            <button class="icon-btn sm" id="mv-prev"  title="Previous"   aria-label="Previous move">&#9664;</button>
+            <button class="icon-btn sm" id="mv-next"  title="Next"       aria-label="Next move">&#9654;</button>
+            <button class="icon-btn sm" id="mv-end"   title="Latest"     aria-label="Go to latest">&#9654;&#124;</button>
+          </div>
+        </div>
+        <div class="panel-body moves-body">
+          <ol class="movelist" id="movelist"></ol>
+          <p class="empty-note" id="moves-empty">No moves yet.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body actions">
+          <button class="btn" id="btn-undo"   title="Take back your last move">Undo</button>
+          <button class="btn" id="btn-flip"   title="Flip the board">Flip</button>
+          <button class="btn" id="btn-hint"   title="Ask the engine for a suggestion">Hint</button>
+          <button class="btn btn-danger" id="btn-resign">Resign</button>
+        </div>
+      </div>
+
+    </aside>
+  </div>
+</section>
+
+<!-- ============================================================= WATCH -->
+<section class="view view-watch" id="view-watch" role="tabpanel" aria-labelledby="tab-watch" hidden>
+  <div class="watch-grid">
+
+    <div class="board-column">
+      <div class="player-strip">
+        <div class="pl-id">
+          <span class="pl-avatar dark" id="w-avatar-top"></span>
+          <span class="pl-meta">
+            <span class="pl-name" id="w-name-top">Black</span>
+            <span class="pl-sub"  id="w-sub-top">—</span>
+          </span>
+        </div>
+        <div class="tray" id="w-tray-top"></div>
+        <div class="pl-adv" id="w-adv-top"></div>
+      </div>
+
+      <div class="board-frame">
+        <div class="board" id="w-board">
+          <div class="layer squares" id="w-sq-layer"></div>
+          <div class="layer marks"   id="w-mark-layer"></div>
+          <div class="layer pieces"  id="w-piece-layer"></div>
+          <div class="layer hints"   id="w-hint-layer"></div>
+          <div class="layer coords"  id="w-coord-layer"></div>
+        </div>
+        <div class="board-veil" id="w-thinking" hidden><span class="spinner"></span><span>playing the game…</span></div>
+      </div>
+
+      <div class="player-strip">
+        <div class="pl-id">
+          <span class="pl-avatar" id="w-avatar-bot"></span>
+          <span class="pl-meta">
+            <span class="pl-name" id="w-name-bot">White</span>
+            <span class="pl-sub"  id="w-sub-bot">—</span>
+          </span>
+        </div>
+        <div class="tray" id="w-tray-bot"></div>
+        <div class="pl-adv" id="w-adv-bot"></div>
+      </div>
+
+      <div class="transport">
+        <button class="icon-btn" id="w-first" title="First" aria-label="First position">&#124;&#9664;</button>
+        <button class="icon-btn" id="w-back"  title="Step back" aria-label="Step back">&#9664;</button>
+        <button class="icon-btn play-btn" id="w-play" title="Play / pause" aria-label="Play or pause">
+          <svg viewBox="0 0 24 24" class="ico-play" aria-hidden="true"><path d="M8 5.2v13.6L19 12z"/></svg>
+          <svg viewBox="0 0 24 24" class="ico-pause" aria-hidden="true"><path d="M7.5 5h3.2v14H7.5zM13.3 5h3.2v14h-3.2z"/></svg>
+        </button>
+        <button class="icon-btn" id="w-fwd"   title="Step forward" aria-label="Step forward">&#9654;</button>
+        <button class="icon-btn" id="w-last"  title="Last" aria-label="Last position">&#9654;&#124;</button>
+        <input class="range flex" id="w-seek" type="range" min="0" max="0" value="0" aria-label="Scrub through the game">
+        <span class="ply-count" id="w-plylabel">0 / 0</span>
+      </div>
+
+      <div class="transport sub">
+        <label class="speed">
+          <span>speed</span>
+          <input class="range" id="w-speed" type="range" min="1" max="20" step="1" value="4" aria-label="Playback speed">
+          <output id="w-speed-out">4/s</output>
+        </label>
+        <button class="icon-btn" id="w-flip" title="Flip board" aria-label="Flip board">&#8645;</button>
+      </div>
+    </div>
+
+    <aside class="side-panel">
+      <div class="panel">
+        <div class="panel-head"><h2>Match-up</h2></div>
+        <div class="panel-body form-grid">
+          <label class="field">
+            <span>White</span>
+            <select id="w-sel-a"><option value="">best agent</option></select>
+          </label>
+          <label class="field">
+            <span>Black</span>
+            <select id="w-sel-b"><option value="">random agent</option></select>
+          </label>
+          <button class="btn btn-primary btn-wide" id="w-go">Generate game</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Evaluation</h2>
+          <span class="pill" id="w-eval-pill">0.00</span>
+        </div>
+        <div class="panel-body">
+          <div class="chart chart-sm" id="w-evalchart"></div>
+        </div>
+      </div>
+
+      <div class="panel panel-moves">
+        <div class="panel-head">
+          <h2>Moves</h2>
+          <span class="pill subtle" id="w-result">—</span>
+        </div>
+        <div class="panel-body moves-body">
+          <ol class="movelist" id="w-movelist"></ol>
+          <p class="empty-note" id="w-moves-empty">Generate a game to watch.</p>
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ============================================================ REPORT -->
+<section class="view view-report" id="view-report" role="tabpanel" aria-labelledby="tab-report" hidden>
+  <div class="report-wrap" id="report-wrap">
+    <div class="report-loading" id="report-loading">
+      <span class="spinner"></span><span>loading the strategy analysis…</span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
