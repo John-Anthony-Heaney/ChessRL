@@ -1,0 +1,9 @@
+build/
+*.o
+*.so
+*.dylib
+runs/*/
+!runs/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
