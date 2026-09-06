@@ -760,6 +760,34 @@ static void test_gen_sanity(void)
     int before = g_fail;
     section("generator sanity (legal-only, captures subset)");
 
+    /* In check: only evasions may be generated, and gen_legal_captures must
+     * narrow to captures of the checker (no quiet blocks, no king shuffles). */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "4k3/8/8/8/4q3/6N1/2B5/4K3 w - - 0 1"), "check FEN");
+        CHECK(in_check(&p, WHITE), "white should be in check from Qe4");
+
+        Move all[MAX_MOVES], caps[MAX_MOVES];
+        int na = gen_legal(&p, all);
+        int nc = gen_legal_captures(&p, caps);
+        CHECK(na == 7, "evasions: got %d, want 7 (Kd1 Kd2 Kf1 Kf2 Bxe4 Nxe4 Nge2)", na);
+        CHECK(nc == 2, "capture evasions: got %d, want 2 (Bxe4, Nxe4)", nc);
+        CHECK(uci_legal(&p, "c2e4") && uci_legal(&p, "g3e4"), "Bxe4 / Nxe4 missing");
+        CHECK(uci_legal(&p, "g3e2"), "the blocking Nge2 is missing");
+        CHECK(!uci_legal(&p, "e1e2"), "the king may not step along the checking ray");
+    }
+    /* Double check: only king moves. */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "4k3/8/8/8/4q3/5n2/2B5/4K3 w - - 0 1"), "double-check FEN");
+        Move all[MAX_MOVES];
+        int na = gen_legal(&p, all);
+        for (int i = 0; i < na; i++)
+            CHECK(p.board[MV_FROM(all[i])] == KING,
+                  "non-king move generated while in double check");
+        CHECK(na > 0, "double check should still leave the king a square");
+    }
+
     static const char *fens[] = {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -767,6 +795,8 @@ static void test_gen_sanity(void)
         "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
         "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "4k3/8/8/8/4q3/6N1/2B5/4K3 w - - 0 1",
+        "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
     };
 
     for (size_t i = 0; i < sizeof(fens) / sizeof(fens[0]); i++) {

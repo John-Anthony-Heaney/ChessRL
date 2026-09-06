@@ -2,7 +2,7 @@
 
 CC      ?= cc
 ARCH    := $(shell $(CC) -mcpu=native -E -x c /dev/null >/dev/null 2>&1 && echo -mcpu=native)
-CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter -funroll-loops \
+CFLAGS  ?= -O3 -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Wno-unused-parameter -funroll-loops \
            -fno-math-errno -ffp-contract=fast $(ARCH) -Isrc
 LDFLAGS ?= -lm -lpthread
 BUILD   := build
@@ -43,7 +43,7 @@ $(BUILD)/test_net: tests/test_net.c $(CORE_OBJ)
 bench: $(BUILD)/chessrl
 	$(BUILD)/chessrl bench
 
-debug: CFLAGS := -O0 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -Isrc
+debug: CFLAGS := -O0 -g -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -Isrc
 debug: clean $(BUILD)/chessrl
 
 clean:
