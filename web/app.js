@@ -833,12 +833,16 @@ function legend(items) {
 /* PLAY view                                                                  */
 /* ========================================================================== */
 
+/* Strength is depth + movetime only.  /api/ai and /api/hint accept exactly
+   {gid, depth, movetime} and reject any other field with HTTP 400, so there is
+   no "blunder" knob to send -- see docs/API.md.  The server clamps depth to
+   1..8 and movetime to 10..15000 ms. */
 const LEVELS = {
-  1: { depth: 1, movetime: 120, blunder: 0.35, name: 'Novice' },
-  2: { depth: 2, movetime: 250, blunder: 0.18, name: 'Casual' },
-  3: { depth: 3, movetime: 450, blunder: 0.07, name: 'Club' },
-  4: { depth: 4, movetime: 800, blunder: 0.02, name: 'Strong' },
-  5: { depth: 5, movetime: 1500, blunder: 0.0, name: 'Champion' }
+  1: { depth: 1, movetime: 100, name: 'Novice' },
+  2: { depth: 2, movetime: 250, name: 'Casual' },
+  3: { depth: 3, movetime: 450, name: 'Club' },
+  4: { depth: 4, movetime: 800, name: 'Strong' },
+  5: { depth: 6, movetime: 2500, name: 'Champion' }
 };
 
 const REASON_TEXT = {
@@ -911,13 +915,18 @@ const Play = {
 
   /* ------------------------------------------------------------- game flow */
 
+  setBusy(v) {
+    this.busy = !!v;
+    this.paintControls();
+  },
+
   async newGame() {
     let want = $('sel-color').value;
     store('color', want);
     if (want === 'random') want = Math.random() < 0.5 ? 'white' : 'black';
     this.level = +$('sel-level').value || 4;
 
-    this.busy = true;
+    this.setBusy(true);
     this.setThinking(false);
     try {
       const r = await api('/api/new?human=' + encodeURIComponent(want));
@@ -940,14 +949,14 @@ const Play = {
       reportError(e, 'Could not start a game');
       this.gid = null;
     } finally {
-      this.busy = false;
+      this.setBusy(false);
       this.maybeEngine();
     }
   },
 
   async playHuman(uci) {
     if (this.gid == null || this.busy) return;
-    this.busy = true;
+    this.setBusy(true);
     this.hint = null;
     try {
       const r = await apiPost('/api/move', { gid: this.gid, move: uci });
@@ -957,7 +966,7 @@ const Play = {
       reportError(e, 'Move rejected');
       await this.refresh();
     } finally {
-      this.busy = false;
+      this.setBusy(false);
       this.maybeEngine();
     }
   },
@@ -972,12 +981,12 @@ const Play = {
 
   async engineMove() {
     const lv = LEVELS[this.level] || LEVELS[4];
-    this.busy = true;
+    this.setBusy(true);
     this.setThinking(true);
     const t0 = performance.now();
     try {
       const r = await apiPost('/api/ai', {
-        gid: this.gid, depth: lv.depth, movetime: lv.movetime, blunder: lv.blunder
+        gid: this.gid, depth: lv.depth, movetime: lv.movetime
       });
       this.engine = {
         move: r.move, san: r.san, score: r.score, depth: r.depth, nodes: r.nodes,
@@ -992,7 +1001,7 @@ const Play = {
       reportError(e, 'The engine failed to move');
     } finally {
       this.setThinking(false);
-      this.busy = false;
+      this.setBusy(false);
       if (this.state && !this.state.result && !this.resigned && this.state.turn !== this.human) {
         /* the engine still has to move (e.g. after a failed attempt) -- do not
            loop: leave it to the user to retry via undo / new game. */
@@ -1012,7 +1021,7 @@ const Play = {
     if (this.gid == null || this.busy || !this.state) return;
     const played = (this.state.moves || []).length;
     if (!played) return;
-    this.busy = true;
+    this.setBusy(true);
     this.setThinking(false);
     try {
       let plies = Math.min(2, played);
@@ -1033,7 +1042,7 @@ const Play = {
     } catch (e) {
       reportError(e, 'Undo failed');
     } finally {
-      this.busy = false;
+      this.setBusy(false);
       this.maybeEngine();
     }
   },
@@ -1041,12 +1050,22 @@ const Play = {
   async askHint() {
     if (this.gid == null || this.busy || !this.state || this.state.result) return;
     if (this.state.turn !== this.human) return;
-    this.busy = true;
+    const lv = LEVELS[this.level] || LEVELS[4];
+    const side = this.state.turn;
+    this.setBusy(true);
     this.setThinking(true);
     try {
-      const r = await api('/api/hint?gid=' + encodeURIComponent(this.gid));
+      const r = await api('/api/hint?gid=' + encodeURIComponent(this.gid) +
+        '&depth=' + lv.depth + '&movetime=' + lv.movetime);
       if (r && typeof r.move === 'string' && r.move.length >= 4) {
         this.hint = { from: r.move.slice(0, 2), to: r.move.slice(2, 4), san: r.san };
+        /* /api/hint returns the same shape as /api/ai, so the engine panel can
+           show what the search actually did for *your* position. */
+        this.engine = {
+          move: r.move, san: r.san, score: r.score, depth: r.depth, nodes: r.nodes,
+          ms: r.ms, value: r.value, top: Array.isArray(r.top) ? r.top : [], color: side
+        };
+        this.paintEngine();
         this.paintMarks();
         toast('Hint', (r.san || r.move) + ' looks best to the champion.', 'info');
       } else {
@@ -1056,15 +1075,16 @@ const Play = {
       reportError(e, 'Hint failed');
     } finally {
       this.setThinking(false);
-      this.busy = false;
+      this.setBusy(false);
     }
   },
 
   resign() {
     if (!this.state || this.state.result || this.resigned) return;
     this.resigned = this.human;
+    this.viewPly = null;
     this.board.setEnabled(false);
-    this.paintBanner();
+    this.render(false);
   },
 
   /* --------------------------------------------------------------- render */
@@ -1128,9 +1148,22 @@ const Play = {
     this.paintMoves();
     this.paintBanner();
     this.paintEval();
+    this.paintControls();
+  },
+
+  /* Button enablement depends on `busy`, which changes *after* the last
+     render() of a turn -- so this has to be callable on its own. */
+  paintControls() {
+    const st = this.state;
+    const live = this.viewPly == null;
+    const moves = st ? (st.moves || []) : [];
+    const over = !st || !!st.result || !!this.resigned;
+    const canPlay = !!st && live && !over && st.turn === this.human && !this.busy;
+
     $('btn-hint').disabled = !canPlay;
-    $('btn-undo').disabled = !live || !moves.length || this.busy;
-    $('btn-resign').disabled = !!st.result || !!this.resigned;
+    $('btn-undo').disabled = this.busy || !moves.length || this.gid == null;
+    $('btn-resign').disabled = over || this.busy;
+    $('btn-new').disabled = this.busy;
     $('mv-prev').disabled = this.curPly() <= 0;
     $('mv-start').disabled = this.curPly() <= 0;
     $('mv-next').disabled = live;
@@ -1190,8 +1223,10 @@ const Play = {
     $('strip-bottom').classList.toggle('to-move', !!active && turn === botColor);
 
     const plies = st ? (st.moves || []).length : 0;
+    const whole = Math.floor(plies / 2);
+    const shown = whole + (plies % 2 ? '½' : '');
     $('clock-top').textContent = $('clock-bot').textContent =
-      Math.floor(plies / 2) + (plies % 2 ? '½' : '') + ' moves';
+      shown + (plies === 2 ? ' move' : ' moves');
   },
 
   paintMoves() {
@@ -1349,6 +1384,7 @@ const Watch = {
   timer: null,
   flipped: false,
   loading: false,
+  evalXMax: 0,
 
   init() {
     this.board = new Board($('w-board'), { interactive: false });
@@ -1373,13 +1409,18 @@ const Watch = {
     });
     $('w-evalchart').addEventListener('click', (e) => {
       const hit = $('w-evalchart').querySelector('.plot-hit');
-      if (!hit || !this.positions) return;
+      if (!hit || !this.positions || !this.evalXMax) return;
       const r = hit.getBoundingClientRect();
       if (!r.width) return;
       const f = clamp((e.clientX - r.left) / r.width, 0, 1);
       this.pause();
-      this.seek(Math.round(f * this.maxPly()));
+      /* the chart's x axis spans 0..evalXMax, which can be shorter than the
+         game when the server did not log an eval for every ply */
+      this.seek(clamp(Math.round(f * this.evalXMax), 0, this.maxPly()));
     });
+    /* Show the start position rather than a bare grid before the first game. */
+    this.board.setPosition(parseFen(START_FEN).board, { animate: false });
+    this.paintChart();
     this.loadAgents();
   },
 
@@ -1387,14 +1428,22 @@ const Watch = {
     try {
       const m = await api('/api/model');
       const agents = Array.isArray(m && m.agents) ? m.agents : [];
+      /* /api/watch takes a=/b= agent indices; a negative index (or none at all)
+         means "the champion", so that is what the blank option maps to. */
       const opts = agents.slice(0, 256).map((a) => {
-        const idx = a.i != null ? a.i : (a.index != null ? a.index : 0);
-        const elo = a.elo != null ? ' · ' + Math.round(a.elo) + ' Elo' : '';
-        return '<option value="' + esc(idx) + '">agent ' + esc(idx) + esc(elo) + '</option>';
+        const idx = a && a.i != null ? a.i : 0;
+        const bits = [];
+        if (isFinite(a && a.elo)) bits.push(Math.round(a.elo) + ' Elo');
+        if (isFinite(a && a.rank)) bits.push('#' + a.rank);
+        return '<option value="' + esc(idx) + '">agent ' + esc(idx) +
+          (bits.length ? esc(' · ' + bits.join(' · ')) : '') + '</option>';
       }).join('');
-      $('w-sel-a').innerHTML = '<option value="">best agent</option>' + opts;
-      $('w-sel-b').innerHTML = '<option value="">random agent</option>' + opts;
-      if (agents.length > 1) $('w-sel-b').value = String(agents[Math.min(1, agents.length - 1)].i);
+      $('w-sel-a').innerHTML = '<option value="">champion (best agent)</option>' + opts;
+      $('w-sel-b').innerHTML = '<option value="">champion (best agent)</option>' + opts;
+      /* default to champion vs the runner-up so the first game is not a mirror */
+      if (agents.length > 1 && agents[1] && agents[1].i != null) {
+        $('w-sel-b').value = String(agents[1].i);
+      }
     } catch (_) { /* the match-up selects simply stay on their defaults */ }
   },
 
@@ -1559,26 +1608,36 @@ const Watch = {
   paintChart() {
     const g = this.game || {};
     const host = $('w-evalchart');
-    let evals = Array.isArray(g.evals) ? g.evals.filter((v) => v == null || isFinite(v)) : [];
-    if (!evals.length) {
-      host.innerHTML = '<p class="empty-note">No evaluation trace for this game.</p>';
+    const evals = Array.isArray(g.evals) ? g.evals.map((v) => (isFinite(v) ? v : null)) : [];
+    const known = evals.filter((v) => v != null);
+    if (!known.length) {
+      host.innerHTML = '<p class="empty-note">' +
+        (this.game ? 'No evaluation trace for this game.' : 'Generate a game to see the evaluation.') +
+        '</p>';
       $('w-eval-pill').textContent = '—';
+      $('w-eval-pill').className = 'pill subtle';
+      this.evalXMax = 0;
       return;
     }
+    /* evals[i] is the value of position i, from White's point of view, so the
+       x axis is a ply index and the marker sits exactly on the shown ply. */
     const xs = evals.map((_, i) => i);
+    this.evalXMax = evals.length - 1;
+    /* A near-flat trace should not be squashed against a fixed +/-1 axis, but a
+       decisive one must not blow past it either. */
+    const span = Math.max(0.25, Math.abs(Math.min.apply(null, known)), Math.abs(Math.max.apply(null, known)));
     host.innerHTML = lineChart({
       xs: xs,
       series: [{ name: 'eval', color: 'var(--accent)', values: evals }],
       width: 320, height: 120, area: true, zeroLine: true, hit: true,
-      yMin: Math.min(-1, Math.min.apply(null, evals)),
-      yMax: Math.max(1, Math.max.apply(null, evals)),
-      fmtY: (v) => fmtNum(v, 1),
+      yMin: -span * 1.1, yMax: span * 1.1,
+      fmtY: (v) => fmtNum(v, 2),
       fmtX: (v) => String(Math.round(v)),
       markerIndex: clamp(this.ply, 0, evals.length - 1)
     });
     const v = evals[clamp(this.ply, 0, evals.length - 1)];
-    $('w-eval-pill').textContent = fmtSigned(v, 2);
-    $('w-eval-pill').className = 'pill ' + (v > 0.1 ? 'pos' : v < -0.1 ? 'neg' : '');
+    $('w-eval-pill').textContent = v == null ? '—' : fmtSigned(v, 2);
+    $('w-eval-pill').className = 'pill ' + (v == null ? 'subtle' : v > 0.1 ? 'pos' : v < -0.1 ? 'neg' : '');
   }
 };
 
@@ -1586,259 +1645,83 @@ const Watch = {
 /* REPORT view                                                                */
 /* ========================================================================== */
 
-/* The exact shape of /api/report is produced by py/report.py; the normaliser
-   below accepts every reasonable spelling of the telemetry documented in
-   docs/ALGORITHM.md, including the raw per-generation JSONL rows. */
+/* This renders the JSON produced by py/report.py, whose shape is:
+ *
+ *   run        {name, dir, generations, gen_first, gen_last, lines_read,
+ *               lines_bad, missing_fields[], caveats[]}
+ *   squares    64 square names, a1 first  (index = rank*8 + file)
+ *   series     column-oriented per-generation arrays, all parallel to series.gen
+ *              (elo_best, elo_mean, elo_p10, draw_rate, white_win, black_win,
+ *               avg_len, captures_per_game, ..., term{checkmate,...})
+ *   learning   {elo_best|elo_mean|elo_p10 {start,end,gain,peak,peak_gen,per_gen},
+ *               plateau{detected,gen,reason,...}, spread, gain_by_quarter[]}
+ *   throughput {total_games, total_plies, wall_hours, games_per_sec,
+ *               positions_per_sec, plies_per_game, speedup_vs_human, ...}
+ *   phases     {bands[{label,gen_lo,gen_hi,n_gens,metrics{m:{mean,sd,n,vs_first}}}],
+ *               core_metrics[], metric_labels{}, metric_units{}, statements[]}
+ *   openings   {available, bands[{gen_lo,gen_hi,top[{uci,san,count,share}],
+ *               entropy_bits,...}], shift[{san,first_share,last_share,delta,...}],
+ *               statements[], entropy_delta}
+ *   pieces     {available, note, heatmap_last{pawn:[64],...}, heatmap_first,
+ *               pieces[{piece,letter,top_last[],entropy_delta,...}], statements[]}
+ *   champion   {available, agent, elo, gen, hypers{}, comparison[], statements[],
+ *               baseline{...}, baseline_is_proxy, summary}
+ *   findings     [{title, claim, evidence[], rank}]
+ *   limitations  [{title, detail, evidence[]}]
+ *
+ * Everything is optional: py/report.py omits or flags sections whose telemetry
+ * was never logged, and /api/report answers `{}` when no report exists at all.
+ * Nothing below assumes a field is present.
+ */
 
-function walk(root, visit, depth) {
-  depth = depth || 0;
-  if (!root || typeof root !== 'object' || depth > 6) return;
-  if (visit(root, depth) === true) return;
-  const vals = Array.isArray(root) ? root : Object.values(root);
-  for (const v of vals) if (v && typeof v === 'object') walk(v, visit, depth + 1);
-}
+const isNum = (v) => typeof v === 'number' && isFinite(v);
+const numArr = (v) => (Array.isArray(v) ? v.map((x) => (isNum(x) ? x : null)) : null);
+const hasData = (a) => Array.isArray(a) && a.some((v) => v != null);
 
-function findArray(root, test) {
-  let hit = null;
-  walk(root, (node) => {
-    if (hit) return true;
-    if (Array.isArray(node) && node.length && test(node)) { hit = node; return true; }
-    if (!Array.isArray(node)) {
-      for (const v of Object.values(node)) {
-        if (Array.isArray(v) && v.length && test(v)) { hit = v; return true; }
-      }
-    }
-    return false;
-  });
-  return hit;
-}
-
-function findObject(root, test) {
-  let hit = null;
-  walk(root, (node) => {
-    if (hit) return true;
-    if (!Array.isArray(node) && test(node)) { hit = node; return true; }
-    return false;
-  });
-  return hit;
-}
-
-function pick(obj, names, dflt) {
-  if (!obj) return dflt;
-  for (const n of names) {
-    if (obj[n] != null) return obj[n];
-    const lower = n.toLowerCase();
-    for (const k of Object.keys(obj)) {
-      if (k.toLowerCase() === lower && obj[k] != null) return obj[k];
-    }
-  }
-  return dflt;
-}
-
-function seriesFrom(rows, names) {
-  const out = rows.map((r) => {
-    const v = pick(r, names, null);
-    return typeof v === 'number' && isFinite(v) ? v : null;
-  });
-  return out.some((v) => v != null) ? out : null;
-}
-
-function toNumberMap(obj) {
-  const out = [];
-  if (!obj || typeof obj !== 'object') return out;
-  for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === 'number' && isFinite(v)) out.push({ label: k, value: v });
-  }
-  return out;
-}
-
-function normaliseReport(raw) {
-  const R = { raw: raw };
-
-  /* --- per-generation rows -------------------------------------------- */
-  const rows = findArray(raw, (a) =>
-    typeof a[0] === 'object' && a[0] !== null && !Array.isArray(a[0]) &&
-    (a[0].gen != null || a[0].generation != null) &&
-    Object.keys(a[0]).length > 2) || [];
-  R.rows = rows;
-  R.gens = rows.length
-    ? rows.map((r, i) => {
-      const g = pick(r, ['gen', 'generation'], i + 1);
-      return typeof g === 'number' ? g : i + 1;
-    })
-    : [];
-
-  const S = (names) => (rows.length ? seriesFrom(rows, names) : null);
-  const direct = (names) => {
-    for (const n of names) {
-      const v = pick(raw, [n], null);
-      if (Array.isArray(v) && v.length && typeof v[0] === 'number') return v;
-    }
-    return null;
-  };
-
-  R.eloBest = S(['elo_best', 'eloBest', 'best_elo']) || direct(['elo_best']);
-  R.eloMean = S(['elo_mean', 'eloMean', 'mean_elo']) || direct(['elo_mean']);
-  R.eloP10 = S(['elo_p10', 'eloP10']) || direct(['elo_p10']);
-  const eloObj = findObject(raw, (o) => o && (Array.isArray(o.best) || Array.isArray(o.mean)) &&
-    (o.best || o.mean).length && typeof (o.best || o.mean)[0] === 'number');
-  if (!R.eloBest && eloObj) R.eloBest = Array.isArray(eloObj.best) ? eloObj.best : null;
-  if (!R.eloMean && eloObj) R.eloMean = Array.isArray(eloObj.mean) ? eloObj.mean : null;
-  if (!R.eloP10 && eloObj) R.eloP10 = Array.isArray(eloObj.p10) ? eloObj.p10 : null;
-
-  R.whiteWin = S(['white_win', 'whiteWin', 'white_wins', 'white_win_rate']);
-  R.blackWin = S(['black_win', 'blackWin', 'black_wins', 'black_win_rate']);
-  R.draw = S(['draw', 'draws', 'draw_rate']);
-  R.avgLen = S(['avg_len', 'avgLen', 'average_length', 'avg_plies']);
-  R.gps = S(['gps', 'games_per_sec', 'games_sec']);
-  R.captures = S(['captures_per_game', 'captures']);
-  R.checks = S(['checks_per_game', 'checks']);
-  R.castle = S(['castle_rate', 'castles']);
-  R.promo = S(['promo_rate', 'promotions']);
-  R.ep = S(['ep_rate']);
-  R.entropy = S(['piece_dest_entropy', 'entropy']);
-  R.material = S(['avg_final_material']);
-  R.gradNorm = S(['grad_norm', 'gradNorm']);
-
-  const lossOf = (k) => rows.length
-    ? rows.map((r) => {
-      const l = pick(r, ['loss'], null);
-      const v = l && typeof l === 'object' ? pick(l, [k], null) : pick(r, ['loss_' + k], null);
-      return typeof v === 'number' && isFinite(v) ? v : null;
-    })
-    : null;
-  R.lossPolicy = lossOf('policy');
-  R.lossValue = lossOf('value');
-  R.lossEntropy = lossOf('entropy');
-  if (R.lossPolicy && !R.lossPolicy.some((v) => v != null)) R.lossPolicy = null;
-  if (R.lossValue && !R.lossValue.some((v) => v != null)) R.lossValue = null;
-  if (R.lossEntropy && !R.lossEntropy.some((v) => v != null)) R.lossEntropy = null;
-
-  if (!R.gens.length) {
-    const anyLen = [R.eloBest, R.eloMean, R.whiteWin].find((a) => Array.isArray(a) && a.length);
-    if (anyLen) R.gens = anyLen.map((_, i) => i + 1);
-  }
-
-  /* --- terminations ---------------------------------------------------- */
-  const TERM_KEYS = ['checkmate', 'stalemate', 'fifty', 'repetition', 'insufficient', 'maxplies'];
-  let term = findObject(raw, (o) => {
-    const keys = Object.keys(o).map((k) => k.toLowerCase());
-    let hits = 0;
-    for (const t of TERM_KEYS) if (keys.includes(t)) hits++;
-    return hits >= 3 && Object.values(o).every((v) => typeof v === 'number');
-  });
-  if (!term && rows.length) {
-    term = {};
-    for (const r of rows) {
-      const t = pick(r, ['term', 'terminations', 'termination'], null);
-      if (t && typeof t === 'object') {
-        for (const [k, v] of Object.entries(t)) {
-          if (typeof v === 'number') term[k] = (term[k] || 0) + v;
-        }
-      }
-    }
-    if (!Object.keys(term).length) term = null;
-  }
-  R.terminations = term ? toNumberMap(term).filter((d) => d.value >= 0) : [];
-
-  /* --- openings -------------------------------------------------------- */
-  let openings = [];
-  const openArr = findArray(raw, (a) => {
-    const f = a[0];
-    if (Array.isArray(f)) return f.length >= 2 && typeof f[0] === 'string';
-    return f && typeof f === 'object' &&
-      (f.san != null || f.move != null || f.opening != null) &&
-      (f.count != null || f.pct != null || f.n != null || f.freq != null || f.share != null);
-  });
-  if (openArr) {
-    openings = openArr.map((e) => Array.isArray(e)
-      ? { label: String(e[0]), value: +e[1] || 0 }
-      : {
-        label: String(pick(e, ['san', 'move', 'opening', 'name'], '?')),
-        value: +pick(e, ['count', 'n', 'pct', 'freq', 'share', 'value'], 0) || 0
-      });
-  } else {
-    const openObj = findObject(raw, (o) => {
-      const ks = Object.keys(o);
-      return ks.length >= 3 && ks.length <= 40 &&
-        ks.every((k) => /^[a-h][1-8][a-h][1-8][qrbn]?$|^[KQRBNa-h][a-h1-8x=+#-]{1,6}$/.test(k)) &&
-        Object.values(o).every((v) => typeof v === 'number');
-    });
-    if (openObj) openings = toNumberMap(openObj);
-  }
-  if (!openings.length && rows.length) {
-    const agg = {};
-    for (const r of rows) {
-      const t = pick(r, ['opening_top', 'openings', 'opening'], null);
-      if (Array.isArray(t)) {
-        for (const e of t) {
-          if (Array.isArray(e)) agg[e[0]] = (agg[e[0]] || 0) + (+e[1] || 0);
-          else if (e && typeof e === 'object') {
-            const k = String(pick(e, ['san', 'move', 'name'], '?'));
-            agg[k] = (agg[k] || 0) + (+pick(e, ['count', 'n', 'pct', 'freq', 'value'], 0) || 0);
-          }
-        }
-      } else if (t && typeof t === 'object') {
-        for (const [k, v] of Object.entries(t)) if (typeof v === 'number') agg[k] = (agg[k] || 0) + v;
-      }
-    }
-    openings = toNumberMap(agg);
-  }
-  openings.sort((a, b) => b.value - a.value);
-  R.openings = openings.slice(0, 10);
-
-  /* --- piece-square heatmaps ------------------------------------------- */
-  const PIECES = ['P', 'N', 'B', 'R', 'Q', 'K'];
-  const NAMES = { p: 'P', pawn: 'P', n: 'N', knight: 'N', b: 'B', bishop: 'B',
-    r: 'R', rook: 'R', q: 'Q', queen: 'Q', k: 'K', king: 'K' };
-  let heat = null;
-  const is64 = (a) => Array.isArray(a) && a.length === 64 && a.every((v) => typeof v === 'number');
-  const heatArr = findArray(raw, (a) => a.length >= 1 && a.length <= 6 && is64(a[0]));
-  if (heatArr) {
-    heat = heatArr.map((cells, i) => ({ piece: PIECES[i] || '?', cells: cells }));
-  } else {
-    const heatObj = findObject(raw, (o) => {
-      const vals = Object.values(o);
-      return vals.length >= 1 && vals.length <= 12 && vals.some(is64) &&
-        Object.keys(o).every((k) => NAMES[k.toLowerCase()] != null);
-    });
-    if (heatObj) {
-      heat = Object.entries(heatObj)
-        .filter(([, v]) => is64(v))
-        .map(([k, v]) => ({ piece: NAMES[k.toLowerCase()] || '?', cells: v }));
-      heat.sort((a, b) => PIECES.indexOf(a.piece) - PIECES.indexOf(b.piece));
-    }
-  }
-  R.heat = heat || [];
-
-  /* --- headline numbers ------------------------------------------------ */
-  const last = rows.length ? rows[rows.length - 1] : null;
-  R.meta = {
-    run: pick(raw, ['run', 'run_dir', 'name'], null),
-    generation: pick(raw, ['generation', 'generations', 'gens'], null) ||
-      (R.gens.length ? R.gens[R.gens.length - 1] : null),
-    agents: pick(raw, ['n_agents', 'agents_count', 'population'], null),
-    games: pick(raw, ['games', 'total_games'], null) ||
-      (rows.length ? rows.reduce((s, r) => s + (+pick(r, ['games'], 0) || 0), 0) : null),
-    plies: rows.length ? rows.reduce((s, r) => s + (+pick(r, ['plies'], 0) || 0), 0) : null,
-    seconds: rows.length ? rows.reduce((s, r) => s + (+pick(r, ['sec', 'seconds'], 0) || 0), 0) : null,
-    eloBest: R.eloBest ? lastNum(R.eloBest) : pick(raw, ['elo_best'], null),
-    eloMean: R.eloMean ? lastNum(R.eloMean) : null,
-    gps: R.gps ? lastNum(R.gps) : null,
-    avgLen: R.avgLen ? lastNum(R.avgLen) : null,
-    best: last ? pick(last, ['best_agent'], null) : null
-  };
-  if (typeof R.meta.agents !== 'number') {
-    const n = pick(raw, ['n_agents'], null);
-    R.meta.agents = typeof n === 'number' ? n : null;
-  }
-  return R;
+/** A numeric column from report.series, or null when it was never logged. */
+function seriesCol(rep, name) {
+  const s = rep && rep.series;
+  if (!s) return null;
+  const a = numArr(s[name]);
+  return hasData(a) ? a : null;
 }
 
 function lastNum(arr) {
-  for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null && isFinite(arr[i])) return arr[i];
+  if (!Array.isArray(arr)) return null;
+  for (let i = arr.length - 1; i >= 0; i--) if (isNum(arr[i])) return arr[i];
   return null;
 }
+
+function firstNum(arr) {
+  if (!Array.isArray(arr)) return null;
+  for (let i = 0; i < arr.length; i++) if (isNum(arr[i])) return arr[i];
+  return null;
+}
+
+/** True when the payload carries nothing worth drawing. */
+function reportIsEmpty(rep) {
+  if (!rep || typeof rep !== 'object' || Array.isArray(rep)) return true;
+  if (!Object.keys(rep).length) return true;
+  const gens = seriesCol(rep, 'gen');
+  return !gens &&
+    !(rep.findings && rep.findings.length) &&
+    !(rep.openings && rep.openings.available) &&
+    !(rep.champion && rep.champion.available) &&
+    !rep.throughput;
+}
+
+const REPORT_EMPTY_HTML =
+  '<div class="report-empty">' +
+  '<svg viewBox="0 0 48 48" class="empty-mark" aria-hidden="true">' +
+  '<rect x="6" y="6" width="36" height="36" rx="5"/>' +
+  '<path d="M13 32l7-8 6 5 9-12"/></svg>' +
+  '<strong>No strategy report yet</strong>' +
+  '<p>This view renders <code>runs/&lt;name&gt;/report.json</code>. The server has ' +
+  'none to serve, so there is nothing to analyse.</p>' +
+  '<p class="how">Train a run, then build the report:</p>' +
+  '<pre><code>./build/chessrl train --run myrun --gens 50\n' +
+  'python3 py/report.py runs/myrun</code></pre>' +
+  '<button class="btn" id="report-retry">Check again</button></div>';
 
 const Report = {
   loaded: false,
@@ -1851,196 +1734,484 @@ const Report = {
     wrap.innerHTML = '<div class="report-loading"><span class="spinner"></span>' +
       '<span>loading the strategy analysis…</span></div>';
     try {
-      const raw = await api('/api/report');
-      const R = normaliseReport(raw);
-      this.render(R);
-      this.loaded = true;
+      const rep = await api('/api/report');
+      if (reportIsEmpty(rep)) {
+        wrap.innerHTML = REPORT_EMPTY_HTML;
+        this.loaded = false;
+      } else {
+        this.render(rep);
+        this.loaded = true;
+      }
     } catch (e) {
       wrap.innerHTML =
-        '<div class="report-error"><strong>The strategy report is not available.</strong>' +
+        '<div class="report-error"><strong>The strategy report could not be loaded.</strong>' +
         '<span>' + esc(e && e.message ? e.message : String(e)) + '</span>' +
-        '<span style="max-width:44ch">It is generated by <code>py/report.py</code> from ' +
-        '<code>runs/&lt;name&gt;/telemetry.jsonl</code>; run a training job first.</span>' +
         '<button class="btn" id="report-retry">Try again</button></div>';
-      const b = $('report-retry');
-      if (b) b.addEventListener('click', () => this.load(true));
+      this.loaded = false;
     } finally {
       this.loading = false;
+      this.wire();
     }
   },
 
-  render(R) {
+  wire() {
+    for (const id of ['report-retry', 'report-reload']) {
+      const b = $(id);
+      if (b) b.addEventListener('click', () => this.load(true));
+    }
+  },
+
+  render(rep) {
     const wrap = $('report-wrap');
-    const m = R.meta;
+    const run = (rep.run && typeof rep.run === 'object') ? rep.run : {};
+    const gens = seriesCol(rep, 'gen') || [];
     let html = '';
 
+    /* ------------------------------------------------------------- header */
+    const subBits = [];
+    if (isNum(run.generations)) subBits.push(fmtInt(run.generations) + ' generations logged');
+    if (isNum(run.gen_first) && isNum(run.gen_last)) {
+      subBits.push('gen ' + fmtInt(run.gen_first) + '–' + fmtInt(run.gen_last));
+    }
+    if (isNum(run.lines_bad) && run.lines_bad > 0) {
+      subBits.push(fmtInt(run.lines_bad) + ' unreadable telemetry lines');
+    }
     html += '<div class="report-head"><div>' +
       '<h1>Strategy analysis</h1>' +
-      '<p>' + (m.run ? esc(m.run) + ' · ' : '') +
-      (m.generation != null ? fmtInt(m.generation) + ' generations' : 'population self-play') +
-      (m.agents != null ? ' · ' + fmtInt(m.agents) + ' agents' : '') + '</p></div>' +
+      '<p>' + (run.name ? '<b>' + esc(run.name) + '</b> · ' : '') +
+      esc(subBits.join(' · ') || 'population self-play') + '</p></div>' +
       '<button class="btn btn-sm" id="report-reload">Refresh</button></div>';
 
-    /* ---- KPI row ---- */
-    const kpis = [];
-    if (m.eloBest != null) kpis.push(k('Best Elo', fmtNum(m.eloBest, 0), m.eloMean != null ? 'mean ' + fmtNum(m.eloMean, 0) : ''));
-    if (m.games != null && m.games > 0) kpis.push(k('Games played', fmtCompact(m.games), m.plies ? fmtCompact(m.plies) + ' plies' : ''));
-    if (m.gps != null) kpis.push(k('Throughput', fmtInt(m.gps), 'games / second', 'games/s'));
-    if (m.avgLen != null) kpis.push(k('Game length', fmtNum(m.avgLen, 1), 'plies on average'));
-    const dr = R.draw ? lastNum(R.draw) : null;
-    if (dr != null) kpis.push(k('Draw rate', fmtPct(dr > 1 ? dr / 100 : dr, 1), 'latest generation'));
-    if (m.seconds) kpis.push(k('Compute', fmtNum(m.seconds / 3600, 1), 'core-hours of self-play', 'h'));
-    if (kpis.length) html += '<div class="kpis">' + kpis.join('') + '</div>';
+    /* ---------------------------------------------------------- KPI strip */
+    html += this.kpis(rep);
 
+    /* ----------------------------------------------------------- caveats */
+    const caveats = Array.isArray(run.caveats) ? run.caveats.filter((c) => typeof c === 'string') : [];
+    if (caveats.length) {
+      html += '<div class="caveat-bar"><span class="caveat-tag">read this first</span><ul>' +
+        caveats.map((c) => '<li>' + esc(c) + '</li>').join('') + '</ul></div>';
+    }
+
+    /* ---------------------------------------------------------- findings */
+    const findings = Array.isArray(rep.findings) ? rep.findings : [];
+    if (findings.length) {
+      html += '<h2 class="sec-title">What the run actually shows</h2>';
+      html += '<div class="findings">' + findings.map((f, i) => {
+        const ev = Array.isArray(f.evidence) ? f.evidence.filter((s) => typeof s === 'string') : [];
+        return '<article class="finding">' +
+          '<span class="f-rank">' + (isNum(f.rank) ? f.rank : i + 1) + '</span>' +
+          '<div class="f-body"><h3>' + esc(f.title || 'Finding') + '</h3>' +
+          (f.claim ? '<p class="f-claim">' + esc(f.claim) + '</p>' : '') +
+          (ev.length ? '<ul class="f-ev">' + ev.map((e) => '<li>' + esc(e) + '</li>').join('') + '</ul>' : '') +
+          '</div></article>';
+      }).join('') + '</div>';
+    }
+
+    /* -------------------------------------------------------------- cards */
     html += '<div class="report-grid">';
-
-    /* ---- Elo curve ---- */
-    if (R.gens.length && (R.eloBest || R.eloMean || R.eloP10)) {
-      const series = [];
-      if (R.eloBest) series.push({ name: 'best', color: 'var(--c1)', values: R.eloBest });
-      if (R.eloMean) series.push({ name: 'population mean', color: 'var(--c2)', values: R.eloMean });
-      if (R.eloP10) series.push({ name: '10th percentile', color: 'var(--c3)', values: R.eloP10 });
-      html += card('Elo over training',
-        'Hall-of-fame agents are frozen, so the scale is absolute rather than drifting with the mean.',
-        '<div class="chart">' + lineChart({
-          xs: R.gens, series: series, width: 520, height: 190,
-          fmtY: (v) => fmtNum(v, 0), fmtX: (v) => 'g' + Math.round(v)
-        }) + '</div>' + legend(series.map((s) => ({
-          name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 0)
-        }))), 'span-2');
-    }
-
-    /* ---- result mix ---- */
-    if (R.gens.length && (R.whiteWin || R.blackWin || R.draw)) {
-      const norm = (a) => a ? a.map((v) => (v == null ? 0 : v > 1.0001 ? v / 100 : v)) : null;
-      const w = norm(R.whiteWin) || R.gens.map(() => 0);
-      const d = norm(R.draw) || R.gens.map(() => 0);
-      const b = norm(R.blackWin) || R.gens.map(() => 0);
-      const layers = [
-        { name: 'White wins', color: 'var(--c1)', values: w },
-        { name: 'Draws', color: 'var(--c3)', values: d },
-        { name: 'Black wins', color: 'var(--c4)', values: b }
-      ];
-      html += card('Result mix by generation',
-        'The share of games ending in a White win, a draw, or a Black win.',
-        '<div class="chart">' + stackedArea({ xs: R.gens, layers: layers, width: 520, height: 190 }) + '</div>' +
-        legend(layers.map((l) => ({ name: l.name, color: l.color, value: fmtPct(lastNum(l.values) || 0, 0) }))),
-        'span-2');
-    }
-
-    /* ---- openings ---- */
-    if (R.openings.length) {
-      const total = R.openings.reduce((s, o) => s + o.value, 0) || 1;
-      const max = R.openings[0].value || 1;
-      const bars = R.openings.map((o) =>
-        '<div class="bar-row"><span class="b-name">' + esc(o.label) + '</span>' +
-        '<span class="b-track"><span class="b-fill" style="width:' +
-        (100 * o.value / max).toFixed(1) + '%"></span></span>' +
-        '<span class="b-val">' + (o.value <= 1 ? fmtPct(o.value, 1) : fmtPct(o.value / total, 1)) +
-        '</span></div>').join('');
-      html += card('Opening preference',
-        'How often the population opens with each first move.',
-        '<div class="bars">' + bars + '</div>');
-    }
-
-    /* ---- terminations ---- */
-    if (R.terminations.length) {
-      const order = ['checkmate', 'stalemate', 'repetition', 'fifty', 'insufficient', 'maxplies'];
-      const items = R.terminations.slice().sort((a, b) => {
-        const ai = order.indexOf(a.label.toLowerCase()), bi = order.indexOf(b.label.toLowerCase());
-        return (ai < 0 ? 9 : ai) - (bi < 0 ? 9 : bi);
-      });
-      const total = items.reduce((s, i) => s + i.value, 0) || 1;
-      const segs = items.map((it, i) =>
-        '<span class="stack-seg" title="' + esc(it.label) + '" style="width:' +
-        (100 * it.value / total).toFixed(2) + '%;background:' +
-        CHART_COLORS[i % CHART_COLORS.length] + '"></span>').join('');
-      html += card('How games end',
-        'Termination reasons across the whole run.',
-        '<div class="stack-bar">' + segs + '</div>' +
-        legend(items.map((it, i) => ({
-          name: termLabel(it.label), color: CHART_COLORS[i % CHART_COLORS.length],
-          value: fmtPct(it.value / total, 1)
-        }))));
-    }
-
-    /* ---- heatmaps ---- */
-    if (R.heat.length) {
-      html += card('Learned piece-square preference',
-        'Where each piece type ends up moving, aggregated over self-play. Brighter is more visited.',
-        '<div class="heatgrid">' + R.heat.map(heatBoard).join('') + '</div>' +
-        '<div class="scale-strip"><span>rare</span>' +
-        '<span class="scale-grad" style="background:linear-gradient(90deg,var(--bg-sunk),var(--accent))"></span>' +
-        '<span>frequent</span></div>', 'span-2');
-    }
-
-    /* ---- style / dynamics ---- */
-    const dyn = [];
-    if (R.avgLen) dyn.push({ name: 'game length (plies)', color: 'var(--c1)', values: R.avgLen });
-    if (R.captures) dyn.push({ name: 'captures per game', color: 'var(--c2)', values: R.captures });
-    if (R.checks) dyn.push({ name: 'checks per game', color: 'var(--c3)', values: R.checks });
-    if (dyn.length && R.gens.length) {
-      html += card('Game dynamics',
-        'Longer games with more captures and checks mean the population is fighting rather than shuffling.',
-        '<div class="chart">' + lineChart({
-          xs: R.gens, series: dyn, width: 360, height: 170, fmtX: (v) => 'g' + Math.round(v)
-        }) + '</div>' + legend(dyn.map((s) => ({
-          name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 1)
-        }))));
-    }
-
-    const rates = [];
-    if (R.castle) rates.push({ name: 'castling rate', color: 'var(--c5)', values: R.castle });
-    if (R.promo) rates.push({ name: 'promotion rate', color: 'var(--c6)', values: R.promo });
-    if (R.ep) rates.push({ name: 'en-passant rate', color: 'var(--c4)', values: R.ep });
-    if (R.entropy) rates.push({ name: 'destination entropy', color: 'var(--c2)', values: R.entropy });
-    if (rates.length && R.gens.length) {
-      html += card('Technique acquisition',
-        'Rates of the moves that only appear once the population understands them.',
-        '<div class="chart">' + lineChart({
-          xs: R.gens, series: rates, width: 360, height: 170, fmtX: (v) => 'g' + Math.round(v),
-          fmtY: (v) => fmtNum(v, 2)
-        }) + '</div>' + legend(rates.map((s) => ({
-          name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 3)
-        }))));
-    }
-
-    const losses = [];
-    if (R.lossPolicy) losses.push({ name: 'policy', color: 'var(--c1)', values: R.lossPolicy });
-    if (R.lossValue) losses.push({ name: 'value', color: 'var(--c4)', values: R.lossValue });
-    if (R.lossEntropy) losses.push({ name: 'entropy', color: 'var(--c3)', values: R.lossEntropy });
-    if (losses.length && R.gens.length) {
-      html += card('Optimisation',
-        'A2C loss components per generation.',
-        '<div class="chart">' + lineChart({
-          xs: R.gens, series: losses, width: 360, height: 170, fmtX: (v) => 'g' + Math.round(v),
-          fmtY: (v) => fmtNum(v, 2)
-        }) + '</div>' + legend(losses.map((s) => ({
-          name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 3)
-        }))));
-    }
-
-    if (m.best && typeof m.best === 'object') {
-      const b = m.best;
-      const rowsHtml = Object.entries(b).map(([kk, v]) =>
-        '<tr><td>' + esc(kk) + '</td><td class="num">' +
-        esc(typeof v === 'number' ? fmtNum(v, 3) : String(v)) + '</td></tr>').join('');
-      html += card('Champion hyper-parameters',
-        'The best agent of the final generation, as selected by Elo.',
-        '<table class="agent-table"><tbody>' + rowsHtml + '</tbody></table>');
-    }
-
+    html += this.eloCard(rep, gens);
+    html += this.resultMixCard(rep, gens);
+    html += this.openingCard(rep);
+    html += this.terminationCard(rep, gens);
+    html += this.heatCard(rep);
+    html += this.dynamicsCard(rep, gens);
+    html += this.techniqueCard(rep, gens);
+    html += this.optimisationCard(rep, gens);
+    html += this.phaseCard(rep);
+    html += this.championCard(rep);
+    html += this.throughputCard(rep);
     html += '</div>';
 
-    if (!R.gens.length && !R.openings.length && !R.terminations.length && !R.heat.length) {
-      html += '<div class="report-error"><strong>The report contained no recognisable telemetry.</strong>' +
-        '<span>Expected per-generation rows with <code>gen</code>, <code>elo_best</code>, ' +
-        '<code>opening_top</code>, <code>term</code> and piece-square counts.</span></div>';
+    /* ------------------------------------------------------- limitations */
+    const lims = Array.isArray(rep.limitations) ? rep.limitations : [];
+    if (lims.length) {
+      html += '<h2 class="sec-title">Limitations</h2>';
+      html += '<div class="limits">' + lims.map((l) =>
+        '<div class="limit"><strong>' + esc(l.title || '') + '</strong>' +
+        (l.detail ? '<span>' + esc(l.detail) + '</span>' : '') + '</div>').join('') + '</div>';
+    }
+
+    if (rep.generated_at) {
+      html += '<p class="report-foot">Generated ' + esc(String(rep.generated_at)) +
+        (rep.generator ? ' by ' + esc(String(rep.generator)) : '') + '.</p>';
     }
 
     wrap.innerHTML = html;
-    const rl = $('report-reload');
-    if (rl) rl.addEventListener('click', () => this.load(true));
+  },
+
+  /* ---------------------------------------------------------------- KPIs */
+
+  kpis(rep) {
+    const out = [];
+    const L = rep.learning || {};
+    const T = rep.throughput || {};
+    const eb = L.elo_best || {};
+
+    if (isNum(eb.end)) {
+      out.push(k('Best Elo', fmtNum(eb.end, 0),
+        isNum(eb.gain) ? fmtSigned(eb.gain, 1) + ' over the run' : ''));
+    }
+    if (isNum(T.total_games) && T.total_games > 0) {
+      out.push(k('Games played', fmtCompact(T.total_games),
+        isNum(T.total_plies) ? fmtCompact(T.total_plies) + ' plies' : ''));
+    }
+    if (isNum(T.games_per_sec)) {
+      out.push(k('Throughput', fmtCompact(T.games_per_sec), 'games / second', '/s'));
+    }
+    if (isNum(T.positions_per_sec)) {
+      out.push(k('Positions', fmtCompact(T.positions_per_sec), 'evaluated / second', '/s'));
+    }
+    if (isNum(T.plies_per_game)) {
+      out.push(k('Game length', fmtNum(T.plies_per_game, 1), 'plies on average'));
+    }
+    const dr = lastNum(seriesCol(rep, 'draw_rate'));
+    if (dr != null) out.push(k('Draw rate', fmtPct(dr, 1), 'final generation'));
+    /* A smoke run takes milliseconds and a real one takes hours, so pick the
+       unit rather than printing "0.000 h". */
+    const secs = isNum(T.wall_seconds) ? T.wall_seconds
+      : (isNum(T.wall_hours) ? T.wall_hours * 3600 : null);
+    if (secs != null && secs > 0) {
+      const big = secs >= 3600;
+      out.push(k('Compute',
+        big ? fmtNum(secs / 3600, 1) : fmtNum(secs, secs < 1 ? 3 : 1),
+        'wall-clock self-play', big ? 'h' : 's'));
+    }
+    if (isNum(T.speedup_vs_human) && T.speedup_vs_human > 0) {
+      out.push(k('Speed-up', fmtCompact(T.speedup_vs_human), 'vs a human playing', '×'));
+    }
+    return out.length ? '<div class="kpis">' + out.join('') + '</div>' : '';
+  },
+
+  /* --------------------------------------------------------------- cards */
+
+  eloCard(rep, gens) {
+    if (!gens.length) return '';
+    const series = [];
+    const add = (name, key, color) => {
+      const v = seriesCol(rep, key);
+      if (v) series.push({ name: name, color: color, values: v });
+    };
+    add('best', 'elo_best', 'var(--c1)');
+    add('population mean', 'elo_mean', 'var(--c2)');
+    add('10th percentile', 'elo_p10', 'var(--c3)');
+    if (!series.length) return '';
+
+    const L = rep.learning || {};
+    const plateau = L.plateau || {};
+    let note = '';
+    if (plateau.detected && isNum(plateau.gen)) {
+      note = '<p class="card-note">Plateau detected at generation ' + fmtInt(plateau.gen) +
+        (isNum(plateau.gain_after) ? '; only ' + fmtSigned(plateau.gain_after, 1) +
+          ' Elo after it.' : '.') + '</p>';
+    } else if (plateau.reason) {
+      note = '<p class="card-note">Plateau test: ' + esc(plateau.reason) + '.</p>';
+    }
+
+    return card('Elo over training',
+      'Hall-of-fame agents are frozen, so this scale is absolute rather than drifting with the mean.',
+      '<div class="chart">' + lineChart({
+        xs: gens, series: series, width: 520, height: 190,
+        fmtY: (v) => fmtNum(v, 0), fmtX: (v) => 'g' + Math.round(v)
+      }) + '</div>' +
+      legend(series.map((s) => ({ name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 0) }))) +
+      note, 'span-2');
+  },
+
+  resultMixCard(rep, gens) {
+    if (!gens.length) return '';
+    const w = seriesCol(rep, 'white_win'), d = seriesCol(rep, 'draw_rate') || seriesCol(rep, 'draw'), b = seriesCol(rep, 'black_win');
+    if (!w && !d && !b) return '';
+    const zero = gens.map(() => 0);
+    const norm = (a) => (a ? a.map((v) => (isNum(v) ? clamp(v > 1.0001 ? v / 100 : v, 0, 1) : 0)) : zero);
+    const layers = [
+      { name: 'White wins', color: 'var(--c1)', values: norm(w) },
+      { name: 'Draws', color: 'var(--c3)', values: norm(d) },
+      { name: 'Black wins', color: 'var(--c4)', values: norm(b) }
+    ];
+    return card('Result mix by generation',
+      'The share of self-play games ending in a White win, a draw, or a Black win.',
+      '<div class="chart">' + stackedArea({ xs: gens, layers: layers, width: 520, height: 190 }) + '</div>' +
+      legend(layers.map((l) => ({ name: l.name, color: l.color, value: fmtPct(lastNum(l.values) || 0, 0) }))),
+      'span-2');
+  },
+
+  openingCard(rep) {
+    const O = rep.openings;
+    if (!O || typeof O !== 'object') return '';
+    const bands = Array.isArray(O.bands) ? O.bands.filter((b) => b && Array.isArray(b.top)) : [];
+    if (O.available === false && !bands.length) {
+      return card('Opening preference', 'White\'s first move across the run.',
+        '<p class="empty-note">' + esc(O.note || 'The opening histogram was never logged.') + '</p>');
+    }
+    if (!bands.length) return '';
+
+    const first = bands[0], last = bands[bands.length - 1];
+    const firstShare = {};
+    for (const e of first.top) if (e && e.san) firstShare[e.san] = e.share;
+
+    const rows = last.top.slice(0, 8).map((e) => {
+      const share = isNum(e.share) ? e.share : 0;
+      const was = firstShare[e.san];
+      const delta = isNum(was) ? share - was : null;
+      return '<div class="bar-row"><span class="b-name">' + esc(e.san || e.uci || '?') + '</span>' +
+        '<span class="b-track"><span class="b-fill" style="width:' +
+        (100 * clamp(share, 0, 1)).toFixed(1) + '%"></span></span>' +
+        '<span class="b-val">' + fmtPct(share, 1) +
+        (delta != null && Math.abs(delta) >= 0.005
+          ? '<em class="' + (delta > 0 ? 'up' : 'down') + '">' + fmtSigned(delta * 100, 1) + '</em>'
+          : '') +
+        '</span></div>';
+    }).join('');
+
+    const sts = Array.isArray(O.statements) ? O.statements.filter((s) => typeof s === 'string') : [];
+    const meta = [];
+    if (isNum(last.entropy_bits)) meta.push('entropy ' + fmtNum(last.entropy_bits, 2) + ' bits');
+    if (isNum(O.entropy_delta)) meta.push(fmtSigned(O.entropy_delta, 2) + ' bits since the first band');
+    if (isNum(last.n_distinct)) meta.push(fmtInt(last.n_distinct) + ' distinct first moves');
+
+    return card('Opening preference',
+      'White\'s first move in the final band (gen ' + fmtInt(last.gen_lo) + '–' + fmtInt(last.gen_hi) +
+      '), with the change since gen ' + fmtInt(first.gen_lo) + '–' + fmtInt(first.gen_hi) + '.',
+      '<div class="bars">' + rows + '</div>' +
+      (meta.length ? '<p class="card-note">' + esc(meta.join(' · ')) + '</p>' : '') +
+      (sts.length ? '<ul class="notes">' + sts.map((s) => '<li>' + esc(s) + '</li>').join('') + '</ul>' : ''));
+  },
+
+  terminationCard(rep, gens) {
+    const term = rep.series && rep.series.term;
+    if (!term || typeof term !== 'object') return '';
+    const ORDERED = ['checkmate', 'stalemate', 'repetition', 'fifty', 'insufficient', 'maxplies'];
+    const items = [];
+    for (const key of ORDERED) {
+      const a = numArr(term[key]);
+      if (!hasData(a)) continue;
+      /* a reason that never once happened is noise in the legend */
+      if (!a.some((v) => isNum(v) && v > 0)) continue;
+      const v = lastNum(a);
+      items.push({ key: key, value: isNum(v) ? Math.max(0, v) : 0, series: a });
+    }
+    if (!items.length) return '';
+    const total = items.reduce((s, i) => s + i.value, 0);
+    if (!total) return '';
+
+    const segs = items.map((it, i) =>
+      '<span class="stack-seg" title="' + esc(termLabel(it.key)) + ' ' + fmtPct(it.value / total, 1) +
+      '" style="width:' + (100 * it.value / total).toFixed(2) + '%;background:' +
+      CHART_COLORS[i % CHART_COLORS.length] + '"></span>').join('');
+
+    let trend = '';
+    if (gens.length > 1) {
+      const layers = items.map((it, i) => ({
+        name: termLabel(it.key), color: CHART_COLORS[i % CHART_COLORS.length],
+        values: it.series.map((v) => (isNum(v) ? clamp(v, 0, 1) : 0))
+      }));
+      trend = '<div class="chart">' + stackedArea({ xs: gens, layers: layers, width: 360, height: 140 }) + '</div>';
+    }
+
+    return card('How games end',
+      'Termination reasons — the bar is the final generation, the band below is every generation.',
+      '<div class="stack-bar">' + segs + '</div>' + trend +
+      legend(items.map((it, i) => ({
+        name: termLabel(it.key), color: CHART_COLORS[i % CHART_COLORS.length],
+        value: fmtPct(it.value / total, 1)
+      }))));
+  },
+
+  heatCard(rep) {
+    const P = rep.pieces;
+    if (!P || typeof P !== 'object') return '';
+    const squares = Array.isArray(rep.squares) && rep.squares.length === 64 ? rep.squares : SQN;
+    const map = (P.heatmap_last && typeof P.heatmap_last === 'object') ? P.heatmap_last
+      : (P.heatmap_first && typeof P.heatmap_first === 'object') ? P.heatmap_first : null;
+    const NAME2LETTER = { pawn: 'P', knight: 'N', bishop: 'B', rook: 'R', queen: 'Q', king: 'K' };
+    const boards = [];
+    if (map) {
+      for (const [name, cells] of Object.entries(map)) {
+        const a = numArr(cells);
+        if (!a || a.length !== 64) continue;
+        boards.push({ letter: NAME2LETTER[String(name).toLowerCase()] || '?', name: String(name), cells: a });
+      }
+      boards.sort((a, b) => 'PNBRQK'.indexOf(a.letter) - 'PNBRQK'.indexOf(b.letter));
+    }
+    const sts = Array.isArray(P.statements) ? P.statements.filter((s) => typeof s === 'string') : [];
+
+    if (!boards.length) {
+      if (!sts.length && !P.note) return '';
+      return card('Learned piece placement',
+        'Where each piece type prefers to move.',
+        '<p class="empty-note">' + esc(P.note || 'Piece-destination counts were not logged.') + '</p>' +
+        (sts.length ? '<ul class="notes">' + sts.map((s) => '<li>' + esc(s) + '</li>').join('') + '</ul>' : ''));
+    }
+
+    return card('Learned piece-square preference',
+      'Destination squares over the final band, normalised per piece. Brighter is more visited.',
+      '<div class="heatgrid">' + boards.map((b) => heatBoard(b, squares)).join('') + '</div>' +
+      '<div class="scale-strip"><span>rare</span>' +
+      '<span class="scale-grad"></span><span>frequent</span></div>' +
+      (sts.length ? '<ul class="notes">' + sts.map((s) => '<li>' + esc(s) + '</li>').join('') + '</ul>' : ''),
+      'span-2');
+  },
+
+  dynamicsCard(rep, gens) {
+    if (gens.length < 2) return '';
+    const dyn = [];
+    const push = (name, key, color) => { const v = seriesCol(rep, key); if (v) dyn.push({ name: name, color: color, values: v }); };
+    push('game length (plies)', 'avg_len', 'var(--c1)');
+    push('captures per game', 'captures_per_game', 'var(--c2)');
+    push('checks per game', 'checks_per_game', 'var(--c3)');
+    if (!dyn.length) return '';
+    return card('Game dynamics',
+      'Longer games with more captures and checks mean the population is fighting rather than shuffling.',
+      '<div class="chart">' + lineChart({
+        xs: gens, series: dyn, width: 360, height: 170, fmtX: (v) => 'g' + Math.round(v)
+      }) + '</div>' +
+      legend(dyn.map((s) => ({ name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 1) }))));
+  },
+
+  techniqueCard(rep, gens) {
+    if (gens.length < 2) return '';
+    const rates = [];
+    const push = (name, key, color) => { const v = seriesCol(rep, key); if (v) rates.push({ name: name, color: color, values: v }); };
+    push('castling rate', 'castle_rate', 'var(--c5)');
+    push('promotion rate', 'promo_rate', 'var(--c6)');
+    push('en-passant rate', 'ep_rate', 'var(--c4)');
+    push('checkmate share', 'checkmate_share', 'var(--c1)');
+    if (!rates.length) return '';
+    return card('Technique acquisition',
+      'The moves and outcomes that only show up once the population understands them.',
+      '<div class="chart">' + lineChart({
+        xs: gens, series: rates, width: 360, height: 170,
+        fmtX: (v) => 'g' + Math.round(v), fmtY: (v) => fmtNum(v, 2)
+      }) + '</div>' +
+      legend(rates.map((s) => ({ name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 3) }))));
+  },
+
+  optimisationCard(rep, gens) {
+    if (gens.length < 2) return '';
+    const losses = [];
+    const push = (name, key, color) => { const v = seriesCol(rep, key); if (v) losses.push({ name: name, color: color, values: v }); };
+    push('policy', 'loss_policy', 'var(--c1)');
+    push('value', 'loss_value', 'var(--c4)');
+    push('entropy', 'loss_entropy', 'var(--c3)');
+    push('grad norm', 'grad_norm', 'var(--c2)');
+    if (!losses.length) return '';
+    return card('Optimisation',
+      'A2C loss components and the global gradient norm, per generation.',
+      '<div class="chart">' + lineChart({
+        xs: gens, series: losses, width: 360, height: 170,
+        fmtX: (v) => 'g' + Math.round(v), fmtY: (v) => fmtNum(v, 2)
+      }) + '</div>' +
+      legend(losses.map((s) => ({ name: s.name, color: s.color, value: fmtNum(lastNum(s.values), 3) }))));
+  },
+
+  phaseCard(rep) {
+    const P = rep.phases;
+    if (!P || typeof P !== 'object') return '';
+    const bands = Array.isArray(P.bands) ? P.bands.filter((b) => b && b.metrics) : [];
+    const core = Array.isArray(P.core_metrics) ? P.core_metrics : [];
+    if (bands.length < 2 || !core.length) return '';
+    const labels = P.metric_labels || {};
+    const units = P.metric_units || {};
+
+    let head = '<tr><th>metric</th>';
+    for (const b of bands) {
+      head += '<th class="num">' + esc(b.label || ('band ' + ((b.index || 0) + 1))) +
+        '<span class="th-sub">g' + fmtInt(b.gen_lo) + '–' + fmtInt(b.gen_hi) + '</span></th>';
+    }
+    head += '<th class="num">change</th></tr>';
+
+    let body = '';
+    for (const m of core) {
+      const cells = bands.map((b) => (b.metrics[m] && isNum(b.metrics[m].mean)) ? b.metrics[m].mean : null);
+      if (!cells.some((v) => v != null)) continue;
+      const a = firstNum(cells), z = lastNum(cells);
+      const delta = (a != null && z != null) ? z - a : null;
+      const sig = bands.length && bands[bands.length - 1].metrics[m] &&
+        bands[bands.length - 1].metrics[m].vs_first &&
+        bands[bands.length - 1].metrics[m].vs_first.significant;
+      body += '<tr><td>' + esc(labels[m] || m) +
+        (units[m] ? ' <span class="unit">' + esc(units[m]) + '</span>' : '') + '</td>' +
+        cells.map((v) => '<td class="num">' + (v == null ? '—' : fmtNum(v, 3)) + '</td>').join('') +
+        '<td class="num ' + (delta == null ? '' : delta > 0 ? 'up' : delta < 0 ? 'down' : '') + '">' +
+        (delta == null ? '—' : fmtSigned(delta, 3) + (sig ? ' *' : '')) + '</td></tr>';
+    }
+    if (!body) return '';
+
+    const sts = Array.isArray(P.statements) ? P.statements : [];
+    const sig = sts.filter((s) => s && s.core && s.significant && s.text)
+      .slice(0, 4).map((s) => '<li>' + esc(s.text) + '</li>').join('');
+
+    return card('How play changed across the run',
+      'Core metrics averaged inside each band of generations. A “*” marks a change py/report.py judged significant against within-band noise.',
+      '<div class="table-scroll"><table class="agent-table band-table"><thead>' + head +
+      '</thead><tbody>' + body + '</tbody></table></div>' +
+      (sig ? '<ul class="notes">' + sig + '</ul>' : ''), 'span-2');
+  },
+
+  championCard(rep) {
+    const C = rep.champion;
+    if (!C || typeof C !== 'object') return '';
+    if (C.available === false) {
+      return C.note ? card('Champion', 'The best agent of the final generation.',
+        '<p class="empty-note">' + esc(C.note) + '</p>') : '';
+    }
+    const cmp = Array.isArray(C.comparison) ? C.comparison : [];
+    const hypers = (C.hypers && typeof C.hypers === 'object') ? C.hypers : {};
+    const names = cmp.length ? cmp.map((c) => c.name) : Object.keys(hypers);
+    if (!names.length) return '';
+
+    let body = '';
+    for (const n of names) {
+      const c = cmp.find((x) => x && x.name === n) || {};
+      const val = isNum(c.value) ? c.value : (isNum(hypers[n]) ? hypers[n] : null);
+      const base = isNum(c.baseline) ? c.baseline : null;
+      const ratio = isNum(c.ratio) ? c.ratio : null;
+      body += '<tr><td>' + esc(n) + '</td>' +
+        '<td class="num">' + (val == null ? '—' : fmtNum(val, 4)) + '</td>' +
+        '<td class="num">' + (base == null ? '—' : fmtNum(base, 4)) + '</td>' +
+        '<td class="num ' + (ratio == null ? '' : ratio > 1.15 ? 'up' : ratio < 0.85 ? 'down' : '') + '">' +
+        (ratio == null ? '—' : '×' + fmtNum(ratio, 2)) + '</td></tr>';
+    }
+
+    const sts = Array.isArray(C.statements) ? C.statements.filter((s) => typeof s === 'string') : [];
+    const idLine = [];
+    if (isNum(C.agent)) idLine.push('agent ' + fmtInt(C.agent));
+    if (isNum(C.elo)) idLine.push(fmtNum(C.elo, 1) + ' Elo');
+    if (isNum(C.gen)) idLine.push('generation ' + fmtInt(C.gen));
+
+    return card('Champion hyper-parameters',
+      idLine.join(' · ') || 'The best agent of the final generation, selected by Elo.',
+      '<div class="table-scroll"><table class="agent-table"><thead><tr><th>hyper-parameter</th>' +
+      '<th class="num">champion</th><th class="num">baseline</th><th class="num">ratio</th></tr></thead>' +
+      '<tbody>' + body + '</tbody></table></div>' +
+      (C.baseline_is_proxy && C.baseline && C.baseline.source
+        ? '<p class="card-note">' + esc(String(C.baseline.source)) + '</p>' : '') +
+      (sts.length ? '<ul class="notes">' + sts.map((s) => '<li>' + esc(s) + '</li>').join('') + '</ul>' : ''));
+  },
+
+  throughputCard(rep) {
+    const T = rep.throughput;
+    if (!T || typeof T !== 'object') return '';
+    const rows = [
+      ['games played', isNum(T.total_games) ? fmtInt(T.total_games) : null],
+      ['positions played', isNum(T.total_plies) ? fmtInt(T.total_plies) : null],
+      ['games / second', isNum(T.games_per_sec) ? fmtInt(T.games_per_sec) : null],
+      ['positions / second', isNum(T.positions_per_sec) ? fmtInt(T.positions_per_sec) : null],
+      ['plies per game', isNum(T.plies_per_game) ? fmtNum(T.plies_per_game, 1) : null],
+      ['wall-clock seconds', isNum(T.wall_seconds) ? fmtNum(T.wall_seconds, 2) : null],
+      ['human-equivalent years', isNum(T.human_equivalent_years) ? fmtNum(T.human_equivalent_years, 3) : null],
+      ['speed-up vs a human', isNum(T.speedup_vs_human) ? fmtCompact(T.speedup_vs_human) + '×' : null]
+    ].filter((r) => r[1] != null);
+    if (!rows.length) return '';
+    const goal = T.meets_1000_gps === true
+      ? '<p class="card-note ok">Clears the 1000 games/second design budget.</p>'
+      : T.meets_1000_gps === false
+        ? '<p class="card-note warn">Below the 1000 games/second design budget.</p>' : '';
+    return card('Throughput',
+      'What the training budget actually bought.',
+      '<table class="agent-table"><tbody>' + rows.map((r) =>
+        '<tr><td>' + esc(r[0]) + '</td><td class="num">' + esc(r[1]) + '</td></tr>').join('') +
+      '</tbody></table>' + goal);
   }
 };
 
@@ -2060,28 +2231,34 @@ function card(title, sub, body, cls) {
 function termLabel(s) {
   const map = {
     checkmate: 'checkmate', stalemate: 'stalemate', fifty: 'fifty-move',
-    repetition: 'repetition', insufficient: 'insufficient material', maxplies: 'move limit'
+    repetition: 'repetition', insufficient: 'insufficient material',
+    maxplies: 'move limit'
   };
   return map[String(s).toLowerCase()] || String(s);
 }
 
-function heatBoard(h) {
+/** One 8x8 heat board. `cells` is indexed a1=0 .. h8=63, like report.squares. */
+function heatBoard(h, squares) {
   const cells = h.cells;
   let max = 0;
-  for (const v of cells) if (v > max) max = v;
+  for (const v of cells) if (isNum(v) && v > max) max = v;
   if (!max) max = 1;
   let grid = '';
   for (let row = 0; row < 8; row++) {
-    for (let col = 0; col < 8; col++) {
-      const idx = (7 - row) * 8 + col;                 /* rank 8 first */
-      const t = Math.pow(clamp(cells[idx] / max, 0, 1), 0.6);
-      grid += '<div class="heat-cell" title="' + SQN[idx] + ': ' + fmtCompact(cells[idx]) + '">' +
-        '<div style="position:absolute;inset:0;background:var(--accent);opacity:' + t.toFixed(3) + '"></div></div>';
+    for (let col2 = 0; col2 < 8; col2++) {
+      const idx = (7 - row) * 8 + col2;                  /* rank 8 painted first */
+      const raw = isNum(cells[idx]) ? cells[idx] : 0;
+      const t = Math.pow(clamp(raw / max, 0, 1), 0.6);
+      grid += '<div class="heat-cell" title="' + esc(squares[idx] || SQN[idx]) + ': ' +
+        esc(raw <= 1 ? fmtPct(raw, 2) : fmtCompact(raw)) + '">' +
+        '<div class="heat-ink" style="opacity:' + t.toFixed(3) + '"></div></div>';
     }
   }
-  return '<div class="heat"><div class="heat-title">' + pieceGlyph('w' + h.piece) +
-    '<span>' + esc({ P: 'Pawns', N: 'Knights', B: 'Bishops', R: 'Rooks', Q: 'Queens', K: 'Kings' }[h.piece] || h.piece) +
-    '</span></div><div class="heat-board" style="background:var(--bg-sunk)">' + grid + '</div></div>';
+  const label = { P: 'Pawns', N: 'Knights', B: 'Bishops', R: 'Rooks', Q: 'Queens', K: 'Kings' }[h.letter] ||
+    (h.name ? h.name.charAt(0).toUpperCase() + h.name.slice(1) + 's' : '?');
+  return '<div class="heat"><div class="heat-title">' + pieceGlyph('w' + h.letter) +
+    '<span>' + esc(label) + '</span></div>' +
+    '<div class="heat-board">' + grid + '</div></div>';
 }
 
 /* ========================================================================== */
@@ -2178,3 +2355,4 @@ function boot() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
+

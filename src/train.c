@@ -56,6 +56,27 @@
 
 _Static_assert(sizeof(Hyper) == 8 * sizeof(float), "Hyper must be 8 packed floats");
 
+/* Learning self-checks.  Off by default so they cost exactly nothing at -O3;
+ * build with  make CC='cc -DCHESSRL_DEBUG_LEARN'  to turn them on.  They verify
+ * that every advantage/return is finite, that the normalised advantages have
+ * ~zero mean and ~unit variance over the generation, and that the per-game
+ * means still spread out -- which is what separates generation-wide from
+ * per-game normalisation, since both give a pooled mean of zero. */
+#ifdef CHESSRL_DEBUG_LEARN
+#define DBG_CHECK(cond, ...)                                                   \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "train: self-check failed (%s:%d): ",              \
+                    __FILE__, __LINE__);                                       \
+            fprintf(stderr, __VA_ARGS__);                                      \
+            fputc('\n', stderr);                                               \
+            abort();                                                           \
+        }                                                                      \
+    } while (0)
+#else
+#define DBG_CHECK(cond, ...) ((void)0)
+#endif
+
 static volatile sig_atomic_t g_interrupt = 0;
 
 static void on_sigint(int sig) { (void)sig; g_interrupt = 1; }
@@ -244,6 +265,13 @@ typedef struct {
     float    *adv, *ret;
     /* running advantage statistics for this generation (Welford)            */
     double    adv_n, adv_mean, adv_m2;
+#ifdef CHESSRL_DEBUG_LEARN
+    /* post-normalisation moments, checked once per generation                */
+    double    dbg_n, dbg_sum, dbg_sumsq;
+    /* moments of the PER-SUBSEQUENCE means of the normalised advantages:
+     * these must spread out, or the normalisation is happening per game       */
+    double    dbg_gn, dbg_gsum, dbg_gsumsq;
+#endif
     /* telemetry                                                             */
     double    l_pol, l_val, l_ent;
     uint64_t  l_n, decisions;
@@ -360,6 +388,28 @@ static void learn_side(Worker *w, int agent, const Traj *tr, int color,
         ainv = 1.0f / ((float)sqrt(var) + 1e-6f);
         if (!(ainv < 100.0f)) ainv = 100.0f;        /* also catches NaN      */
     }
+
+#ifdef CHESSRL_DEBUG_LEARN
+    {
+        double gm = 0.0;
+        for (int j = 0; j < n; j++) {
+            double a = ((double)w->adv[j] - (double)amean) * (double)ainv;
+            DBG_CHECK(isfinite(w->adv[j]), "advantage %d/%d = %g", j, n, (double)w->adv[j]);
+            DBG_CHECK(isfinite(w->ret[j]), "return %d/%d = %g", j, n, (double)w->ret[j]);
+            DBG_CHECK(isfinite(a), "normalised advantage %d/%d = %g", j, n, a);
+            w->dbg_n += 1.0;
+            w->dbg_sum += a;
+            w->dbg_sumsq += a * a;
+            gm += a;
+        }
+        if (n >= 4) {
+            gm /= (double)n;
+            w->dbg_gn += 1.0;
+            w->dbg_gsum += gm;
+            w->dbg_gsumsq += gm * gm;
+        }
+    }
+#endif
 
     /* ---- per-decision-point gradients ---------------------------------- */
     grad_zero(w->hscratch, (int)HEAD_NPARAM);
@@ -647,16 +697,15 @@ static void write_telemetry(FILE *f, const Shared *sh, const PlayStats *st,
             uint64_t c = st->first_move[i];
             int pos;
             if (c == 0) continue;
+            /* Scan only -- the shift below must happen exactly once, or an
+             * entry moved more than one slot gets copied twice and appears
+             * twice in the output. */
             pos = ntop;
-            while (pos > 0 && st->first_move[top[pos - 1]] < c) {
-                if (pos < 8) top[pos] = top[pos - 1];
-                pos--;
-            }
-            if (pos < 8) {
-                if (ntop < 8) ntop++;
-                for (int q = (ntop < 8 ? ntop : 8) - 1; q > pos; q--) top[q] = top[q - 1];
-                top[pos] = i;
-            }
+            while (pos > 0 && st->first_move[top[pos - 1]] < c) pos--;
+            if (pos >= 8) continue;              /* below the whole current top-8 */
+            if (ntop < 8) ntop++;
+            for (int q = ntop - 1; q > pos; q--) top[q] = top[q - 1];
+            top[pos] = i;
         }
         fprintf(f, ",\"opening_top\":[");
         for (int i = 0; i < ntop; i++) {
@@ -934,6 +983,10 @@ int train_run(TrainCfg *c)
             stats_zero(&w->stats);
             grad_zero(w->tg, (int)TRUNK_NPARAM);
             w->adv_n = w->adv_mean = w->adv_m2 = 0.0;
+#ifdef CHESSRL_DEBUG_LEARN
+            w->dbg_n = w->dbg_sum = w->dbg_sumsq = 0.0;
+            w->dbg_gn = w->dbg_gsum = w->dbg_gsumsq = 0.0;
+#endif
             w->l_pol = w->l_val = w->l_ent = 0.0;
             w->l_n = 0;
             w->decisions = 0;
@@ -953,6 +1006,42 @@ int train_run(TrainCfg *c)
             total_dec += workers[t].decisions;
         }
         if (ln) { lp /= (double)ln; lv /= (double)ln; le /= (double)ln; }
+
+#ifdef CHESSRL_DEBUG_LEARN
+        /* Advantages must be finite, centred and unit-scaled over the whole
+         * generation.  The two moment checks catch a sign flip, a missing mean
+         * subtraction or a NaN; the third catches per-game normalisation. */
+        for (int t = 0; t < nthreads; t++) {
+            const Worker *w = &workers[t];
+            double m, var;
+            if (w->dbg_n < 256.0) continue;         /* too few points to judge */
+            m   = w->dbg_sum / w->dbg_n;
+            var = w->dbg_sumsq / w->dbg_n - m * m;
+            /* Measured over many runs: |mean| stays under 0.18 and the variance
+             * inside [0.74, 1.35]; the estimator is streaming, so the tolerance
+             * has to absorb its drift.  A missing mean subtraction or a flipped
+             * sign puts the mean at order 1, far outside this. */
+            DBG_CHECK(isfinite(m) && fabs(m) < 0.40,
+                      "gen %d thread %d: normalised advantage mean %g over %.0f points",
+                      gen, t, m, w->dbg_n);
+            DBG_CHECK(isfinite(var) && var > 0.25 && var < 4.0,
+                      "gen %d thread %d: normalised advantage variance %g over %.0f points",
+                      gen, t, var, w->dbg_n);
+            /* Between-subsequence spread.  Pooled mean/variance cannot tell
+             * per-game from per-generation normalisation (per-game gives a
+             * pooled mean of 0 too); this can: per-game normalisation forces
+             * every subsequence mean to 0, so their variance collapses. */
+            if (w->dbg_gn >= 32.0) {
+                double gm  = w->dbg_gsum / w->dbg_gn;
+                double gvar = w->dbg_gsumsq / w->dbg_gn - gm * gm;
+                DBG_CHECK(isfinite(gvar) && gvar > 1e-3,
+                          "gen %d thread %d: per-subsequence advantage means have "
+                          "variance %g over %.0f subsequences -- advantages look "
+                          "normalised per game, not per generation",
+                          gen, t, gvar, w->dbg_gn);
+            }
+        }
+#endif
 
         /* -- 4. OPTIMISE ------------------------------------------------ */
         grad_zero(tgsum, (int)TRUNK_NPARAM);

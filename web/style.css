@@ -290,6 +290,17 @@ button { cursor: pointer; }
 @supports (height: 100dvh) {
   .board-column { width: min(100%, var(--board-max), calc(100dvh - 190px)); }
 }
+/* Watch stacks two transport rows under the board, so on the side-by-side
+   layout it needs more headroom than Play or the play/pause controls drop
+   below the fold. Below 900px the views stack and the page scrolls anyway. */
+@media (min-width: 901px) {
+  .view-watch .board-column { width: min(100%, var(--board-max), calc(100vh - 310px)); }
+}
+@supports (height: 100dvh) {
+  @media (min-width: 901px) {
+    .view-watch .board-column { width: min(100%, var(--board-max), calc(100dvh - 310px)); }
+  }
+}
 .side-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 
 /* -------------------------------------------------------------- the board */
@@ -720,10 +731,12 @@ select:hover { border-color: var(--accent-line); }
 .card-body { padding: 10px 14px 14px; }
 
 .bars { display: flex; flex-direction: column; gap: 7px; }
-.bar-row { display: grid; grid-template-columns: 54px 1fr 46px; gap: 9px; align-items: center; }
+.bar-row { display: grid; grid-template-columns: 54px 1fr 58px; gap: 9px; align-items: center; }
 .bar-row .b-name { font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .bar-row .b-track { height: 8px; border-radius: 99px; background: var(--bg-sunk); overflow: hidden; }
-.bar-row .b-fill { height: 100%; border-radius: 99px; background: var(--accent); transition: width 320ms ease; }
+/* a <span> inside a non-flex parent stays inline, and inline boxes ignore
+   width/height -- so this must be blockified or the bar never fills */
+.bar-row .b-fill { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width 320ms ease; }
 .bar-row .b-val {
   font-family: var(--ff-num); font-size: 11.5px; color: var(--text-dim);
   text-align: right; font-variant-numeric: tabular-nums;
@@ -758,7 +771,78 @@ select:hover { border-color: var(--accent-line); }
 }
 .agent-table td { padding: 5px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 .agent-table tr:last-child td { border-bottom: 0; }
-.agent-table td.num { text-align: right; font-family: var(--ff-num); }
+.agent-table td.num, .agent-table th.num { text-align: right; font-family: var(--ff-num); }
+.agent-table td .unit { color: var(--text-faint); font-size: 11px; }
+.agent-table .th-sub { display: block; font-weight: 500; text-transform: none; letter-spacing: 0; opacity: .8; }
+.band-table td:first-child { white-space: nowrap; }
+.table-scroll { overflow-x: auto; }
+
+/* empty / error states -------------------------------------------------- */
+.report-empty {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: 10px; padding: 56px 20px; color: var(--text-dim);
+  max-width: 560px; margin: 0 auto;
+}
+.report-empty .empty-mark { width: 46px; height: 46px; fill: none; stroke: var(--text-faint); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; opacity: .75; }
+.report-empty strong { font-size: 16px; color: var(--text); font-weight: 640; }
+.report-empty p { font-size: 12.5px; line-height: 1.55; }
+.report-empty p.how { margin-top: 4px; color: var(--text-faint); }
+.report-empty pre {
+  width: 100%; text-align: left; background: var(--bg-sunk); border: 1px solid var(--line);
+  border-radius: var(--r-md); padding: 10px 12px; overflow-x: auto;
+  font-family: var(--ff-num); font-size: 11.5px; line-height: 1.7; color: var(--text-dim);
+}
+.report-empty .btn, .report-error .btn { margin-top: 4px; }
+
+/* caveats, findings, limitations ---------------------------------------- */
+.sec-title { font-size: 14px; font-weight: 640; letter-spacing: -.01em; margin: 22px 0 10px; }
+.caveat-bar {
+  display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--warn);
+  border-radius: var(--r-md); padding: 11px 14px; margin-bottom: 16px;
+}
+.caveat-tag {
+  font-size: 9.5px; letter-spacing: .07em; text-transform: uppercase; font-weight: 700;
+  color: var(--text-faint); padding-top: 2px; flex: none;
+}
+.caveat-bar ul { margin: 0; padding-left: 16px; min-width: 0; }
+.caveat-bar li { font-size: 12px; color: var(--text-dim); line-height: 1.55; }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; align-items: start; }
+.finding {
+  display: flex; gap: 12px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r-lg); padding: 13px 15px; box-shadow: var(--shadow-1); min-width: 0;
+}
+.f-rank {
+  flex: none; width: 22px; height: 22px; border-radius: 7px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-size: 11.5px; font-weight: 700;
+}
+.f-body { min-width: 0; }
+.f-body h3 { font-size: 13.5px; font-weight: 640; letter-spacing: -.01em; }
+.f-claim { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; margin-top: 4px; }
+.f-ev { margin: 7px 0 0; padding-left: 16px; }
+.f-ev li { font-size: 11.5px; color: var(--text-faint); line-height: 1.6; }
+
+.limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+.limit {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 11px 13px; min-width: 0;
+}
+.limit strong { display: block; font-size: 12.5px; font-weight: 620; }
+.limit span { display: block; font-size: 11.5px; color: var(--text-dim); line-height: 1.6; margin-top: 3px; }
+
+.notes { margin: 10px 0 0; padding-left: 16px; }
+.notes li { font-size: 11.5px; color: var(--text-dim); line-height: 1.6; }
+.card-note { font-size: 11.5px; color: var(--text-faint); margin-top: 9px; line-height: 1.55; }
+.card-note.ok { color: var(--good); }
+.card-note.warn { color: var(--bad); }
+.bar-row .b-val em { font-style: normal; display: block; font-size: 10px; }
+.bar-row .b-val em.up, .agent-table .num.up { color: var(--good); }
+.bar-row .b-val em.down, .agent-table .num.down { color: var(--bad); }
+.report-foot { font-size: 11px; color: var(--text-faint); margin-top: 22px; text-align: center; }
+.heat-ink { position: absolute; inset: 0; background: var(--accent); }
+.heat-board { background: var(--bg-sunk); }
+.scale-grad { background: linear-gradient(90deg, var(--bg-sunk), var(--accent)); }
 
 /* ------------------------------------------------------------------ toasts */
 .toasts {

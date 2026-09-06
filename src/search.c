@@ -36,6 +36,7 @@
 #define S_MATE        30000                 /* mate at ply 0                 */
 #define S_MATE_BOUND  (S_MATE - S_MAX_PLY)  /* anything above this is a mate */
 #define S_INF         31000
+#define QS_MAX_PLY    6                     /* quiescence plies past horizon */
 
 #define SBIT(x)       (1ULL << (x))
 
@@ -99,7 +100,6 @@ typedef struct {
 
     int64_t  t0_ns;
     int64_t  budget_ns;                 /* <= 0 : no time limit               */
-    int      allow_stop;                /* 0 until depth 1 has completed      */
 } Ctx;
 
 /* ------------------------------------------------------------------ misc */
@@ -480,10 +480,17 @@ static void pv_store(Ctx *c, int ply, Move m)
 
 /* --------------------------------------------------------------- limits -- */
 
+/* The limits apply from the very first node.  They deliberately do NOT wait for
+ * depth 1 to finish: quiescence is a variable-width tree (a position with eight
+ * pawns on the seventh rank generates a promotion at every node and defeats
+ * stand-pat, delta and SEE pruning all at once), so "let the first iteration
+ * always complete" is not a bounded amount of work -- it can run for minutes.
+ * search_best() keeps a legal move in hand from before the first node, so an
+ * iteration that is cut short costs quality, never correctness. */
 static void check_limits(Ctx *c)
 {
     Search *s = c->s;
-    if (!c->allow_stop || s->stop) return;
+    if (s->stop) return;
     if (s->max_nodes && s->nodes >= s->max_nodes) { s->stop = 1; return; }
     if (c->budget_ns > 0 && now_ns() - c->t0_ns >= c->budget_ns) s->stop = 1;
 }
@@ -496,7 +503,7 @@ static inline int has_big_piece(const Position *p, int col)
 
 /* ---------------------------------------------------------- quiescence -- */
 
-static int qsearch(Ctx *c, int alpha, int beta, int ply)
+static int qsearch(Ctx *c, int alpha, int beta, int ply, int qply)
 {
     Search *s = c->s;
     Position *p = &c->pos;
@@ -517,6 +524,17 @@ static int qsearch(Ctx *c, int alpha, int beta, int ply)
     }
 
     in_chk = in_check(p, p->side);
+
+    /* Hard bound on how far quiescence may run past the horizon.  Capture and
+     * promotion chains normally die out in three or four plies; the ones that
+     * do not are pathological (mass promotions, long check series) and are
+     * worth far less than the time they cost.  Mate is still reported exactly:
+     * a position with no legal move while in check is checkmate at any qply. */
+    if (qply >= QS_MAX_PLY) {
+        if (in_chk && gen_legal(p, c->mlist[ply]) == 0) return -S_MATE + ply;
+        have_fw = s_forward(s, p, fw);
+        return blend_cp(p, fw, have_fw);
+    }
     stand  = -S_INF;
     if (!in_chk) {
         have_fw = s_forward(s, p, fw);
@@ -552,7 +570,7 @@ static int qsearch(Ctx *c, int alpha, int beta, int ply)
 
         make_move(p, m, &u);
         push_key(c, p->key);
-        sc = -qsearch(c, -beta, -alpha, ply + 1);
+        sc = -qsearch(c, -beta, -alpha, ply + 1, qply + 1);
         pop_key(c);
         unmake_move(p, m, &u);
         if (s->stop) return best > -S_INF ? best : stand;
@@ -578,7 +596,7 @@ static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null
     Fwd *fw = &c->fwbuf[ply];
     const int is_pv = (beta - alpha) > 1;
     int in_chk, have_fw = 0, eval = 0;
-    int best = -S_INF, orig_alpha = alpha, n, i, moved_quiets = 0;
+    int best = -S_INF, orig_alpha, n, i, moved_quiets = 0;
     Move ttm = MV_NONE, bestm = MV_NONE;
     Move quiets[64];
     Move *ml;
@@ -594,11 +612,12 @@ static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null
         if (beta  >  S_MATE - ply - 1) beta  =  S_MATE - ply - 1;
         if (alpha >= beta) return alpha;
     }
+    orig_alpha = alpha;      /* after mate-distance pruning, so the TT flag is right */
     if (ply >= S_MAX_PLY - 2) {
         have_fw = s_forward(s, p, fw);
         return blend_cp(p, fw, have_fw);
     }
-    if (depth <= 0) return qsearch(c, alpha, beta, ply);
+    if (depth <= 0) return qsearch(c, alpha, beta, ply, 0);
 
     s->nodes++;
     if ((s->nodes & 2047) == 0) { check_limits(c); if (s->stop) return 0; }
@@ -901,7 +920,6 @@ Move search_best(Search *s, const Game *g)
 
     c->t0_ns     = now_ns();
     c->budget_ns = (s->movetime_ms > 0) ? (int64_t)s->movetime_ms * 1000000LL : 0;
-    c->allow_stop = 0;                 /* depth 1 always runs to completion   */
 
     maxd = s->max_depth;
     if (maxd <= 0) maxd = (s->movetime_ms > 0 || s->max_nodes) ? S_MAX_PLY - 4 : 8;
@@ -914,6 +932,7 @@ Move search_best(Search *s, const Game *g)
         order_moves(c, &c->pos, c->rootm, c->rootsc, c->nroot, MV_NONE, 0, &fw, have);
         sort_root(c->rootm, c->rootsc, c->nroot);
         for (i = 0; i < c->nroot; i++) c->rootsc[i] = -S_INF;
+        best_move = c->rootm[0];       /* best guess before a single node runs */
     }
 
     /* -------------------------------------------------- iterative deepening */
@@ -942,7 +961,13 @@ Move search_best(Search *s, const Game *g)
             if (alpha <= -S_INF && beta >= S_INF) break;
         }
 
-        if (s->stop) break;                 /* iteration incomplete: discard   */
+        /* Iteration incomplete: discard its score, but a partial root pass has
+         * still measured some moves, so keep its best-so-far over the raw
+         * move-ordering guess. */
+        if (s->stop) {
+            if (completed == 0 && itm != MV_NONE) best_move = itm;
+            break;
+        }
 
         prev = score;
         best_move = itm;
@@ -954,15 +979,13 @@ Move search_best(Search *s, const Game *g)
         if (s->pv_len == 0) { s->pv[0] = best_move; s->pv_len = 1; }
 
         sort_root(c->rootm, c->rootsc, c->nroot);
-        c->allow_stop = 1;                  /* from here on, the clock rules   */
 
         if (score >= S_MATE_BOUND || score <= -S_MATE_BOUND) break;  /* mate    */
         if (c->budget_ns > 0 && (now_ns() - c->t0_ns) * 2 >= c->budget_ns) break;
         if (s->max_nodes && s->nodes >= s->max_nodes) break;
     }
 
-    if (completed == 0) {                    /* should not happen; stay legal  */
-        best_move = c->rootm[0];
+    if (completed == 0) {                    /* cut off early; stay legal      */
         s->depth_reached = 1;
         s->pv[0] = best_move;
         s->pv_len = 1;

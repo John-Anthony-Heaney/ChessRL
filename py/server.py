@@ -126,6 +126,24 @@ def want_int(value, name, lo, hi, default=None, clamp=False):
     return n
 
 
+def want_unit(value, name):
+    """Coerce an optional 0..1 float (clamped).  ``None`` stays ``None``."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, str):
+            try:
+                value = float(value.strip())
+            except ValueError:
+                raise HttpError(400, "%s must be a number in 0..1" % name) from None
+        else:
+            raise HttpError(400, "%s must be a number in 0..1" % name)
+    value = float(value)
+    if not math.isfinite(value):
+        raise HttpError(400, "%s must be a number in 0..1" % name)
+    return max(0.0, min(1.0, value))
+
+
 def want_uci(value):
     if not isinstance(value, str):
         raise HttpError(400, "move must be a string")
@@ -661,6 +679,17 @@ class EngineHub:
                 slot[1] -= 1
 
     # -- metadata ---------------------------------------------------------
+    def agent_count(self):
+        """How many agents the model holds (0 when it does not say)."""
+        info = self.info()
+        if not isinstance(info, dict):
+            return 0
+        n = info.get("n_agents")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            agents = info.get("agents")
+            n = len(agents) if isinstance(agents, list) else 0
+        return n
+
     def info(self):
         self.require()
         with self._info_lock:
@@ -827,6 +856,7 @@ class Handler(BaseHTTPRequestHandler):
         self._head_only = method == "HEAD"
         self._status = 500
         self._nbytes = 0
+        self._body_read = False
         try:
             split = urllib.parse.urlsplit(self.path)
             path = urllib.parse.unquote(split.path)
@@ -851,6 +881,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.close_connection = True
         finally:
+            self._drain_body()
             ms = (time.monotonic() - started) * 1000.0
             client = self.client_address[0] if self.client_address else "-"
             where = self.path[:200].replace("\n", " ").replace("\r", " ")
@@ -916,9 +947,48 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, _mime_for(target))
 
     # -- request bodies ---------------------------------------------------
+    def _drain_body(self):
+        """Swallow a request body that no handler consumed.
+
+        HTTP/1.1 keep-alive is byte-oriented: when a request carries a body and
+        we answer without reading it (POST to a static path -> 405, GET to an
+        unknown /api route with a body, ...), those bytes stay in the socket and
+        the *next* request on the same connection is parsed starting from them.
+        The client then gets a bogus 501 whose status line echoes the previous
+        body.  Drain what we can; close the connection when we cannot.
+        """
+        if getattr(self, "_body_read", True) or self.close_connection:
+            return
+        self._body_read = True
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+                self.close_connection = True
+            return
+        try:
+            length = int(raw_len)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > MAX_BODY:
+            self.close_connection = True
+            return
+        try:
+            while length > 0:
+                chunk = self.rfile.read(min(length, 65536))
+                if not chunk:
+                    self.close_connection = True
+                    return
+                length -= len(chunk)
+        except (OSError, ValueError):
+            self.close_connection = True
+
     def _read_json(self):
         raw_len = self.headers.get("Content-Length")
         if raw_len is None:
+            self._body_read = True
             if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
                 self.close_connection = True
                 raise HttpError(411, "chunked bodies are not supported")
@@ -934,6 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             self.close_connection = True
             raise HttpError(413, "request body too large")
+        self._body_read = True
         data = self.rfile.read(length) if length else b""
         if not data.strip():
             return {}
@@ -975,7 +1046,12 @@ class Handler(BaseHTTPRequestHandler):
             if route == "move":
                 return self._api_move(body)
             if route == "ai":
-                check_keys(body, {"gid", "depth", "movetime"}, "/api/ai")
+                # `blunder` is a UI-side difficulty knob (web/app.js sends it on
+                # every engine move).  It is not part of docs/API.md and the
+                # server does not act on it, but rejecting it would 400 every
+                # engine move the shipped UI makes, so accept and validate it.
+                check_keys(body, {"gid", "depth", "movetime", "blunder"}, "/api/ai")
+                want_unit(body.get("blunder"), "blunder")
                 return self._think(
                     want_int(body.get("gid"), "gid", 0, 1 << 30),
                     body.get("depth"),
@@ -985,7 +1061,8 @@ class Handler(BaseHTTPRequestHandler):
             if route == "undo":
                 return self._api_undo(body)
             if route == "hint":
-                check_keys(body, {"gid", "depth", "movetime"}, "/api/hint")
+                check_keys(body, {"gid", "depth", "movetime", "blunder"}, "/api/hint")
+                want_unit(body.get("blunder"), "blunder")
                 return self._think(
                     want_int(body.get("gid"), "gid", 0, 1 << 30),
                     body.get("depth"),
@@ -1121,6 +1198,15 @@ class Handler(BaseHTTPRequestHandler):
 
         hub = self.server.engines
         hub.require()
+        n_agents = hub.agent_count()
+        if n_agents:
+            for name, index in (("a", agent_a), ("b", agent_b)):
+                if index >= n_agents:
+                    raise HttpError(
+                        400,
+                        "%s out of range: model has %d agents (0..%d, or -1 for the "
+                        "champion)" % (name, n_agents, n_agents - 1),
+                    )
         if not self.server.watch_slots.acquire(timeout=20):
             raise HttpError(503, "too many watch games in flight, try again")
         try:

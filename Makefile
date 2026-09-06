@@ -10,7 +10,7 @@ BUILD   := build
 CORE_SRC := src/chess.c src/net.c src/arena.c src/search.c
 CORE_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))
 
-.PHONY: all clean lib test bench fast debug
+.PHONY: all clean lib test integration bench fast debug
 all: $(BUILD)/chessrl lib
 
 $(BUILD):
@@ -28,10 +28,15 @@ $(BUILD)/libchessrl.dylib: $(CORE_SRC) src/api.c src/train.c
 	$(CC) $(CFLAGS) -fPIC -shared $^ -o $@ $(LDFLAGS)
 
 # --------------------------------------------------------------------- tests
-test: $(BUILD)/test_perft $(BUILD)/test_rules $(BUILD)/test_net
-	@echo "=== perft ==="  && $(BUILD)/test_perft
-	@echo "=== rules ==="  && $(BUILD)/test_rules
-	@echo "=== net   ==="  && $(BUILD)/test_net
+test: $(BUILD)/test_perft $(BUILD)/test_rules $(BUILD)/test_net $(BUILD)/test_search
+	@echo "=== perft  ===" && $(BUILD)/test_perft
+	@echo "=== rules  ===" && $(BUILD)/test_rules
+	@echo "=== net    ===" && $(BUILD)/test_net
+	@echo "=== search ===" && $(BUILD)/test_search
+
+# Full-stack test: builds the shared library, starts the server, drives every endpoint.
+integration: lib
+	python3 tests/test_integration.py
 
 $(BUILD)/test_perft: tests/test_perft.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -39,6 +44,8 @@ $(BUILD)/test_rules: tests/test_rules.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 $(BUILD)/test_net: tests/test_net.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -O1 $^ -o $@ $(LDFLAGS)
+$(BUILD)/test_search: tests/test_search.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 bench: $(BUILD)/chessrl
 	$(BUILD)/chessrl bench

@@ -1939,7 +1939,9 @@ def render_markdown(rep):
                 d = b["metrics"].get(key, {}).get("vs_prev", {}).get("delta")
                 if d is not None:
                     steps.append((abs(d), b, d))
-            big = max(steps)[1:] if steps else (None, None)
+            # key= on the magnitude only: two bands can tie on abs(delta), and the
+            # tuple fallback would then compare the band dicts and raise TypeError.
+            big = max(steps, key=lambda s: s[0])[1:] if steps else (None, None)
             when = ("the biggest single step was into gen %d-%d (%s%s)"
                     % (big[0]["gen_lo"], big[0]["gen_hi"],
                        "+" if big[1] > 0 else "", fnum(big[1]))) if big[0] else ""
