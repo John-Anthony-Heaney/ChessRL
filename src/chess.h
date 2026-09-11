@@ -56,6 +56,11 @@ typedef struct {
     uint8_t  side;                    /* side to move                        */
     uint8_t  castling;                /* CR_* bits                           */
     int8_t   ep;                      /* en-passant target square, -1 if none */
+    uint8_t  chess960;                /* 0 = classical, 1 = Chess960 castling */
+    /* Origin FILE of each castling rook, [colour][0 = king-side, 1 = queen-side].
+     * Classical chess is simply {7,0}; Chess960 needs this because the rooks do
+     * not start on a1/h1.  Only meaningful where the matching CR_* bit is set. */
+    uint8_t  crook[NCOLORS][2];
     uint16_t halfmove;                /* plies since last capture/pawn move  */
     uint16_t fullmove;                /* starts at 1, increments after black */
 } Position;
@@ -131,9 +136,37 @@ void move_to_san(const Position *p, Move m, char *buf, size_t buflen);
 
 uint64_t perft(Position *p, int depth);
 
+/* ------------------------------------------------------------- chess 960 */
+/* Chess960 (Fischer Random).  Castling is defined by the DESTINATION squares,
+ * which are the same as classical chess (king to g1/c1, rook to f1/d1), but the
+ * king and rooks may start anywhere on the back rank, so castling legality has
+ * to be expressed in terms of the rook origin files in Position.crook.
+ *
+ * Positions are numbered 0..959 using the standard Scharnagl scheme, in which
+ * 518 is the classical starting array.  Every classical rule is unchanged. */
+#define CHESS960_CLASSICAL_ID 518
+
+void pos_startpos960(Position *p, int id);       /* id is taken modulo 960     */
+/* Scharnagl id of a back-rank arrangement, or -1 if it is not a legal 960 array. */
+int  pos_960_id(const Position *p);
+/* Uniformly samples a 960 id from `rng`, an xoshiro256** state. */
+int  pos_960_random(uint64_t *rng);
+
+/* X-FEN / Shredder-FEN.  pos_from_fen accepts KQkq, the file-letter form
+ * (e.g. "HAha"), and the X-FEN hybrid; pos_to_fen emits file letters whenever
+ * the position is Chess960 and KQkq would be ambiguous. */
+
+/* In Chess960 a castling move is conventionally written king-takes-rook
+ * ("e1h1"), because the king's destination can coincide with a normal king
+ * move.  move_from_uci accepts BOTH that form and the classical king-destination
+ * form; move_to_uci emits king-takes-rook when p->chess960 is set, so the extra
+ * argument is the position the move belongs to (may be NULL for classical). */
+void move_to_uci_pos(const Position *p, Move m, char *buf);
+
 /* ------------------------------------------------------------------ game */
 
 void game_start(Game *g);
+void game_start960(Game *g, int id);
 int  game_start_fen(Game *g, const char *fen);
 /* Applies a move, appends history, refreshes result/reason.  Returns result. */
 int  game_push(Game *g, Move m);
