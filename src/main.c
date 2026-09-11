@@ -635,6 +635,9 @@ static int usage(void)
 "  play       play the champion from the terminal (UCI move strings)\n"
 "    --model PATH --agent I --depth D --movetime MS --blunder R\n"
 "\n"
+"  uci        speak the UCI protocol on stdin/stdout (cutechess-cli, any GUI)\n"
+"    --model PATH --agent I --hash MB --blunder PCT --overhead MS --no-search\n"
+"\n"
 "NETWORK   %d sparse inputs -> %d accumulator -> %d hidden -> policy(%d) + value\n"
 "          %zu trunk parameters shared, %zu per agent\n",
     default_threads(), NF_INPUT, NF_ACC, NF_HID, NF_PDIM,
@@ -661,6 +664,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "selfplay")) return cmd_selfplay(rargc, rargv);
     if (!strcmp(cmd, "eval"))     return cmd_eval(rargc, rargv);
     if (!strcmp(cmd, "play"))     return cmd_play(rargc, rargv);
+    if (!strcmp(cmd, "uci"))      { int uci_main(int, char **); return uci_main(rargc, rargv); }
 
     fprintf(stderr, "unknown command '%s'\n\n", cmd);
     usage();
