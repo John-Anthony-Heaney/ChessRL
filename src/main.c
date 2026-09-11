@@ -1,6 +1,7 @@
 /* main.c -- command dispatch for the chessrl binary.
  *
  *   chessrl train     population RL training run
+ *   chessrl az        AlphaZero-style training: MCTS self-play + replay buffer
  *   chessrl bench     headline throughput number (full games/sec, net in the loop)
  *   chessrl perft     move-generator node counts
  *   chessrl selfplay  watch two trained agents play
@@ -19,6 +20,7 @@
 #include "arena.h"
 #include "search.h"
 #include "train.h"
+#include "az.h"
 
 /* --------------------------------------------------------------- utilities */
 
@@ -137,6 +139,81 @@ static int cmd_train(int argc, char **argv)
         return 2;
     }
     return train_run(&c) ? 0 : 1;
+}
+
+/* ---------------------------------------------------------------------- az */
+/* AlphaZero-style training.  Everything the agent learns comes from the game
+ * result and the MCTS visit counts -- see docs/FROM_SCRATCH.md. */
+
+static int cmd_az(int argc, char **argv)
+{
+    AZCfg c;
+    az_default_cfg(&c);
+
+    c.n_agents         = (int)opt_int(argc, argv, "--agents",          c.n_agents);
+    c.generations      = (int)opt_int(argc, argv, "--gens",            c.generations);
+    c.games_per_agent  = (int)opt_int(argc, argv, "--games-per-agent", c.games_per_agent);
+    c.threads          = (int)opt_int(argc, argv, "--threads",         c.threads);
+    c.sims             = (int)opt_int(argc, argv, "--sims",            c.sims);
+    c.max_plies        = (int)opt_int(argc, argv, "--max-plies",       c.max_plies);
+    c.opening_plies    = (int)opt_int(argc, argv, "--opening-plies",   c.opening_plies);
+    c.batch_size       = (int)opt_int(argc, argv, "--batch",           c.batch_size);
+    c.steps_per_gen    = (int)opt_int(argc, argv, "--steps",           c.steps_per_gen);
+    c.buffer_positions = (int)opt_int(argc, argv, "--buffer",          c.buffer_positions);
+    c.hof_every        = (int)opt_int(argc, argv, "--hof-every",       c.hof_every);
+    c.hof_frac_pct     = (int)opt_int(argc, argv, "--hof-pct",         c.hof_frac_pct);
+
+    c.lr               = (float)opt_num(argc, argv, "--lr",           c.lr);
+    c.lr_final         = (float)opt_num(argc, argv, "--lr-final",     c.lr_final);
+    c.weight_decay     = (float)opt_num(argc, argv, "--wd",           c.weight_decay);
+    c.grad_clip        = (float)opt_num(argc, argv, "--clip",         c.grad_clip);
+    c.value_coef       = (float)opt_num(argc, argv, "--value-coef",   c.value_coef);
+    c.draw_penalty     = (float)opt_num(argc, argv, "--draw-penalty", c.draw_penalty);
+    c.c_puct           = (float)opt_num(argc, argv, "--cpuct",        c.c_puct);
+    c.dirichlet_alpha  = (float)opt_num(argc, argv, "--dir-alpha",    c.dirichlet_alpha);
+    c.dirichlet_eps    = (float)opt_num(argc, argv, "--dir-eps",      c.dirichlet_eps);
+    c.temp_start       = (float)opt_num(argc, argv, "--temp-start",   c.temp_start);
+    c.temp_end         = (float)opt_num(argc, argv, "--temp-end",     c.temp_end);
+    c.resign_threshold = (float)opt_num(argc, argv, "--resign",       c.resign_threshold);
+    c.resign_check_frac= (float)opt_num(argc, argv, "--resign-check", c.resign_check_frac);
+    c.elite_frac       = (float)opt_num(argc, argv, "--elite",        c.elite_frac);
+    c.cull_frac        = (float)opt_num(argc, argv, "--cull",         c.cull_frac);
+
+    c.seed             = (uint64_t)opt_int(argc, argv, "--seed",      (long)c.seed);
+    c.quiet            = opt_flag(argc, argv, "--quiet");
+
+    /* Per-agent clone noise.  It lives in Hyper, not AZCfg, so az.c exposes a
+     * setter rather than az.h growing a field (headers are fixed). */
+    {
+        void az_set_mutate_sigma(float);
+        const char *ms = opt_str(argc, argv, "--mutate-sigma", NULL);
+        if (ms) az_set_mutate_sigma((float)atof(ms));
+    }
+
+    static char run_dir[512];
+    const char *run = opt_str(argc, argv, "--run", NULL);
+    if (run) {
+        if (strchr(run, '/')) snprintf(run_dir, sizeof run_dir, "%s", run);
+        else                  snprintf(run_dir, sizeof run_dir, "runs/%s", run);
+        c.run_dir = run_dir;
+    }
+
+    if (c.n_agents < 2 || c.generations < 1 || c.games_per_agent < 1 ||
+        c.threads < 1 || c.sims < 2 || c.batch_size < 1) {
+        fprintf(stderr, "error: --agents >= 2, --gens >= 1, --games-per-agent >= 1, "
+                        "--threads >= 1, --sims >= 2, --batch >= 1\n");
+        return 2;
+    }
+    {   /* --start classical|960|mixed */
+        const char *sm = opt_str(argc, argv, "--start", NULL);
+        if (sm) {
+            if      (!strcmp(sm, "classical")) c.start_mode = AZ_START_CLASSICAL;
+            else if (!strcmp(sm, "960"))       c.start_mode = AZ_START_960;
+            else if (!strcmp(sm, "mixed"))     c.start_mode = AZ_START_MIXED;
+            else { fprintf(stderr, "error: --start must be classical|960|mixed\n"); return 2; }
+        }
+    }
+    return az_run(&c) ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------- bench */
@@ -620,6 +697,21 @@ static int usage(void)
 "    --elite F --cull F --hof-every N --hof-pct N\n"
 "    --seed N --run NAME --quiet\n"
 "\n"
+"  az         AlphaZero-style training: MCTS self-play, replay buffer, SGD\n"
+"    --agents N            agents in the population        (default 32)\n"
+"    --gens N              number of generations           (default 200)\n"
+"    --sims N              MCTS simulations per move       (default 64)\n"
+"    --games-per-agent N   games each agent plays per gen  (default 4)\n"
+"    --threads N           worker threads                  (default %d here)\n"
+"    --batch N             minibatch positions             (default 256)\n"
+"    --steps N             optimiser steps per generation  (default 200)\n"
+"    --lr X --lr-final X --wd X --clip X --value-coef X\n"
+"    --draw-penalty X --buffer N --max-plies N --opening-plies N\n"
+"    --temp-start X --temp-end X --cpuct X --dir-alpha X --dir-eps X\n"
+"    --resign X --resign-check X --elite F --cull F --mutate-sigma X\n"
+"    --hof-every N --hof-pct N\n"
+"    --seed N --run NAME --quiet\n"
+"\n"
 "  bench      measure throughput: full games/sec with the network in the loop\n"
 "    --seconds S --threads N --max-plies N --no-record --model PATH\n"
 "\n"
@@ -640,7 +732,7 @@ static int usage(void)
 "\n"
 "NETWORK   %d sparse inputs -> %d accumulator -> %d hidden -> policy(%d) + value\n"
 "          %zu trunk parameters shared, %zu per agent\n",
-    default_threads(), NF_INPUT, NF_ACC, NF_HID, NF_PDIM,
+    default_threads(), default_threads(), NF_INPUT, NF_ACC, NF_HID, NF_PDIM,
     (size_t)TRUNK_NPARAM, (size_t)HEAD_NPARAM);
     return 0;
 }
@@ -659,6 +751,7 @@ int main(int argc, char **argv)
     char **rargv = argv + 2;
 
     if (!strcmp(cmd, "train"))    return cmd_train(rargc, rargv);
+    if (!strcmp(cmd, "az"))       return cmd_az(rargc, rargv);
     if (!strcmp(cmd, "bench"))    return cmd_bench(rargc, rargv);
     if (!strcmp(cmd, "perft"))    return cmd_perft(rargc, rargv);
     if (!strcmp(cmd, "selfplay")) return cmd_selfplay(rargc, rargv);

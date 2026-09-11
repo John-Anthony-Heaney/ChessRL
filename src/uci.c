@@ -10,33 +10,50 @@
  * against Stockfish (or against a deliberately crippled copy of itself) using
  * standard tooling.
  *
- * Two options exist specifically for that calibration:
+ * WHICH ENGINE PLAYS  (docs/FROM_SCRATCH.md is the contract)
+ * ---------------------------------------------------------
+ * `Engine` selects the mover, and it DEFAULTS TO mcts:
  *
- *   UseSearch false   plays the RAW POLICY ARGMAX with no search whatsoever.
- *                     This separates what the network learned from what the
- *                     hand-written alpha-beta contributes -- without it the two
- *                     contributions are hopelessly confounded in one number.
- *   BlunderRate       weakens play on purpose.  An agent that loses 100% of its
- *                     games tells you almost nothing; a ladder of deliberately
- *                     weakened opponents brackets it from both sides.
+ *   mcts        PUCT Monte-Carlo tree search (src/mcts.c) over the learned
+ *               priors, root noise OFF, temperature 0 (argmax of visit counts).
+ *               THE SHIPPED AGENT.  The only evaluations are the network's
+ *               policy and value heads; everything else is the rules of chess.
+ *   policy      the raw policy argmax, no search whatsoever.  MEASUREMENT ONLY:
+ *               it separates what the network learned from what the search
+ *               contributes -- without it the two are confounded in one number.
+ *   alphabeta   the src/search.c baseline -- a second, structurally different
+ *               searcher over the SAME network.  MEASUREMENT ONLY.
+ *
+ * `Sims` is the MCTS strength dial: simulations per move.  `BlunderRate`
+ * weakens play on purpose in every mode -- an agent that loses 100% of its
+ * games tells you almost nothing, whereas a ladder of deliberately weakened
+ * opponents brackets it from both sides.
+ *
+ * `UseSearch` is kept as a deprecated alias so existing harness scripts and
+ * `--no-search` keep working: false means Engine=policy, true means the default
+ * Engine=mcts.  It is no longer advertised in the option list.
  *
  * Structure
  * ---------
  * The reader loop owns stdin and never blocks on a search: searches run on a
  * worker thread, so `isready` and `stop` are answered while the engine thinks.
  *
- * search_best() runs its own iterative deepening and exposes no per-iteration
- * callback, and search.c is out of bounds for this work, so the `info depth`
- * stream is produced by calling search_best() once per target depth (1, 2, 3,
- * ...).  The transposition table lives in the Search object and survives across
- * those calls, so revisiting the shallow depths is nearly free; each call still
- * respects the *remaining* clock, so the outer loop cannot overrun the budget.
+ * Neither searcher exposes a per-iteration callback, and neither mcts.c nor
+ * search.c is ours to change, so the `info` stream is produced by calling the
+ * searcher once per budget step: search_best() once per target depth (1, 2, 3,
+ * ...) in alphabeta mode, and mcts_search() once per simulation budget (32, 64,
+ * 128, ...) in mcts mode.  Alpha-beta's transposition table survives across
+ * those calls so revisiting shallow depths is nearly free; MCTS builds a fresh
+ * tree each time, so the ramp costs at most 2x the final pass, which buys a
+ * `go` that genuinely respects `movetime` and `wtime`.  Each step is given the
+ * *remaining* clock, so the outer loop cannot overrun the budget.
  *
  * Nothing is ever written to stdout that is not valid UCI.  Diagnostics go out
  * as `info string`, which is part of the protocol; genuine errors go to stderr.
  */
 
 #include <ctype.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -48,6 +65,7 @@
 #include <time.h>
 
 #include "chess.h"
+#include "mcts.h"
 #include "net.h"
 #include "search.h"
 
@@ -74,6 +92,37 @@
  * Duplicated rather than exported because search.h is not ours to change. */
 #define UCI_MATE          30000
 #define UCI_MATE_BOUND    (UCI_MATE - 64)
+
+/* ------------------------------------------------------------ engine modes */
+#define UCI_ENGINE_MCTS       0   /* the shipped agent, and the default       */
+#define UCI_ENGINE_POLICY     1   /* measurement only                         */
+#define UCI_ENGINE_ALPHABETA  2   /* measurement only                         */
+
+/* ------------------------------------------------------------------- MCTS */
+/* Simulations per move.  800 is the AlphaZero-paper figure for evaluation play
+ * and costs about 4 ms here, which suits a 40/5' time control.  `go nodes N`
+ * overrides it exactly (nodes ARE simulations); `go depth D` caps it at
+ * D * UCI_SIMS_PER_DEPTH, the same map api.c uses, so a GUI's depth slider
+ * still means "think harder". */
+#define UCI_DEF_SIMS         800
+#define UCI_MAX_SIMS      262144
+#define UCI_SIMS_PER_DEPTH    64
+#define UCI_SIMS_FIRST        32   /* first pass of the time-capped ramp      */
+
+/* One simulation expands at most one node, which adds one child per legal move.
+ * 40 is a comfortable bound on the average branch factor.  The pool is capped
+ * so that an absurd `Sims` cannot ask for gigabytes: past the cap mcts.c
+ * degrades gracefully -- it keeps evaluating and stops growing the tree. */
+#define UCI_POOL_PER_SIM      40
+#define UCI_POOL_MAX_NODES 2000000
+
+/* `go infinite` / `go ponder` has no budget to ramp against, so the ramp would
+ * otherwise run all the way to UCI_MAX_SIMS and a `stop` arriving early in that
+ * pass would wait seconds for it.  mcts_search() cannot be interrupted (mcts.h
+ * offers no stop hook and is not ours to change), so the pass size is what
+ * bounds `stop` latency: 32768 simulations is about 300 ms, and the tree is
+ * already far larger than any real time control would build. */
+#define UCI_INF_SIMS       32768
 
 /* ---------------------------------------------------------------- output */
 
@@ -142,7 +191,11 @@ static int    g_generation;
 static int    g_agent;          /* resolved index actually in use            */
 static int    g_have_model;
 
-static Search g_search;
+static Search g_search;         /* measurement-only alpha-beta baseline      */
+static Mcts   g_mcts;           /* the shipped agent                         */
+static int    g_pool_sims;      /* sims the node pool is sized for           */
+static uint64_t g_mcts_rng[4] = { 0x9E3779B97F4A7C15ull, 0xBF58476D1CE4E5B9ull,
+                                  0x94D049BB133111EBull, 0x2545F4914F6CDD1Dull };
 static Game   g_game;           /* position set by the last `position` cmd   */
 
 /* options */
@@ -150,7 +203,8 @@ static char g_model_path[UCI_PATH_MAX] = UCI_DEF_MODEL;
 static int  g_opt_agent    = -1;        /* -1 = champion by Elo              */
 static int  g_hash_mb      = UCI_DEF_HASH;
 static int  g_blunder_pct  = 0;
-static int  g_use_search   = 1;
+static int  g_engine       = UCI_ENGINE_MCTS;   /* THE DEFAULT IS MCTS       */
+static int  g_sims         = UCI_DEF_SIMS;
 static int  g_overhead_ms  = UCI_DEF_OVERHEAD;
 
 /* ------------------------------------------------------------- threading */
@@ -408,6 +462,90 @@ static Move policy_move(const Position *p, const Move *list, int n)
     return list[order[pick]];
 }
 
+/* ==========================================================================
+ * the MCTS agent
+ * ========================================================================== */
+
+/* A value in [-1,1] rendered as the integer a GUI expects in `score cp`.
+ *
+ *      cp = 300 * atanh(clamp(v, -0.995, +0.995))
+ *
+ * atanh undoes the value head's tanh, so the map is strictly monotone: it
+ * changes the units and reorders nothing.  300 is arbitrary presentation and is
+ * NOT calibrated against a pawn -- this engine has never been told what a pawn
+ * is worth, and `score cp` is the only place the word "pawn" survives at all.
+ * MCTS has no mate distance to report, so mcts mode never emits `score mate`;
+ * a forced mate shows up as the value saturating near the +-899 clamp. */
+static int value_to_cp(double v)
+{
+    double cp;
+    if (!(v == v)) return 0;                      /* NaN */
+    if (v >  0.995) v =  0.995;
+    if (v < -0.995) v = -0.995;
+    cp = 300.0 * atanh(v);
+    if (cp >  20000.0) cp =  20000.0;
+    if (cp < -20000.0) cp = -20000.0;
+    return (int)(cp < 0 ? cp - 0.5 : cp + 0.5);
+}
+
+/* Size the node pool for `sims` simulations.  Never shrinks; never called from
+ * inside a search, so the hot path stays allocation-free. */
+static void mcts_pool_for(int sims)
+{
+    long want, nodes;
+
+    if (sims <= g_pool_sims && g_mcts.pool) return;
+    want  = (long)sims + (sims >> 3) + 8;
+    nodes = want * UCI_POOL_PER_SIM + 1;
+    if (nodes > UCI_POOL_MAX_NODES) nodes = UCI_POOL_MAX_NODES;
+
+    mcts_free(&g_mcts);
+    mcts_init(&g_mcts, (int)nodes);
+    g_pool_sims = g_mcts.pool ? (int)want : 0;
+}
+
+/* The principal variation of a finished MCTS tree: the most-visited child at
+ * every step.  That is what "the search believes" means for a visit-count
+ * agent, exactly as the root move is the most-visited root child.  pv_str()
+ * re-validates every move against the position before printing it. */
+static int mcts_pv(Move *pv, int max)
+{
+    int n = 0, idx = 0;
+
+    if (!g_mcts.pool || g_mcts.used <= 0) return 0;
+    while (n < max) {
+        const MctsNode *nd = &g_mcts.pool[idx];
+        int32_t bn = -1;
+        int     b  = -1, i;
+
+        if (nd->first < 0 || nd->nchild <= 0) break;
+        for (i = 0; i < nd->nchild; i++) {
+            const MctsNode *c = &g_mcts.pool[nd->first + i];
+            if (c->N > bn) { bn = c->N; b = i; }
+        }
+        if (b < 0 || bn <= 0) break;
+        idx = nd->first + b;
+        pv[n++] = g_mcts.pool[idx].move;
+    }
+    return n;
+}
+
+/* Rank the root's legal moves by visit count, best first (stable on ties).
+ * Used for the chosen move and for BlunderRate's "better-scoring half" rule,
+ * which is then the same rule in all three engine modes. */
+static void visit_rank(const int32_t *visits, int n, int *order)
+{
+    int i, j;
+    for (i = 0; i < n; i++) order[i] = i;
+    for (i = 1; i < n; i++) {
+        const int     idx = order[i];
+        const int32_t v   = visits[idx];
+        j = i - 1;
+        while (j >= 0 && visits[order[j]] < v) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = idx;
+    }
+}
+
 /* ------------------------------------------------------------- formatting */
 
 static void score_str(int cp, char *buf, size_t buflen)
@@ -509,51 +647,157 @@ static int64_t compute_budget_ms(const GoLimits *L, int side)
 
 /* ------------------------------------------------------------------ search */
 
-/* Runs one `go` to completion and emits exactly one bestmove.  Always. */
-static void run_go(void)
-{
-    Game     *g = &g_job_game;
-    GoLimits  L = g_limits;
-    Move      list[MAX_MOVES];
-    Move      best = MV_NONE;
-    Move      pv[UCI_PV_MAX];
-    char      pvbuf[UCI_PV_MAX * 6 + 8];
-    char      bestuci[8];
-    double    t0 = now_ms();
-    uint64_t  total_nodes = 0;
-    int64_t   budget;
-    int       nlegal, maxd, d;
-    int       best_score = 0, emitted = 0;
+/* ==========================================================================
+ * running one `go`
+ * ==========================================================================
+ * Each of the three movers below emits its own `info` lines and returns the
+ * move to play.  run_go() owns the single `bestmove` that a `go` must always
+ * produce, so none of them can forget it or emit two.
+ */
 
+/* ---- mcts: THE SHIPPED AGENT --------------------------------------------
+ *
+ * Root noise OFF and temperature 0 (argmax of visit counts): this is real play,
+ * not self-play exploration.  `nodes` is the simulation count and `depth` is
+ * the deepest point the tree reached, both of which are what those words mean
+ * for a visit-count agent.
+ *
+ * The simulation budget ramps 32, 64, 128, ... so that `movetime`, `wtime` and
+ * `stop` are all honoured: mcts_search() runs to completion once called, so the
+ * only place to check the clock is between passes.  A fresh tree per pass makes
+ * the ramp cost at most 2x the final pass, and the final pass is the one whose
+ * tree answers.  `stop` latency is therefore one pass -- 4 ms at the default
+ * 800 simulations.                                                          */
+static Move run_mcts(Game *g, const GoLimits *L, const Move *list, int nlegal,
+                     Move fallback, double t0, uint64_t *nodes_out)
+{
+    int32_t visits[MAX_MOVES];
+    int     order[MAX_MOVES];
+    Move    pv[UCI_PV_MAX];
+    char    pvbuf[UCI_PV_MAX * 6 + 8];
+    int64_t budget = compute_budget_ms(L, g->pos.side);
+    long    target;
+    int     run, done = 0, nroot = 0, emitted = 0;
+    float   rootv = 0.0f;
+    Move    best = fallback;
+
+    *nodes_out = 0;
     pvbuf[0] = '\0';
 
-    nlegal = gen_legal(&g->pos, list);
-    if (nlegal <= 0) {                      /* checkmate, stalemate, no move */
-        say("bestmove 0000");
-        return;
+    if (!g_search.trunk || !g_search.head) {          /* no model loaded */
+        say("info string no model: playing the first legal move");
+        return fallback;
     }
 
-    /* search_best() refuses to run once Game.result is set, which includes
-     * draws by repetition / fifty-move.  A UCI engine must still answer while
-     * legal moves exist: adjudication is the GUI's job, not the engine's. */
-    g->result = GR_ONGOING;
-    g->reason = TR_NONE;
+    /* `Sims`, overridden exactly by `go nodes`, capped by `go depth`. */
+    target = g_sims;
+    if (L->nodes > 0)  target = (long)L->nodes;
+    if (L->depth > 0) {
+        const long cap = (long)L->depth * UCI_SIMS_PER_DEPTH;
+        if (cap < target) target = cap;
+    }
+    if (L->infinite)   target = UCI_INF_SIMS;   /* bounds `stop` latency */
+    if (target < 1)          target = 1;
+    if (target > UCI_MAX_SIMS) target = UCI_MAX_SIMS;
 
-    /* A legal move in hand before a single node is searched, so an immediate
-     * `stop` still produces a real answer. */
-    best = policy_move(&g->pos, list, nlegal);
-    if (best == MV_NONE) best = list[0];
-
-    if (!g_use_search) {
-        /* Raw policy argmax: no search, one network evaluation, no nodes. */
-        move_to_uci(best, bestuci);
-        emit_info(1, search_eval_cp(&g_search, &g->pos), 1, now_ms() - t0, bestuci);
-        say("bestmove %s", bestuci);
-        return;
+    mcts_pool_for((int)target);
+    if (!g_mcts.pool) {
+        say("info string cannot allocate an MCTS node pool");
+        return fallback;
     }
 
-    budget = compute_budget_ms(&L, g->pos.side);
-    maxd   = (L.depth > 0) ? L.depth : UCI_MAX_DEPTH;
+    run = (target < UCI_SIMS_FIRST) ? (int)target : UCI_SIMS_FIRST;
+    for (;;) {
+        int pvlen;
+
+        g_mcts.evals          = 0;
+        g_mcts.max_depth_seen = 0;
+
+        nroot = mcts_search(&g_mcts, g_search.trunk, g_search.head, g,
+                            run, 0 /* no root noise */, g_mcts_rng, visits, &rootv);
+        if (nroot <= 0) break;                        /* already over */
+        done = run;
+
+        visit_rank(visits, nroot, order);
+        if (order[0] >= 0 && order[0] < nlegal) best = list[order[0]];
+
+        pvlen = mcts_pv(pv, UCI_PV_MAX);
+        pv_str(&g->pos, pv, pvlen, pvbuf, sizeof pvbuf);
+        emit_info(g_mcts.max_depth_seen > 0 ? g_mcts.max_depth_seen : 1,
+                  value_to_cp((double)rootv), (uint64_t)done, now_ms() - t0, pvbuf);
+        emitted = 1;
+
+        if (stopping()) break;
+        if (run >= target) {
+            if (!L->infinite) break;
+            /* `go infinite` must not answer until `stop`.  The tree is as big
+             * as the pool allows, so idle rather than burn a core re-searching. */
+            while (!stopping()) nap_us(2000);
+            break;
+        }
+        /* The next pass is about twice this one; do not start one that cannot
+         * finish inside the budget. */
+        if (budget > 0 && (now_ms() - t0) * 3.0 >= (double)budget) break;
+        run = (run * 2 > (int)target) ? (int)target : run * 2;
+    }
+
+    /* BlunderRate: play a uniformly random move from the better-visited half of
+     * the root moves.  Identical in shape to the rule search.c and policy_move()
+     * use, so the option means the same thing in all three modes. */
+    if (nroot > 1 && g_blunder_pct > 0 &&
+        rndf() < (float)g_blunder_pct / 100.0f) {
+        int half = nroot / 2;
+        if (half < 1) half = 1;
+        best = list[order[(int)(rnd64() % (uint64_t)half)]];
+    }
+
+    if (!emitted) {
+        char one[8];
+        move_to_uci(best, one);
+        emit_info(1, value_to_cp((double)rootv), (uint64_t)done, now_ms() - t0, one);
+    }
+    *nodes_out = (uint64_t)done;
+    return best;
+}
+
+/* ---- policy: MEASUREMENT ONLY -------------------------------------------
+ * The raw policy argmax.  One network evaluation, no search, no nodes.  This is
+ * the number that says how much the network itself knows. */
+static Move run_policy(Game *g, const Move *list, int nlegal, Move fallback,
+                       double t0, uint64_t *nodes_out)
+{
+    int   order[MAX_MOVES];
+    float v = 0.0f;
+    char  one[8];
+
+    *nodes_out = 1;
+    if (policy_rank(&g->pos, list, nlegal, order, &v) != nlegal)
+        return fallback;
+
+    move_to_uci(fallback, one);
+    emit_info(1, value_to_cp((double)v), 1, now_ms() - t0, one);
+    return fallback;        /* policy_move() already applied BlunderRate */
+}
+
+/* ---- alphabeta: MEASUREMENT ONLY ----------------------------------------
+ * The src/search.c baseline: a second, structurally different searcher over the
+ * same network, kept so the MCTS agent has something to be measured against.
+ * search_best() exposes no per-iteration callback, so the `info depth` stream
+ * comes from calling it once per target depth; the transposition table survives
+ * across the calls, so the shallow re-searches are nearly free. */
+static Move run_alphabeta(Game *g, const GoLimits *L, const Move *list, int nlegal,
+                          Move fallback, double t0, uint64_t *nodes_out)
+{
+    Move     pv[UCI_PV_MAX];
+    char     pvbuf[UCI_PV_MAX * 6 + 8];
+    Move     best = fallback;
+    uint64_t total_nodes = 0;
+    int64_t  budget = compute_budget_ms(L, g->pos.side);
+    int      maxd = (L->depth > 0) ? L->depth : UCI_MAX_DEPTH;
+    int      d, best_score = 0, emitted = 0;
+
+    (void)nlegal;
+    pvbuf[0] = '\0';
 
     for (d = 1; d <= maxd; d++) {
         Move   m;
@@ -575,9 +819,9 @@ static void run_go(void)
         /* `go nodes` counts every node this command searches, re-searched
          * shallow depths included, so the limit is a true ceiling on work
          * done rather than on the deepest pass alone. */
-        if (L.nodes) {
-            if (total_nodes >= L.nodes) break;
-            g_search.max_nodes = L.nodes - total_nodes;
+        if (L->nodes) {
+            if (total_nodes >= L->nodes) break;
+            g_search.max_nodes = L->nodes - total_nodes;
         } else {
             g_search.max_nodes = 0;
         }
@@ -605,10 +849,58 @@ static void run_go(void)
         if (best_score >= UCI_MATE_BOUND || best_score <= -UCI_MATE_BOUND) break;
     }
 
-    move_to_uci(best, bestuci);
-    if (!emitted)                                       /* stopped before depth 1 */
+    if (!emitted) {                                     /* stopped before depth 1 */
+        char one[8];
+        move_to_uci(best, one);
         emit_info(1, search_eval_cp(&g_search, &g->pos), total_nodes,
-                  now_ms() - t0, bestuci);
+                  now_ms() - t0, one);
+    }
+    *nodes_out = total_nodes;
+    return best;
+}
+
+/* Runs one `go` to completion and emits exactly one bestmove.  Always. */
+static void run_go(void)
+{
+    Game     *g = &g_job_game;
+    GoLimits  L = g_limits;
+    Move      list[MAX_MOVES];
+    Move      best = MV_NONE;
+    char      bestuci[8];
+    double    t0 = now_ms();
+    uint64_t  nodes = 0;
+    int       nlegal;
+
+    nlegal = gen_legal(&g->pos, list);
+    if (nlegal <= 0) {                      /* checkmate, stalemate, no move */
+        say("bestmove 0000");
+        return;
+    }
+
+    /* search_best() and mcts_search() both refuse to run once Game.result is
+     * set, which includes draws by repetition / fifty-move.  A UCI engine must
+     * still answer while legal moves exist: adjudication is the GUI's job. */
+    g->result = GR_ONGOING;
+    g->reason = TR_NONE;
+
+    /* A legal move in hand before a single node is searched, so an immediate
+     * `stop` still produces a real answer. */
+    best = policy_move(&g->pos, list, nlegal);
+    if (best == MV_NONE) best = list[0];
+
+    switch (g_engine) {
+        case UCI_ENGINE_POLICY:
+            best = run_policy(g, list, nlegal, best, t0, &nodes);
+            break;
+        case UCI_ENGINE_ALPHABETA:
+            best = run_alphabeta(g, &L, list, nlegal, best, t0, &nodes);
+            break;
+        default:
+            best = run_mcts(g, &L, list, nlegal, best, t0, &nodes);
+            break;
+    }
+
+    move_to_uci(best, bestuci);
     say("bestmove %s", bestuci);
 }
 
@@ -701,6 +993,15 @@ static int truthy(const char *s)
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+static const char *engine_name(int e)
+{
+    switch (e) {
+        case UCI_ENGINE_POLICY:    return "policy";
+        case UCI_ENGINE_ALPHABETA: return "alphabeta";
+        default:                   return "mcts";
+    }
+}
+
 static void cmd_setoption(char **tok, int n)
 {
     char name[128], value[UCI_PATH_MAX];
@@ -746,8 +1047,23 @@ static void cmd_setoption(char **tok, int n)
     } else if (!strcasecmp(name, "BlunderRate")) {
         g_blunder_pct = clampi((int)strtol(value, NULL, 10), 0, 100);
         g_search.blunder_rate = (float)g_blunder_pct / 100.0f;
+    } else if (!strcasecmp(name, "Engine")) {
+        if      (!strcasecmp(value, "mcts"))      g_engine = UCI_ENGINE_MCTS;
+        else if (!strcasecmp(value, "policy"))    g_engine = UCI_ENGINE_POLICY;
+        else if (!strcasecmp(value, "alphabeta")) g_engine = UCI_ENGINE_ALPHABETA;
+        else {
+            say("info string unknown Engine '%s' (mcts|policy|alphabeta), keeping %s",
+                value, engine_name(g_engine));
+            return;
+        }
+        say("info string engine %s%s", engine_name(g_engine),
+            g_engine == UCI_ENGINE_MCTS ? "" : "  (MEASUREMENT ONLY -- not the shipped agent)");
+    } else if (!strcasecmp(name, "Sims")) {
+        g_sims = clampi((int)strtol(value, NULL, 10), 1, UCI_MAX_SIMS);
     } else if (!strcasecmp(name, "UseSearch")) {
-        g_use_search = value[0] ? truthy(value) : 1;
+        /* Deprecated alias, kept so existing harness scripts keep working:
+         * false selects the raw policy, true restores the default agent. */
+        g_engine = (value[0] && !truthy(value)) ? UCI_ENGINE_POLICY : UCI_ENGINE_MCTS;
     } else if (!strcasecmp(name, "MoveOverhead")) {
         g_overhead_ms = clampi((int)strtol(value, NULL, 10), 0, UCI_MAX_OVERHEAD);
     }
@@ -825,11 +1141,16 @@ static void cmd_uci(void)
     say("option name Model type string default %s",
         g_model_path[0] ? g_model_path : "<empty>");
     say("option name Agent type spin default %d min -1 max %d", g_opt_agent, UCI_MAX_AGENT);
+    /* The shipped agent is `mcts`; the other two are measurement baselines. */
+    say("option name Engine type combo default %s var mcts var policy var alphabeta",
+        engine_name(g_engine));
+    say("option name Sims type spin default %d min 1 max %d", g_sims, UCI_MAX_SIMS);
     say("option name Hash type spin default %d min 1 max %d", g_hash_mb, UCI_MAX_HASH);
     say("option name BlunderRate type spin default %d min 0 max 100", g_blunder_pct);
-    say("option name UseSearch type check default %s", g_use_search ? "true" : "false");
     say("option name MoveOverhead type spin default %d min 0 max %d",
         g_overhead_ms, UCI_MAX_OVERHEAD);
+    /* UseSearch is still accepted (see cmd_setoption) but no longer advertised:
+     * Engine supersedes it and a GUI should not be offered both. */
     say("uciok");
 }
 
@@ -857,13 +1178,26 @@ int uci_main(int argc, char **argv)
         else if (!strcmp(argv[i], "--hash")    && v) g_hash_mb     = clampi((int)strtol(v, NULL, 10), 1, UCI_MAX_HASH);
         else if (!strcmp(argv[i], "--blunder") && v) g_blunder_pct = clampi((int)strtol(v, NULL, 10), 0, 100);
         else if (!strcmp(argv[i], "--overhead")&& v) g_overhead_ms = clampi((int)strtol(v, NULL, 10), 0, UCI_MAX_OVERHEAD);
-        else if (!strcmp(argv[i], "--no-search"))    g_use_search  = 0;
+        else if (!strcmp(argv[i], "--sims")    && v) g_sims        = clampi((int)strtol(v, NULL, 10), 1, UCI_MAX_SIMS);
+        else if (!strcmp(argv[i], "--engine")  && v) {
+            if      (!strcmp(v, "policy"))    g_engine = UCI_ENGINE_POLICY;
+            else if (!strcmp(v, "alphabeta")) g_engine = UCI_ENGINE_ALPHABETA;
+            else                              g_engine = UCI_ENGINE_MCTS;
+        }
+        else if (!strcmp(argv[i], "--no-search"))    g_engine      = UCI_ENGINE_POLICY;
     }
 
     reset_search((size_t)g_hash_mb);
     load_model(g_model_path);           /* silent: nothing may precede `uci` */
     resolve_agent();
     game_start(&g_game);
+
+    /* mcts_search() wants a valid xoshiro state even with root noise off, and
+     * a non-deterministic one so that two engines in the same match are not
+     * locked in step by any tie-break that reaches for it. */
+    g_mcts_rng[0] ^= g_rng;
+    g_mcts_rng[3] ^= (uint64_t)(uintptr_t)&worker;
+    mcts_pool_for(g_sims);
 
     have_worker = (pthread_create(&worker, NULL, worker_main, NULL) == 0);
 
@@ -879,6 +1213,7 @@ int uci_main(int argc, char **argv)
             cmd_uci();
             if (!said_startup) {
                 said_startup = 1;
+                say("info string engine %s, %d simulations/move", engine_name(g_engine), g_sims);
                 if (g_have_model)
                     say("info string model %s: %d agents, generation %d, playing agent %d",
                         g_model_path, g_nagents, g_generation, g_agent);
@@ -919,6 +1254,7 @@ int uci_main(int argc, char **argv)
     if (have_worker) pthread_join(worker, NULL);
 
     search_free(&g_search);
+    mcts_free(&g_mcts);
     free_model();
     return 0;
 }

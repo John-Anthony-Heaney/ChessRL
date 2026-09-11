@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include "net.h"
 
+enum { AZ_START_CLASSICAL = 0, AZ_START_960 = 1, AZ_START_MIXED = 2 };
+
 typedef struct {
     /* population */
     int   n_agents;
@@ -24,6 +26,10 @@ typedef struct {
     int   threads;
 
     /* self-play */
+    /* Where games start.  Training across the 960 Chess960 arrays stops the
+     * agent memorising patterns tied to one opening array: whatever it learns
+     * has to transfer, because it never sees the same start twice in a row. */
+    int   start_mode;        /* AZ_START_*                                    */
     int   sims;              /* MCTS simulations per move                     */
     int   max_plies;         /* adjudicate a draw at this many plies          */
     int   opening_plies;     /* plies played at temp_start before temp_end    */

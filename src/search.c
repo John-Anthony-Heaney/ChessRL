@@ -1,20 +1,66 @@
-/* search.c -- alpha-beta engine used when a human plays the champion.
+/* search.c -- MEASUREMENT-ONLY alpha-beta baseline.  NOT the shipped agent.
  *
- * This file is NOT on the training hot path (training samples straight from the
- * policy head), so it optimises for playing strength and for answering inside a
- * fixed movetime rather than for raw node throughput.
+ * ===========================================================================
+ * WHAT THIS FILE IS FOR, AND WHY IT IS NOT THE AGENT
+ * ===========================================================================
+ * The shipped agent picks its moves with PUCT MCTS over the learned priors
+ * (src/mcts.c, driven from api.c and uci.c).  This file is retained for ONE
+ * purpose: measurement.  When you want to answer "how much of the strength is
+ * the network and how much is the tree search?", you need a second, structurally
+ * different searcher over the same network to compare against.  That is all
+ * this is.  Nothing selects it by default:
  *
- * Structure
- *   iterative deepening
- *     + aspiration windows around the previous iteration's score
- *     + principal variation search (null-window scouts, full-window re-search)
- *     + transposition table (power-of-two entries, replace-by-depth)
- *     + null-move pruning, reverse futility, quiet futility, SEE pruning
- *     + late move reductions, check extensions
- *     + killers, history-with-gravity, and -- the big win here -- the network
- *       POLICY head as the primary ordering key for quiet moves
- *     + quiescence over captures / queen promotions with stand-pat + delta pruning
+ *   - api.c   -- api_engine_move() uses MCTS.  Alpha-beta is reachable only via
+ *                api_engine_set_mode(eid, "alphabeta").
+ *   - uci.c   -- the `Engine` option defaults to `mcts`.  Alpha-beta is
+ *                reachable only via `setoption name Engine value alphabeta`.
  *
+ * ===========================================================================
+ * WHAT WAS REMOVED, AND WHY  (docs/FROM_SCRATCH.md is the contract)
+ * ===========================================================================
+ * The previous version of this file was where essentially all of the old
+ * engine's playing strength actually lived, and none of it was learned:
+ *
+ *   PIECE_CP[] / MAT_CP[] {100,320,330,500,900}  hand-written piece values
+ *   material_cp()                                 hand-written material count
+ *   blend_cp()  = 0.55*net + 0.45*material        the hand-written term, not
+ *                                                 the network, chose the moves
+ *   s_see() / s_attackers()                       static exchange evaluation
+ *   MVV-LVA capture ordering                      hand-authored "good capture"
+ *   order_captures()                              ditto, for quiescence
+ *   killer moves, history-with-gravity            hand-authored move preference
+ *   quiescence search over captures/promotions    "captures are the noisy moves"
+ *   delta pruning (stand_pat + PIECE_CP[QUEEN])   piece values again
+ *   reverse futility / quiet futility margins     margins calibrated in the
+ *                                                 material centipawn scale
+ *   null-move pruning guarded by has_big_piece()  piece-type zugzwang knowledge
+ *
+ * ALL of it is gone.  What survives is a general-purpose game-tree search whose
+ * only two inputs are the network's two heads and the rules of chess:
+ *
+ *   LEAF EVALUATION  -- the value head, alone.  leaf_cp() is a fixed monotone
+ *                       map of v into a "centipawn-ish" integer so the UCI
+ *                       `score cp` field and search.h's score_cp stay the same
+ *                       shape.  It is presentation, not evaluation: the ordering
+ *                       of any two positions is exactly the ordering of their v.
+ *   MOVE ORDERING    -- the policy head, alone (plus the transposition table's
+ *                       own best move, which is a search result, not knowledge).
+ *   TERMINAL VALUES  -- checkmate, stalemate, repetition, fifty-move and dead
+ *                       positions, from chess.c.  These are the rules of the
+ *                       game; a random mover uses the same facts.
+ *
+ * Everything between those (iterative deepening, aspiration windows, principal
+ * variation search, the transposition table, late move reductions and late move
+ * pruning by ordering rank) is domain-independent bandit/alpha-beta machinery.
+ * Swap chess.c and net.c for another game's and this file is unchanged.
+ *
+ * tools/audit_knowledge.sh greps this file along with the rest of the play and
+ * learning path.  It is deliberately NOT exempted: a measurement baseline that
+ * quietly re-grew a material term would poison every measurement made with it.
+ *
+ * ===========================================================================
+ * CONCURRENCY
+ * ===========================================================================
  * Everything mutable lives either in the caller's Search object or in a Ctx
  * allocated per search_best() call, so distinct Search objects are completely
  * independent and may be driven from different threads.  There are no globals
@@ -36,32 +82,25 @@
 #define S_MATE        30000                 /* mate at ply 0                 */
 #define S_MATE_BOUND  (S_MATE - S_MAX_PLY)  /* anything above this is a mate */
 #define S_INF         31000
-#define QS_MAX_PLY    6                     /* quiescence plies past horizon */
 
-#define SBIT(x)       (1ULL << (x))
-
-/* Ordering bands.  Strictly decreasing, no overlap:
- *   TT  >  good captures/promos  >  killers  >  quiets  >  losing captures    */
+/* Ordering bands.  Strictly decreasing, no overlap.  There are exactly two:
+ * the transposition table's move, and then every other move by its policy
+ * prior.  There is no third band, because a third band would have to encode
+ * an opinion about chess.                                                   */
 #define ORD_TT        16777216
-#define ORD_GOODCAP    8388608
-#define ORD_KILLER1    7000000
-#define ORD_KILLER2    6900000
-#define ORD_QUIET      1000000     /* + policy (0..600k) + history (0..262k)  */
-#define ORD_BADCAP      100000     /* + see (negative)                        */
+#define ORD_POLICY     1000000.0f           /* prior in [0,1] -> 0 .. 1e6    */
 
-#define POLICY_SCALE   600000.0f
-#define HIST_MAX         16384
-#define HIST_ORD_SCALE      16     /* (h + HIST_MAX) * 16 -> 0 .. 524288      */
+/* Leaf evaluation scale.  See leaf_cp(). */
+#define EVAL_CLAMP       0.995f
+#define EVAL_CP_SCALE  300.0f
 
-/* Static piece values, centipawns.  KING is huge so that SEE never treats a
- * king capture as a real gain (the recapture then dominates the swap list). */
-static const int PIECE_CP[NPIECES] = { 100, 320, 330, 500, 900, 20000 };
-/* Material-count values: the king must not contribute to the balance. */
-static const int MAT_CP[NPIECES]   = { 100, 320, 330, 500, 900, 0 };
-
-/* Weighting of the two halves of the leaf evaluation (see search_eval_cp). */
-#define EVAL_W_NET  0.55f
-#define EVAL_W_MAT  0.45f
+/* Late move pruning by ORDERING RANK: at a shallow non-PV node that is not in
+ * check and has not yet seen a losing-by-force score, stop after this many
+ * moves.  The rank comes from the policy head, so this prunes what the NETWORK
+ * thinks is unpromising -- it is not a hand-authored opinion about which moves
+ * matter.  Index 0 is unused (depth <= 0 goes straight to a leaf).           */
+#define LMP_MAX_DEPTH   3
+static const int LMP_COUNT[LMP_MAX_DEPTH + 1] = { 0, 12, 18, 26 };
 
 /* ------------------------------------------------------------- per-search */
 
@@ -74,8 +113,7 @@ typedef struct {
     uint64_t reps[MAX_GAME_PLIES + S_MAX_PLY + 16];
     int      nreps;
 
-    /* Per-ply move lists.  negamax(ply) and qsearch(ply) never coexist, so one
-     * slot per ply is enough for both. */
+    /* Per-ply move lists. */
     Move     mlist[S_MAX_PLY][MAX_MOVES];
     int32_t  mscore[S_MAX_PLY][MAX_MOVES];
     Fwd      fwbuf[S_MAX_PLY];          /* network forward pass, per ply      */
@@ -85,9 +123,6 @@ typedef struct {
     MoveKey  kbuf[MAX_MOVES];
     float    lbuf[MAX_MOVES];
     float    pbuf[MAX_MOVES];
-
-    Move     killer[S_MAX_PLY][2];
-    int32_t  hist[NCOLORS][64][64];
 
     Move     pvtab[S_MAX_PLY][S_PV_MAX];
     uint8_t  pvlen[S_MAX_PLY];
@@ -146,17 +181,8 @@ static void seed_rng(uint64_t *st, uint64_t seed)
 }
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
-static inline int imax(int a, int b) { return a > b ? a : b; }
 
 /* -------------------------------------------------------------- evaluation */
-
-static int material_cp(const Position *p)
-{
-    int sc = 0;
-    for (int pt = PAWN; pt <= QUEEN; pt++)
-        sc += MAT_CP[pt] * (bb_count(p->piece[WHITE][pt]) - bb_count(p->piece[BLACK][pt]));
-    return (p->side == WHITE) ? sc : -sc;
-}
 
 /* Runs the network once.  Returns 1 when the forward pass is valid. */
 static int s_forward(const Search *s, const Position *p, Fwd *fw)
@@ -169,39 +195,35 @@ static int s_forward(const Search *s, const Position *p, Fwd *fw)
     return 1;
 }
 
-/* Value head -> centipawns.
+/* THE ONLY EVALUATION IN THIS FILE: the value head, and nothing else.
  *
  * The value head is a tanh, i.e. it saturates: near +-1 it carries no usable
  * gradient of "how much better".  atanh is its exact inverse, so
  *
- *      cp_net = 300 * atanh(clamp(v, -0.995, +0.995))
+ *      cp = 300 * atanh(clamp(v, -0.995, +0.995))
  *
- * is monotone in v, maps v = 0 to 0, gives ~+-900cp (about a queen) at the
- * clamp, and turns the network's saturated region into a bounded score instead
- * of an infinite one.  300 is chosen so that v = 0.55 ("clearly better")
- * lands around +185cp, i.e. roughly two pawns -- a scale that mixes sensibly
- * with real material.
+ * is strictly monotone in v, maps v = 0 to 0, and bounds the saturated region
+ * at about +-900 instead of infinity.  Because it is strictly monotone, the
+ * search's preference between any two positions is exactly the network's
+ * preference between them: the map changes the units, never the ordering.
+ * 300 is an arbitrary presentation constant chosen so the integers land in the
+ * range a UCI GUI expects from a `score cp`.  No part of it is derived from
+ * piece values -- there are none in this file to derive it from.
  *
- * The blend with plain material exists because the value head of a partially
- * trained agent is often wrong by a piece.  Material alone would play like a
- * beginner; the network alone would occasionally leave a queen en prise
- * because it "feels" fine about the position.  0.55/0.45 keeps the network in
- * charge of positional judgement while making a hung queen cost ~400cp, which
- * no amount of network optimism can hide.
- */
-static int blend_cp(const Position *p, const Fwd *fw, int have_fw)
+ * A position with no network (trunk/head NULL) evaluates to 0: unknown, and
+ * therefore a draw, which is the only honest answer.                        */
+static int leaf_cp(const Fwd *fw, int have_fw)
 {
-    const int mat = material_cp(p);
     float v, cp;
     int r;
 
-    if (insufficient_material(p)) return 0;
-    if (!have_fw) return mat;
+    if (!have_fw) return 0;
 
     v = fw->v;
-    if (v >  0.995f) v =  0.995f;
-    if (v < -0.995f) v = -0.995f;
-    cp = EVAL_W_NET * (300.0f * atanhf(v)) + EVAL_W_MAT * (float)mat;
+    if (!isfinite(v)) return 0;
+    if (v >  EVAL_CLAMP) v =  EVAL_CLAMP;
+    if (v < -EVAL_CLAMP) v = -EVAL_CLAMP;
+    cp = EVAL_CP_SCALE * atanhf(v);
 
     r = (int)lrintf(cp);
     if (r >  20000) r =  20000;      /* stay far below the mate band */
@@ -214,90 +236,10 @@ int search_eval_cp(Search *s, const Position *p)
     Fwd fw;
     int have;
     if (!s || !p) return 0;
+    /* A dead position is a draw by the rules, whatever the network thinks. */
+    if (insufficient_material(p)) return 0;
     have = s_forward(s, p, &fw);
-    return blend_cp(p, &fw, have);
-}
-
-/* --------------------------------------------------------------- SEE ---- */
-
-static uint64_t s_attackers(const Position *p, int sq, uint64_t occ)
-{
-    uint64_t a;
-    const uint64_t bq = p->piece[WHITE][BISHOP] | p->piece[BLACK][BISHOP] |
-                        p->piece[WHITE][QUEEN]  | p->piece[BLACK][QUEEN];
-    const uint64_t rq = p->piece[WHITE][ROOK]   | p->piece[BLACK][ROOK] |
-                        p->piece[WHITE][QUEEN]  | p->piece[BLACK][QUEEN];
-
-    /* attacks_pawn(sq, C) is what a pawn OF colour C standing on sq hits, so
-     * the white pawns hitting sq are exactly those on attacks_pawn(sq, BLACK). */
-    a  = attacks_pawn(sq, BLACK) & p->piece[WHITE][PAWN];
-    a |= attacks_pawn(sq, WHITE) & p->piece[BLACK][PAWN];
-    a |= attacks_knight(sq) & (p->piece[WHITE][KNIGHT] | p->piece[BLACK][KNIGHT]);
-    a |= attacks_king(sq)   & (p->piece[WHITE][KING]   | p->piece[BLACK][KING]);
-    a |= attacks_bishop(sq, occ) & bq;
-    a |= attacks_rook(sq, occ)   & rq;
-    return a & occ;
-}
-
-/* Static exchange evaluation of a capture / promotion, in centipawns, from the
- * moving side's point of view.  Classic swap-list with x-ray updates. */
-static int s_see(const Position *p, Move m)
-{
-    const int from = MV_FROM(m), to = MV_TO(m), fl = MV_FLAG(m);
-    const uint64_t bq = p->piece[WHITE][BISHOP] | p->piece[BLACK][BISHOP] |
-                        p->piece[WHITE][QUEEN]  | p->piece[BLACK][QUEEN];
-    const uint64_t rq = p->piece[WHITE][ROOK]   | p->piece[BLACK][ROOK] |
-                        p->piece[WHITE][QUEEN]  | p->piece[BLACK][QUEEN];
-    int gain[34];
-    int d = 0, stm = p->side, moving = p->board[from];
-    uint64_t occ = p->all, attackers;
-
-    if (moving == NO_PIECE) return 0;
-
-    gain[0] = 0;
-    if (fl == MF_EP) {
-        gain[0] = PIECE_CP[PAWN];
-        occ ^= SBIT(to - ((stm == WHITE) ? 8 : -8));
-    } else if (p->board[to] != NO_PIECE) {
-        gain[0] = PIECE_CP[p->board[to]];
-    }
-    if (MV_IS_PROMO(m)) {
-        const int pp = MV_PROMO_PIECE(m);
-        gain[0] += PIECE_CP[pp] - PIECE_CP[PAWN];
-        moving = pp;
-    }
-
-    occ ^= SBIT(from);
-    occ |= SBIT(to);                       /* the mover now stands on `to`   */
-    attackers = s_attackers(p, to, occ);
-    stm ^= 1;
-
-    for (;;) {
-        uint64_t mine = attackers & p->occ[stm] & occ;
-        uint64_t b = 0;
-        int pt = PAWN, mx;
-        if (!mine) break;
-        for (; pt <= KING; pt++) { b = mine & p->piece[stm][pt]; if (b) break; }
-        if (!b) break;
-
-        d++;
-        gain[d] = PIECE_CP[moving] - gain[d - 1];
-        if (d >= 32) break;
-        mx = imax(-gain[d - 1], gain[d]);
-        if (mx < 0) break;                 /* neither side wants to continue */
-
-        occ ^= SBIT(bb_lsb(b));
-        moving = pt;
-        /* only sliders can be discovered behind the piece we just removed */
-        attackers |= (attacks_bishop(to, occ) & bq) | (attacks_rook(to, occ) & rq);
-        attackers &= occ;
-        stm ^= 1;
-    }
-    while (d > 0) {                        /* minimax back down the swap list */
-        if (-gain[d] < gain[d - 1]) gain[d - 1] = -gain[d];
-        d--;
-    }
-    return gain[0];
+    return leaf_cp(&fw, have);
 }
 
 /* ------------------------------------------------------ repetition / draw */
@@ -372,15 +314,6 @@ static void tt_store(Search *s, uint64_t key, int score, int depth, int flag,
 
 /* ------------------------------------------------------------- ordering -- */
 
-static inline void hist_add(Ctx *c, int side, int from, int to, int bonus)
-{
-    int32_t *h = &c->hist[side][from][to];
-    const int32_t a = (bonus < 0) ? -bonus : bonus;
-    *h += bonus - (int32_t)(((int64_t)(*h) * a) / HIST_MAX);
-    if (*h >  HIST_MAX) *h =  HIST_MAX;
-    if (*h < -HIST_MAX) *h = -HIST_MAX;
-}
-
 static inline void pick_best(Move *ml, int32_t *sc, int n, int i)
 {
     int b = i, j;
@@ -391,21 +324,20 @@ static inline void pick_best(Move *ml, int32_t *sc, int n, int i)
     }
 }
 
-/* Score every move of `p` for ordering.
+/* Score every move of `p` for ordering.  Exactly two rules:
  *
- *   1. transposition-table move
- *   2. captures & promotions, MVV-LVA, but demoted below every quiet move when
- *      SEE says the exchange loses material
- *   3. killers
- *   4. quiet moves ordered by the POLICY head's probability -- the network has
- *      already learned which quiet moves are worth looking at, and this is by
- *      far the largest single ordering win available here
- *   5. history as a secondary key within the policy ordering
- */
+ *   1. the transposition-table move, if any.  That is a previous SEARCH RESULT
+ *      for this very position, not a heuristic about chess.
+ *   2. everything else, by the POLICY HEAD's probability.  Nothing is added to
+ *      it, nothing is subtracted from it, and no move type is special-cased:
+ *      a capture, a promotion and a quiet rook lift are ordered purely by what
+ *      the network learned to expect.
+ *
+ * With no network (`use_policy` 0) every move scores the same and the ordering
+ * degenerates to move-generation order, which is the honest fallback.        */
 static void order_moves(Ctx *c, const Position *p, Move *ml, int32_t *sc, int n,
-                        Move ttm, int ply, const Fwd *fw, int use_policy)
+                        Move ttm, const Fwd *fw, int use_policy)
 {
-    const int side = p->side;
     int i;
 
     if (use_policy && n > 1) {
@@ -415,52 +347,10 @@ static void order_moves(Ctx *c, const Position *p, Move *ml, int32_t *sc, int n,
     }
 
     for (i = 0; i < n; i++) {
-        const Move m  = ml[i];
-        const int from = MV_FROM(m), to = MV_TO(m);
-        const int fl   = MV_FLAG(m);
-        int32_t v;
-
-        if (m == ttm) { sc[i] = ORD_TT; continue; }
-
-        if ((fl & 4) || MV_IS_PROMO(m)) {           /* capture and/or promotion */
-            int victim   = (fl == MF_EP) ? PAWN
-                         : (p->board[to] == NO_PIECE ? -1 : p->board[to]);
-            int attacker = p->board[from];
-            int mvv      = (victim >= 0 ? PIECE_CP[victim] * 16 : 0)
-                         - (attacker >= 0 && attacker < NPIECES ? PIECE_CP[attacker] : 0);
-            int see      = s_see(p, m);
-            if (MV_IS_PROMO(m)) mvv += (MV_PROMO_PIECE(m) == QUEEN) ? 20000 : 2000;
-            sc[i] = (see >= 0) ? (ORD_GOODCAP + mvv) : (ORD_BADCAP + see);
-            continue;
-        }
-
-        if (ply < S_MAX_PLY) {
-            if (m == c->killer[ply][0]) { sc[i] = ORD_KILLER1; continue; }
-            if (m == c->killer[ply][1]) { sc[i] = ORD_KILLER2; continue; }
-        }
-
-        v = ORD_QUIET;
-        if (use_policy && n > 1) v += (int32_t)(POLICY_SCALE * c->pbuf[i]);
-        v += (c->hist[side][from][to] + HIST_MAX) * HIST_ORD_SCALE / 32;
-        sc[i] = v;
-    }
-}
-
-/* Cheap MVV-LVA-only ordering for quiescence (SEE is computed once, later, in
- * the move loop where it also drives pruning). */
-static void order_captures(const Position *p, Move *ml, int32_t *sc, int n)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        const Move m = ml[i];
-        const int fl = MV_FLAG(m);
-        int victim   = (fl == MF_EP) ? PAWN
-                     : (p->board[MV_TO(m)] == NO_PIECE ? -1 : p->board[MV_TO(m)]);
-        int attacker = p->board[MV_FROM(m)];
-        int32_t v = (victim >= 0 ? PIECE_CP[victim] * 16 : 0)
-                  - (attacker >= 0 && attacker < NPIECES ? PIECE_CP[attacker] : 0);
-        if (MV_IS_PROMO(m)) v += (MV_PROMO_PIECE(m) == QUEEN) ? 20000 : 1000;
-        sc[i] = v;
+        if (ml[i] == ttm) { sc[i] = ORD_TT; continue; }
+        sc[i] = (use_policy && n > 1 && isfinite(c->pbuf[i]))
+              ? (int32_t)(ORD_POLICY * c->pbuf[i])
+              : 0;
     }
 }
 
@@ -480,13 +370,11 @@ static void pv_store(Ctx *c, int ply, Move m)
 
 /* --------------------------------------------------------------- limits -- */
 
-/* The limits apply from the very first node.  They deliberately do NOT wait for
- * depth 1 to finish: quiescence is a variable-width tree (a position with eight
- * pawns on the seventh rank generates a promotion at every node and defeats
- * stand-pat, delta and SEE pruning all at once), so "let the first iteration
- * always complete" is not a bounded amount of work -- it can run for minutes.
- * search_best() keeps a legal move in hand from before the first node, so an
- * iteration that is cut short costs quality, never correctness. */
+/* The limits apply from the very first node; they deliberately do NOT wait for
+ * depth 1 to finish.  search_best() keeps a legal move in hand from before the
+ * first node, so an iteration that is cut short costs quality, never
+ * correctness.  Every node -- interior and leaf -- passes through the counter,
+ * so the poll interval bounds the overrun in real work, not just in branches. */
 static void check_limits(Ctx *c)
 {
     Search *s = c->s;
@@ -495,116 +383,27 @@ static void check_limits(Ctx *c)
     if (c->budget_ns > 0 && now_ns() - c->t0_ns >= c->budget_ns) s->stop = 1;
 }
 
-static inline int has_big_piece(const Position *p, int col)
-{
-    return (p->piece[col][KNIGHT] | p->piece[col][BISHOP] |
-            p->piece[col][ROOK]   | p->piece[col][QUEEN]) != 0;
-}
-
-/* ---------------------------------------------------------- quiescence -- */
-
-static int qsearch(Ctx *c, int alpha, int beta, int ply, int qply)
-{
-    Search *s = c->s;
-    Position *p = &c->pos;
-    Fwd *fw = &c->fwbuf[ply];
-    int in_chk, have_fw = 0, stand, best, n, i;
-    Move *ml;
-    int32_t *sa;
-
-    c->pvlen[ply] = 0;
-    if (s->stop) return 0;
-    s->nodes++;
-    if ((s->nodes & 2047) == 0) { check_limits(c); if (s->stop) return 0; }
-
-    if (insufficient_material(p)) return 0;
-    if (ply >= S_MAX_PLY - 1) {
-        have_fw = s_forward(s, p, fw);
-        return blend_cp(p, fw, have_fw);
-    }
-
-    in_chk = in_check(p, p->side);
-
-    /* Hard bound on how far quiescence may run past the horizon.  Capture and
-     * promotion chains normally die out in three or four plies; the ones that
-     * do not are pathological (mass promotions, long check series) and are
-     * worth far less than the time they cost.  Mate is still reported exactly:
-     * a position with no legal move while in check is checkmate at any qply. */
-    if (qply >= QS_MAX_PLY) {
-        if (in_chk && gen_legal(p, c->mlist[ply]) == 0) return -S_MATE + ply;
-        have_fw = s_forward(s, p, fw);
-        return blend_cp(p, fw, have_fw);
-    }
-    stand  = -S_INF;
-    if (!in_chk) {
-        have_fw = s_forward(s, p, fw);
-        stand   = blend_cp(p, fw, have_fw);
-        if (stand >= beta) return stand;
-        if (stand > alpha) alpha = stand;
-        /* delta pruning: not even winning a queen outright would reach alpha */
-        if (stand + PIECE_CP[QUEEN] + 200 < alpha) return alpha;
-    }
-
-    ml = c->mlist[ply];
-    sa = c->mscore[ply];
-    n  = in_chk ? gen_legal(p, ml) : gen_legal_captures(p, ml);
-    if (n == 0) return in_chk ? (-S_MATE + ply) : stand;
-    order_captures(p, ml, sa, n);
-
-    best = stand;
-    for (i = 0; i < n; i++) {
-        Move m;
-        Undo u;
-        int sc;
-        pick_best(ml, sa, n, i);
-        m = ml[i];
-
-        if (!in_chk) {
-            int victim = (MV_FLAG(m) == MF_EP) ? PAWN
-                       : (p->board[MV_TO(m)] == NO_PIECE ? -1 : p->board[MV_TO(m)]);
-            int gain = (victim >= 0) ? PIECE_CP[victim] : 0;
-            if (MV_IS_PROMO(m)) gain += PIECE_CP[MV_PROMO_PIECE(m)] - PIECE_CP[PAWN];
-            if (stand + gain + 150 <= alpha) continue;   /* delta pruning      */
-            if (s_see(p, m) < 0) continue;               /* losing exchange    */
-        }
-
-        make_move(p, m, &u);
-        push_key(c, p->key);
-        sc = -qsearch(c, -beta, -alpha, ply + 1, qply + 1);
-        pop_key(c);
-        unmake_move(p, m, &u);
-        if (s->stop) return best > -S_INF ? best : stand;
-
-        if (sc > best) {
-            best = sc;
-            if (sc > alpha) {
-                alpha = sc;
-                pv_store(c, ply, m);
-                if (alpha >= beta) break;
-            }
-        }
-    }
-    return best;
-}
-
 /* ------------------------------------------------------------- negamax -- */
 
-static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null)
+static int negamax(Ctx *c, int depth, int alpha, int beta, int ply)
 {
     Search *s = c->s;
     Position *p = &c->pos;
     Fwd *fw = &c->fwbuf[ply];
     const int is_pv = (beta - alpha) > 1;
-    int in_chk, have_fw = 0, eval = 0;
-    int best = -S_INF, orig_alpha, n, i, moved_quiets = 0;
+    int in_chk, have_fw = 0;
+    int best = -S_INF, orig_alpha, n, i, lmp = 0;
     Move ttm = MV_NONE, bestm = MV_NONE;
-    Move quiets[64];
     Move *ml;
     int32_t *sa;
 
     c->pvlen[ply] = 0;
     if (s->stop) return 0;
 
+    s->nodes++;
+    if ((s->nodes & 511) == 0) { check_limits(c); if (s->stop) return 0; }
+
+    /* ---- draws and mate distance.  Rules of chess, never the network. --- */
     if (ply > 0) {
         if (is_repetition(c) || insufficient_material(p)) return 0;
         /* mate-distance pruning: a mate found closer to the root always wins */
@@ -613,14 +412,12 @@ static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null
         if (alpha >= beta) return alpha;
     }
     orig_alpha = alpha;      /* after mate-distance pruning, so the TT flag is right */
-    if (ply >= S_MAX_PLY - 2) {
-        have_fw = s_forward(s, p, fw);
-        return blend_cp(p, fw, have_fw);
-    }
-    if (depth <= 0) return qsearch(c, alpha, beta, ply, 0);
 
-    s->nodes++;
-    if ((s->nodes & 2047) == 0) { check_limits(c); if (s->stop) return 0; }
+    if (depth <= 0 || ply >= S_MAX_PLY - 2) {
+        if (insufficient_material(p)) return 0;
+        have_fw = s_forward(s, p, fw);
+        return leaf_cp(fw, have_fw);
+    }
 
     /* --- transposition table ------------------------------------------- */
     if (s->tt && s->tt_size) {
@@ -636,111 +433,67 @@ static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null
         }
     }
 
-    /* --- check extension ------------------------------------------------ */
-    in_chk = in_check(p, p->side);
-    if (in_chk && depth < S_MAX_PLY - ply - 2) depth++;
-
-    if (!in_chk) {
-        have_fw = s_forward(s, p, fw);
-        eval    = blend_cp(p, fw, have_fw);
-
-        /* reverse futility: so far ahead that giving away `margin` still wins */
-        if (!is_pv && depth <= 6 && beta > -S_MATE_BOUND && beta < S_MATE_BOUND &&
-            eval - 85 * depth >= beta)
-            return eval;
-
-        /* --- null move ---------------------------------------------------
-         * Skipped in check (illegal), in PV nodes, and without a non-pawn
-         * piece (zugzwang positions are exactly the pawn endings). */
-        if (!is_pv && can_null && depth >= 3 && eval >= beta &&
-            beta > -S_MATE_BOUND && has_big_piece(p, p->side)) {
-            Undo u;
-            int R = 2 + depth / 4 + ((eval - beta) > 200 ? 1 : 0);
-            int sc;
-            if (R > depth - 1) R = depth - 1;
-            make_null(p, &u);
-            push_key(c, 0);                 /* 0 never matches a real key     */
-            sc = -negamax(c, depth - 1 - R, -beta, -beta + 1, ply + 1, 0);
-            pop_key(c);
-            unmake_null(p, &u);
-            if (s->stop) return 0;
-            if (sc >= beta) return (sc >= S_MATE_BOUND) ? beta : sc;
-        }
-    }
-
-    /* --- internal iterative deepening ----------------------------------- */
-    if (is_pv && depth >= 5 && ttm == MV_NONE && !in_chk) {
-        negamax(c, depth - 2, alpha, beta, ply, 0);
-        if (s->stop) return 0;
-        if (s->tt && s->tt_size) {
-            const TTEntry *e = &s->tt[p->key & (s->tt_size - 1)];
-            if (e->key == p->key) ttm = e->best;
-        }
-        c->pvlen[ply] = 0;
-    }
-
     /* --- moves ---------------------------------------------------------- */
     ml = c->mlist[ply];
     sa = c->mscore[ply];
     n  = gen_legal(p, ml);
-    if (n == 0) return in_chk ? (-S_MATE + ply) : 0;
-    if (p->halfmove >= 100) return 0;              /* fifty-move, not mate    */
+    in_chk = in_check(p, p->side);
+    if (n == 0) return in_chk ? (-S_MATE + ply) : 0;   /* checkmate / stalemate */
+    if (p->halfmove >= 100) return 0;                  /* fifty-move, not mate  */
 
-    /* The policy pass costs a handful of microseconds; it pays for itself at
-     * interior nodes and would not at depth 1, where ordering barely matters. */
-    order_moves(c, p, ml, sa, n, ttm, ply, fw, have_fw && depth >= 2);
+    /* One network evaluation per node, used for the priors. */
+    have_fw = s_forward(s, p, fw);
+    order_moves(c, p, ml, sa, n, ttm, fw, have_fw);
+
+    /* Late move pruning by ordering rank.  Never in the PV, never in check,
+     * and never once a forced loss is on the board (which is what keeps a mate
+     * proof from being pruned away: while every move searched so far loses by
+     * force, `best` stays inside the mate band and nothing is skipped). */
+    lmp = n;
+    if (!is_pv && !in_chk && depth <= LMP_MAX_DEPTH)
+        lmp = LMP_COUNT[depth];
 
     for (i = 0; i < n; i++) {
-        Move m;
         Undo u;
-        int is_tactical, gives_check, new_depth, r = 0, sc;
+        Move m;
+        int gives_check, new_depth, r = 0, sc;
+
+        if (i >= lmp && best > -S_MATE_BOUND) break;
 
         pick_best(ml, sa, n, i);
         m = ml[i];
-        is_tactical = MV_IS_CAPTURE(m) || MV_IS_PROMO(m);
-
-        /* shallow quiet pruning, never in the PV and never when a mate is at
-         * stake or nothing has been searched yet */
-        if (!is_pv && !in_chk && i > 0 && !is_tactical &&
-            best > -S_MATE_BOUND && depth <= 5) {
-            if (eval + 110 + 130 * depth <= alpha) continue;
-            if (sa[i] < ORD_QUIET && depth <= 3) continue;      /* bad capture */
-        }
-        if (!is_pv && !in_chk && i > 0 && is_tactical && depth <= 4 &&
-            best > -S_MATE_BOUND && sa[i] < ORD_QUIET) {
-            if (s_see(p, m) < -100 * depth) continue;           /* SEE pruning */
-        }
 
         make_move(p, m, &u);
         push_key(c, p->key);
         gives_check = in_check(p, p->side);
         new_depth = depth - 1;
 
-        /* --- late move reductions --------------------------------------- */
-        if (depth >= 3 && i >= 3 && !is_tactical && !in_chk && !gives_check &&
-            sa[i] < ORD_KILLER2) {
+        /* --- late move reductions ---------------------------------------
+         * Purely a function of (depth, ordering rank).  It says "the network
+         * ranked this move 14th, look at it less hard", which is a statement
+         * about the priors, not about chess.  A move that gives check or is
+         * played out of check is not reduced, because in both cases the reply
+         * set is tiny and the reduction buys nothing. */
+        if (depth >= 3 && i >= 3 && !in_chk && !gives_check) {
             r = c->lmr[imin(depth, 63)][imin(i, 63)];
             if (is_pv) r--;
-            if (c->hist[p->side ^ 1][MV_FROM(m)][MV_TO(m)] > HIST_MAX / 2) r--;
             if (r < 0) r = 0;
             if (r > new_depth - 1) r = new_depth - 1;
         }
 
         if (i == 0) {
-            sc = -negamax(c, new_depth, -beta, -alpha, ply + 1, 1);
+            sc = -negamax(c, new_depth, -beta, -alpha, ply + 1);
         } else {
-            sc = -negamax(c, new_depth - r, -alpha - 1, -alpha, ply + 1, 1);
+            sc = -negamax(c, new_depth - r, -alpha - 1, -alpha, ply + 1);
             if (sc > alpha && r > 0)
-                sc = -negamax(c, new_depth, -alpha - 1, -alpha, ply + 1, 1);
+                sc = -negamax(c, new_depth, -alpha - 1, -alpha, ply + 1);
             if (sc > alpha && sc < beta)
-                sc = -negamax(c, new_depth, -beta, -alpha, ply + 1, 1);
+                sc = -negamax(c, new_depth, -beta, -alpha, ply + 1);
         }
 
         pop_key(c);
         unmake_move(p, m, &u);
         if (s->stop) return best > -S_INF ? best : alpha;
-
-        if (!is_tactical && moved_quiets < 64) quiets[moved_quiets++] = m;
 
         if (sc > best) {
             best  = sc;
@@ -748,19 +501,7 @@ static int negamax(Ctx *c, int depth, int alpha, int beta, int ply, int can_null
             if (sc > alpha) {
                 alpha = sc;
                 pv_store(c, ply, m);
-                if (alpha >= beta) {
-                    if (!is_tactical) {
-                        int j, bonus = imin(depth * depth, 1200);
-                        if (ply < S_MAX_PLY && c->killer[ply][0] != m) {
-                            c->killer[ply][1] = c->killer[ply][0];
-                            c->killer[ply][0] = m;
-                        }
-                        hist_add(c, p->side, MV_FROM(m), MV_TO(m), bonus);
-                        for (j = 0; j < moved_quiets - 1; j++)
-                            hist_add(c, p->side, MV_FROM(quiets[j]), MV_TO(quiets[j]), -bonus);
-                    }
-                    break;
-                }
+                if (alpha >= beta) break;
             }
         }
     }
@@ -782,6 +523,8 @@ static int root_search(Ctx *c, int depth, int alpha, int beta, Move *bestm)
     *bestm = c->rootm[0];
     for (i = 0; i < n; i++) c->rootsc[i] = -S_INF;
 
+    /* Every root move is searched, always: no pruning and no reduction may
+     * remove a candidate from the answer itself. */
     for (i = 0; i < n; i++) {
         const Move m = c->rootm[i];
         Undo u;
@@ -792,17 +535,17 @@ static int root_search(Ctx *c, int depth, int alpha, int beta, Move *bestm)
         gives_check = in_check(p, p->side);
 
         if (i == 0) {
-            sc = -negamax(c, depth - 1, -beta, -alpha, 1, 1);
+            sc = -negamax(c, depth - 1, -beta, -alpha, 1);
         } else {
-            if (depth >= 3 && i >= 4 && !MV_IS_CAPTURE(m) && !MV_IS_PROMO(m) && !gives_check)
+            if (depth >= 3 && i >= 4 && !gives_check)
                 r = 1 + (i >= 12 && depth >= 5);
             if (r > depth - 2) r = depth - 2;
             if (r < 0) r = 0;
-            sc = -negamax(c, depth - 1 - r, -alpha - 1, -alpha, 1, 1);
+            sc = -negamax(c, depth - 1 - r, -alpha - 1, -alpha, 1);
             if (sc > alpha && r > 0)
-                sc = -negamax(c, depth - 1, -alpha - 1, -alpha, 1, 1);
+                sc = -negamax(c, depth - 1, -alpha - 1, -alpha, 1);
             if (sc > alpha && sc < beta)
-                sc = -negamax(c, depth - 1, -beta, -alpha, 1, 1);
+                sc = -negamax(c, depth - 1, -beta, -alpha, 1);
         }
 
         pop_key(c);
@@ -823,18 +566,26 @@ static int root_search(Ctx *c, int depth, int alpha, int beta, Move *bestm)
     return best;
 }
 
-/* Insertion sort, scores descending: best move first for the next iteration. */
-static void sort_root(Move *rm, int *rsc, int n)
+/* Move `m` to the front of the root list, keeping every other move in its
+ * existing (policy) order.
+ *
+ * This deliberately does NOT sort the root by the iteration's scores.  In a
+ * PVS root every move after the first is searched with a null window, so its
+ * score is an UPPER BOUND that has failed low -- a "not better than alpha"
+ * token, not a measurement.  Sorting on those bounds makes the root order, and
+ * therefore the tie-break between equally-valued moves, depend on search noise:
+ * with the network value head as the only evaluation, whole blocks of moves
+ * legitimately score the same, so that noise decides the answer.  Promoting the
+ * principal move and leaving the rest in the policy's order keeps the ordering
+ * reproducible while still putting the best candidate first. */
+static void promote_root(Move *rm, int n, Move m)
 {
-    int i;
-    for (i = 1; i < n; i++) {
-        const Move m = rm[i];
-        const int sc = rsc[i];
-        int j = i - 1;
-        while (j >= 0 && rsc[j] < sc) { rm[j + 1] = rm[j]; rsc[j + 1] = rsc[j]; j--; }
-        rm[j + 1] = m;
-        rsc[j + 1] = sc;
-    }
+    int i, j;
+    if (m == MV_NONE || n <= 1) return;
+    for (i = 0; i < n; i++) if (rm[i] == m) break;
+    if (i <= 0 || i >= n) return;
+    for (j = i; j > 0; j--) rm[j] = rm[j - 1];
+    rm[0] = m;
 }
 
 /* ------------------------------------------------------------------ API -- */
@@ -925,12 +676,24 @@ Move search_best(Search *s, const Game *g)
     if (maxd <= 0) maxd = (s->movetime_ms > 0 || s->max_nodes) ? S_MAX_PLY - 4 : 8;
     if (maxd > S_MAX_PLY - 4) maxd = S_MAX_PLY - 4;
 
-    /* Order the root once up front: policy + MVV-LVA. */
+    /* Order the root once up front, by the policy head alone. */
     {
         Fwd fw;
         int have = s_forward(s, &c->pos, &fw);
-        order_moves(c, &c->pos, c->rootm, c->rootsc, c->nroot, MV_NONE, 0, &fw, have);
-        sort_root(c->rootm, c->rootsc, c->nroot);
+        order_moves(c, &c->pos, c->rootm, c->rootsc, c->nroot, MV_NONE, &fw, have);
+        /* Stable descending sort by prior: the one and only root ordering. */
+        for (i = 1; i < c->nroot; i++) {
+            const Move  m  = c->rootm[i];
+            const int32_t v = c->rootsc[i];
+            int k = i - 1;
+            while (k >= 0 && c->rootsc[k] < v) {
+                c->rootm[k + 1]  = c->rootm[k];
+                c->rootsc[k + 1] = c->rootsc[k];
+                k--;
+            }
+            c->rootm[k + 1]  = m;
+            c->rootsc[k + 1] = v;
+        }
         for (i = 0; i < c->nroot; i++) c->rootsc[i] = -S_INF;
         best_move = c->rootm[0];       /* best guess before a single node runs */
     }
@@ -978,7 +741,7 @@ Move search_best(Search *s, const Game *g)
         for (i = 0; i < s->pv_len; i++) s->pv[i] = c->pvtab[0][i];
         if (s->pv_len == 0) { s->pv[0] = best_move; s->pv_len = 1; }
 
-        sort_root(c->rootm, c->rootsc, c->nroot);
+        promote_root(c->rootm, c->nroot, best_move);
 
         if (score >= S_MATE_BOUND || score <= -S_MATE_BOUND) break;  /* mate    */
         if (c->budget_ns > 0 && (now_ns() - c->t0_ns) * 2 >= c->budget_ns) break;
@@ -994,8 +757,8 @@ Move search_best(Search *s, const Game *g)
     /* ------------------------------------------------------------ blunder --
      * The UI's difficulty slider.  With probability blunder_rate we play a
      * uniformly random move out of the better-scoring half of the root moves
-     * instead of the best one -- always a legal move, and never something
-     * completely absurd, so easier levels still feel like chess. */
+     * instead of the best one -- always a legal move.  It is a strength dial
+     * over the search's OWN ranking and contains no chess knowledge. */
     chosen = best_move;
     if (s->blunder_rate > 0.0f && c->nroot > 1 && s_randf(s->rng) < s->blunder_rate) {
         int half = c->nroot / 2;

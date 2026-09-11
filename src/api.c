@@ -29,11 +29,34 @@
  * No entry point may crash on a garbage handle: every one of them validates.
  *
  * ============================================================================
+ * WHICH ENGINE PLAYS  (read docs/FROM_SCRATCH.md first)
+ * ============================================================================
+ * api_engine_move() chooses moves with PUCT MCTS (src/mcts.c) over the learned
+ * priors, with root noise OFF and temperature 0 (argmax of visit counts).  The
+ * ONLY evaluations involved are the network's policy and value heads plus the
+ * rules of chess.  That is the shipped agent, and it is the default.
+ *
+ * Two other modes exist for MEASUREMENT ONLY and are never selected by default:
+ *
+ *   "policy"     the raw policy argmax, no search at all.  This is what
+ *                separates "what the network learned" from "what the search
+ *                contributes" -- without it the two are confounded.
+ *   "alphabeta"  the alpha-beta baseline in src/search.c, which is a second,
+ *                structurally different searcher over the same network.
+ *
+ * api.h has no field for the mode, and headers are fixed, so the selector is
+ * the extra export api_engine_set_mode() below.  See the report.
+ *
+ * ============================================================================
  * SIGN CONVENTIONS  (read this before touching the eval numbers)
  * ============================================================================
- * `score` in api_engine_move is Search::score_cp, which search.h defines as
- * being from the SIDE-TO-MOVE's point of view (positive = good for whoever is
- * about to move).
+ * `score` in api_engine_move is a "centipawn-ish" integer from the SIDE-TO-
+ * MOVE's point of view (positive = good for whoever is about to move).  In MCTS
+ * mode it is value_to_cp() of the MCTS ROOT VALUE; in alphabeta mode it is
+ * Search::score_cp, which search.h defines with the same sign convention.
+ * value_to_cp() is a strictly monotone map of a value in [-1,1] onto an integer
+ * -- presentation, not evaluation.  There are no piece values anywhere in this
+ * file's play path to calibrate it against, and none are wanted.
  *
  * `value` in api_engine_move is the network's tanh value head for the position
  * the engine was asked about, re-signed into WHITE's frame of reference:
@@ -79,6 +102,7 @@
 
 #include "api.h"
 #include "chess.h"
+#include "mcts.h"
 #include "net.h"
 #include "search.h"
 
@@ -95,6 +119,49 @@
 #define API_DEF_MOVETIME 1000
 #define API_MAX_DEPTH      63   /* Search::pv holds 64 plies                  */
 #define API_MAX_MOVETIME 300000
+
+/* ---------------------------------------------------------- engine modes */
+/* The shipped agent.  api_engine_load() always starts here. */
+#define API_ENGINE_MCTS       0
+/* Measurement only: the raw policy head, no search. */
+#define API_ENGINE_POLICY     1
+/* Measurement only: the alpha-beta baseline in src/search.c. */
+#define API_ENGINE_ALPHABETA  2
+
+/* -------------------------------------------------- the `depth` -> `sims` map
+ *
+ * api.h's api_engine_move() takes a `depth`, because the engine behind it used
+ * to be an alpha-beta searcher.  MCTS has no depth to set; its strength dial is
+ * the simulation count.  Rather than break every existing caller (py/engine.py,
+ * py/server.py, mac/Engine.swift and the UI's difficulty slider all pass a
+ * depth), `depth` is mapped onto a simulation budget:
+ *
+ *     sims = clamp(depth, 1, 63) * 64,  then clamped to [16, 4096]
+ *
+ * so the familiar numbers keep meaning "more thinking":
+ *
+ *     depth 1 ->   64 sims      depth 6  ->  384 sims
+ *     depth 2 ->  128 sims      depth 8  ->  512 sims
+ *     depth 4 ->  256 sims      depth 63 -> 4032 sims   (the default is 4)
+ *
+ * The map is deliberately linear and not 2^depth: an MCTS simulation is a unit
+ * of work, not a ply, so doubling the budget is what doubles the thinking.  A
+ * caller that wants to reason in simulations directly should pass
+ * depth = sims / 64 or use the UCI front end's `Sims` option.
+ *
+ * `movetime_ms` remains a hard wall-clock CAP, enforced by the doubling loop in
+ * engine_mcts_move(): the budget grows 32, 64, 128, ... until either the target
+ * is reached or another pass would overrun the clock.                        */
+#define API_SIMS_PER_DEPTH   64
+#define API_MIN_SIMS         16
+#define API_MAX_SIMS       4096
+#define API_SIMS_FIRST       32   /* first pass of the time-capped ramp       */
+
+/* Node pool: one simulation expands at most one node, which adds at most one
+ * child per legal move.  40 is a comfortable upper bound on the average branch
+ * factor over a real game, and mcts.c degrades gracefully (it keeps evaluating
+ * and stops growing) if a pathological position ever exceeds it. */
+#define API_POOL_PER_SIM     40
 
 /* ==========================================================================
  * string builder
@@ -227,7 +294,12 @@ typedef struct {
     Trunk  trunk;                /* Search keeps pointers to these two, so    */
     Head   head;                 /* the slot must never be moved or copied.   */
     Hyper  hyper;
-    Search search;
+    Search search;               /* measurement-only alpha-beta baseline      */
+    Mcts   mcts;                 /* the shipped agent                         */
+    int    pool_sims;            /* sims the node pool is currently sized for */
+    int    mode;                 /* API_ENGINE_*                              */
+    uint64_t rng[4];             /* mcts_search's rng argument; unused while
+                                  * root noise is off, but it must be valid   */
     Game   scratch;              /* search runs on this copy, never on the
                                   * caller's Game                            */
     float  elo;
@@ -411,6 +483,28 @@ static const char *reason_name(int reason)
     }
 }
 
+/* AUDIT-OK-BEGIN
+ *
+ * Presentation only, never an evaluation.
+ *
+ * tools/audit_knowledge.sh flags this table, and it is right to: a list of
+ * piece values inside the play path is exactly the thing that must not exist.
+ * It is allow-listed because of what reads it -- ONLY sb_captured() and
+ * material_of(), which fill the `material` and `captured` fields of
+ * api_game_state()'s JSON.  Those two fields are the scoreboard a HUMAN reads
+ * next to the board (mac/Engine.swift decodes `material` as a required field);
+ * api.h documents them as part of the state payload.
+ *
+ * Nothing in the play path reads them.  api_engine_move() and
+ * api_engine_policy() never call material_of(); grep this file and you will
+ * find the only two callers are the JSON builders.  The engine's evaluation is
+ * the network's value head and nothing else.
+ *
+ * If you ever find yourself wanting PIECE_VALUE inside a move-choosing function,
+ * that is the contract breaking, not this comment expanding.
+ *
+ * The allow-listed region ends just after sb_captured().  tools/audit_knowledge.sh
+ * -v lists it every time it runs, so it cannot quietly grow. */
 /* Standard piece values, indexed by PAWN..KING. */
 static const int PIECE_VALUE[NPIECES] = { 1, 3, 3, 5, 9, 0 };
 /* Full army, indexed by PAWN..KING. */
@@ -446,6 +540,7 @@ static void sb_captured(SB *sb, const Position *p, int color)
     }
     sb_putc(sb, ']');
 }
+/* AUDIT-OK-END */
 
 int api_game_state(int gid, char *buf, int buflen)
 {
@@ -541,6 +636,9 @@ int api_game_state(int gid, char *buf, int buflen)
         SB_LIT(&sb, "null");
     }
 
+    /* AUDIT-OK-BEGIN -- the UI's captured-piece tray, not an evaluation.  See
+     * the note on PIECE_VALUE above; mac/Engine.swift decodes `material` as a
+     * required field and api.h documents it as part of this payload. */
     SB_LIT(&sb, ",");
     sb_key(&sb, "material");
     SB_LIT(&sb, "{");
@@ -548,6 +646,7 @@ int api_game_state(int gid, char *buf, int buflen)
     SB_LIT(&sb, ",");
     sb_key(&sb, "black"); sb_i64(&sb, material_of(p, BLACK));
     SB_LIT(&sb, "}");
+    /* AUDIT-OK-END */
 
     SB_LIT(&sb, ",");
     sb_key(&sb, "captured");
@@ -643,6 +742,9 @@ static int best_agent(const float *elo, int n)
  * engines
  * ========================================================================== */
 
+/* Defined below, next to the rest of the MCTS glue. */
+static void engine_pool_for(EngineSlot *e, int sims);
+
 int api_engine_load(const char *model_path, int agent_index)
 {
     ModelBlob mb;
@@ -671,6 +773,19 @@ int api_engine_load(const char *model_path, int agent_index)
     snprintf(e->path, sizeof(e->path), "%s", model_path);
     blob_free(&mb);
 
+    /* THE DEFAULT IS MCTS.  docs/FROM_SCRATCH.md requires that the shipped
+     * agent be the learned policy/value under a domain-independent search; the
+     * other two modes exist only so that claim can be measured. */
+    e->mode      = API_ENGINE_MCTS;
+    e->pool_sims = 0;
+    /* mcts_search wants a valid xoshiro state even with root noise off. */
+    e->rng[0] = 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)e;
+    e->rng[1] = 0xBF58476D1CE4E5B9ull;
+    e->rng[2] = 0x94D049BB133111EBull;
+    e->rng[3] = 0x2545F4914F6CDD1Dull + (uint64_t)pick;
+    /* Sized on first use by engine_pool_for(); the default depth is 4. */
+    engine_pool_for(e, API_DEF_DEPTH * API_SIMS_PER_DEPTH);
+
     /* Search holds borrowed pointers into this slot, which is heap-allocated
      * and never moved, so they stay valid until api_engine_free. */
     search_init(&e->search, &e->trunk, &e->head, API_TT_MB);
@@ -680,7 +795,7 @@ int api_engine_load(const char *model_path, int agent_index)
     if (eid >= 0) g_engines[eid] = e;
     pthread_mutex_unlock(&g_lock);
 
-    if (eid < 0) { search_free(&e->search); free(e); return -1; }
+    if (eid < 0) { search_free(&e->search); mcts_free(&e->mcts); free(e); return -1; }
     return eid;
 }
 
@@ -694,6 +809,7 @@ void api_engine_free(int eid)
     pthread_mutex_unlock(&g_lock);
     if (e) {
         search_free(&e->search);
+        mcts_free(&e->mcts);
         free(e);
     }
 }
@@ -763,6 +879,146 @@ static int clampi(int v, int lo, int hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* ------------------------------------------------------- value -> "score" --
+ *
+ * A value in [-1,1] rendered as the integer a chess UI expects in a score
+ * field.  tanh saturates, so atanh -- its exact inverse -- is used to undo the
+ * squashing before scaling:
+ *
+ *      cp = 300 * atanh(clamp(v, -0.995, +0.995))
+ *
+ * Strictly monotone, maps 0 to 0, and bounded at about +-900 instead of
+ * infinity.  Because it is strictly monotone it reorders nothing: the UI's
+ * "+150" and the agent's preference are the same statement in different units.
+ * The constant 300 is arbitrary presentation.  It is NOT calibrated against a
+ * pawn, because this engine has never been told what a pawn is worth.        */
+static int value_to_cp(double v)
+{
+    double cp;
+    if (!isfinite(v)) return 0;
+    if (v >  0.995) v =  0.995;
+    if (v < -0.995) v = -0.995;
+    cp = 300.0 * atanh(v);
+    if (cp >  20000.0) cp =  20000.0;
+    if (cp < -20000.0) cp = -20000.0;
+    return (int)(cp < 0 ? cp - 0.5 : cp + 0.5);
+}
+
+/* ---------------------------------------------------------- the MCTS agent */
+
+/* Grow the node pool so `sims` simulations can expand without running dry.
+ * Never shrinks, so a UI that alternates difficulty levels reallocates once.
+ * Called before a search, never inside one: the hot path allocates nothing. */
+static void engine_pool_for(EngineSlot *e, int sims)
+{
+    int want;
+    if (sims <= e->pool_sims && e->mcts.pool) return;
+    want = sims + (sims >> 3) + 8;                /* headroom, then round up  */
+    mcts_free(&e->mcts);
+    mcts_init(&e->mcts, 1 + want * API_POOL_PER_SIM);
+    e->pool_sims = e->mcts.pool ? want : 0;
+}
+
+/* Runs MCTS for `target` simulations, or for as many as the clock allows.
+ *
+ * Root noise is OFF and the move is the ARGMAX of the visit counts
+ * (temperature 0): this is real play, not self-play exploration.
+ *
+ * The clock is honoured by ramping the budget 32, 64, 128, ... up to `target`
+ * and stopping when one more pass would overrun.  mcts_search() builds a fresh
+ * tree per call, so a ramp costs at most 2x the simulations of the final pass;
+ * in exchange, `movetime_ms` is a real cap rather than a suggestion.  The final
+ * pass is the one that answers, so `sims_done` is the size of the tree the
+ * reported move actually came out of.
+ *
+ * Returns the number of legal moves (0 if the position is already over) and
+ * fills in the chosen move, the root value, the simulations spent and the
+ * deepest point the tree reached. */
+static int engine_mcts_move(EngineSlot *e, const Move *list, int budget_ms,
+                            int target, Move *best, float *root_value,
+                            int *sims_done, int *depth_seen)
+{
+    int32_t visits[MAX_MOVES];
+    double  t0 = now_ms();
+    int     nroot = 0, run, done = 0;
+
+    *best       = MV_NONE;
+    *root_value = 0.0f;
+    *sims_done  = 0;
+    *depth_seen = 0;
+
+    if (target < 1) target = 1;
+    engine_pool_for(e, target);
+    if (!e->mcts.pool) return 0;
+
+    run = (target < API_SIMS_FIRST) ? target : API_SIMS_FIRST;
+    for (;;) {
+        e->mcts.evals          = 0;
+        e->mcts.max_depth_seen = 0;
+
+        nroot = mcts_search(&e->mcts, &e->trunk, &e->head, &e->scratch,
+                            run, 0 /* no root noise */, e->rng, visits, root_value);
+        if (nroot <= 0) return 0;                 /* terminal position        */
+        done        = run;
+        *depth_seen = e->mcts.max_depth_seen;
+
+        if (run >= target) break;
+        /* The next pass is about twice this one; do not start one that cannot
+         * finish inside the budget. */
+        if (budget_ms > 0 && (now_ms() - t0) * 3.0 >= (double)budget_ms) break;
+        run = (run * 2 > target) ? target : run * 2;
+    }
+
+    {
+        const int pick = mcts_pick(visits, nroot, 0.0f, NULL);   /* temp 0 */
+        if (pick >= 0 && pick < nroot) *best = list[pick];
+    }
+    *sims_done = done;
+    return nroot;
+}
+
+/* Select the engine used by api_engine_move().
+ *
+ * NOT DECLARED IN api.h -- headers are fixed for this work, so this is an extra
+ * export of the shared library.  ctypes finds it by name; see the report.
+ *
+ *   "mcts"       PUCT MCTS over the learned priors.  THE DEFAULT, and the only
+ *                mode any shipped caller should ever use.
+ *   "policy"     raw policy argmax, no search.       MEASUREMENT ONLY.
+ *   "alphabeta"  the src/search.c baseline.          MEASUREMENT ONLY.
+ *
+ * Returns 1 on success, 0 for an unknown mode, -1 for a bad handle. */
+int api_engine_set_mode(int eid, const char *mode)
+{
+    EngineSlot *e;
+
+    api_init();
+    e = engine_get(eid);
+    if (!e) return -1;
+    if (!mode || !*mode) return 0;
+
+    if      (!strcmp(mode, "mcts"))      e->mode = API_ENGINE_MCTS;
+    else if (!strcmp(mode, "policy"))    e->mode = API_ENGINE_POLICY;
+    else if (!strcmp(mode, "alphabeta")) e->mode = API_ENGINE_ALPHABETA;
+    else return 0;
+    return 1;
+}
+
+/* The mode currently in force, as the same string, or NULL for a bad handle. */
+const char *api_engine_get_mode(int eid)
+{
+    EngineSlot *e;
+
+    api_init();
+    e = engine_get(eid);
+    if (!e) return NULL;
+    switch (e->mode) {
+        case API_ENGINE_POLICY:    return "policy";
+        case API_ENGINE_ALPHABETA: return "alphabeta";
+        default:                   return "mcts";
+    }
+}
+
 int api_engine_move(int eid, int gid, int depth, int movetime_ms,
                     char *buf, int buflen)
 {
@@ -772,9 +1028,10 @@ int api_engine_move(int eid, int gid, int depth, int movetime_ms,
     PolEnt pol[MAX_MOVES];
     const Position *p;
     Move  best = MV_NONE;
-    float v_stm = 0.0f;
+    float v_stm = 0.0f, root_v = 0.0f;
     double t0, t1;
     int n, ntop, legal_ok = 0;
+    int sims, budget_ms, report_nodes = 0, report_depth = 0, report_cp = 0;
     char uci[8], san[API_SAN_LEN];
     SB sb;
 
@@ -783,27 +1040,72 @@ int api_engine_move(int eid, int gid, int depth, int movetime_ms,
     s = game_get(gid);
     if (!e || !s) return -1;
 
-    /* Never touch the caller's Game: search runs against a private copy that
-     * lives in the engine slot.  (search_best takes a const Game *, but the
-     * copy also means a search that internally const-casts still cannot
-     * corrupt the game the UI is showing.) */
+    /* Never touch the caller's Game: the search runs against a private copy
+     * that lives in the engine slot. */
     e->scratch = s->g;
     p = &e->scratch.pos;
 
+    /* One network evaluation up front: it supplies `value` and `top[]`, which
+     * are the RAW policy/value head for this position in both modes, and the
+     * legal move list that everything below indexes into. */
     n = policy_of(e, p, list, pol, &v_stm);
 
-    e->search.max_depth   = clampi(depth > 0 ? depth : API_DEF_DEPTH, 1, API_MAX_DEPTH);
-    e->search.movetime_ms = clampi(movetime_ms > 0 ? movetime_ms : API_DEF_MOVETIME,
-                                   1, API_MAX_MOVETIME);
-    e->search.blunder_rate = 0.0f;
-    e->search.stop         = 0;
-    e->search.nodes        = 0;
-    e->search.depth_reached = 0;
-    e->search.score_cp      = 0;
-    e->search.pv_len        = 0;
+    sims      = clampi(clampi(depth > 0 ? depth : API_DEF_DEPTH, 1, API_MAX_DEPTH)
+                       * API_SIMS_PER_DEPTH, API_MIN_SIMS, API_MAX_SIMS);
+    budget_ms = clampi(movetime_ms > 0 ? movetime_ms : API_DEF_MOVETIME,
+                       1, API_MAX_MOVETIME);
 
     t0 = now_ms();
-    if (n > 0) best = search_best(&e->search, &e->scratch);
+    if (n > 0) {
+        switch (e->mode) {
+
+        case API_ENGINE_POLICY:
+            /* MEASUREMENT ONLY: what the network plays with no search at all. */
+            best         = list[pol[0].idx];
+            report_nodes = 1;
+            report_depth = 1;
+            report_cp    = value_to_cp((double)v_stm);
+            break;
+
+        case API_ENGINE_ALPHABETA: {
+            /* MEASUREMENT ONLY: the src/search.c baseline over the same net. */
+            e->search.max_depth     = clampi(depth > 0 ? depth : API_DEF_DEPTH,
+                                             1, API_MAX_DEPTH);
+            e->search.movetime_ms   = budget_ms;
+            e->search.blunder_rate  = 0.0f;
+            e->search.stop          = 0;
+            e->search.nodes         = 0;
+            e->search.depth_reached = 0;
+            e->search.score_cp      = 0;
+            e->search.pv_len        = 0;
+            best         = search_best(&e->search, &e->scratch);
+            report_nodes = (int)((e->search.nodes > (uint64_t)INT_MAX)
+                                 ? INT_MAX : e->search.nodes);
+            report_depth = e->search.depth_reached;
+            report_cp    = e->search.score_cp;
+            break;
+        }
+
+        default: {
+            /* THE SHIPPED AGENT: PUCT MCTS over the learned priors. */
+            int done = 0, dseen = 0;
+            if (engine_mcts_move(e, list, budget_ms, sims,
+                                 &best, &root_v, &done, &dseen) > 0) {
+                report_nodes = done;          /* nodes == simulations         */
+                report_depth = dseen;         /* deepest point of the tree    */
+                report_cp    = value_to_cp((double)root_v);
+            } else {
+                /* Pool allocation failed, or the position is already over.
+                 * Fall back to the policy, which is legal by construction. */
+                best         = list[pol[0].idx];
+                report_nodes = 1;
+                report_depth = 1;
+                report_cp    = value_to_cp((double)v_stm);
+            }
+            break;
+        }
+        }
+    }
     t1 = now_ms();
 
     /* Defensive: only report a move the position actually allows.  If the
@@ -825,11 +1127,11 @@ int api_engine_move(int eid, int gid, int depth, int movetime_ms,
     SB_LIT(&sb, ",");
     sb_key(&sb, "san");   sb_json_str(&sb, san);
     SB_LIT(&sb, ",");
-    sb_key(&sb, "score"); sb_i64(&sb, n > 0 ? e->search.score_cp : 0);
+    sb_key(&sb, "score"); sb_i64(&sb, n > 0 ? report_cp : 0);
     SB_LIT(&sb, ",");
-    sb_key(&sb, "depth"); sb_i64(&sb, n > 0 ? e->search.depth_reached : 0);
+    sb_key(&sb, "depth"); sb_i64(&sb, n > 0 ? report_depth : 0);
     SB_LIT(&sb, ",");
-    sb_key(&sb, "nodes"); sb_u64(&sb, (unsigned long long)e->search.nodes);
+    sb_key(&sb, "nodes"); sb_u64(&sb, (unsigned long long)(n > 0 ? report_nodes : 0));
     SB_LIT(&sb, ",");
     sb_key(&sb, "ms");    sb_i64(&sb, (long long)(t1 - t0 + 0.5));
 
@@ -974,7 +1276,15 @@ int api_model_info(const char *model_path, char *buf, int buflen)
         SB_LIT(&sb, ",");
         sb_key(&sb, "lr_scale");     sb_f(&sb, h->lr_scale);
         SB_LIT(&sb, ",");
+        /* AUDIT-OK-BEGIN -- file metadata, not a reward.
+         * Hyper::shaping is a field of net.h, which is fixed and may not be
+         * changed here, and py/report.py + mac/Engine.swift both decode it as a
+         * required key of this payload.  This function only reports what is on
+         * disk; it never plays a move and never produces a learning signal.
+         * The AlphaZero trainer writes 0.0 into it -- the only reward is the
+         * game result -- so what this prints for a current model is a zero. */
         sb_key(&sb, "shaping");      sb_f(&sb, h->shaping);
+        /* AUDIT-OK-END */
         SB_LIT(&sb, "}");
     }
     sb_putc(&sb, ']');
