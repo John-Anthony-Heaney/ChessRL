@@ -91,3 +91,54 @@ best_agent{i,elo,temperature,entropy_coef,lr_scale,shaping}, loss{policy,value,
 entropy}, grad_norm`
 
 `py/report.py` turns this file into the strategy analysis.
+
+---
+
+# AlphaZero rebuild (supersedes the A2C sections above)
+
+The A2C trainer and the hand-evaluated alpha-beta search were removed because
+they violated the from-scratch requirement in `docs/FROM_SCRATCH.md`. See
+`src/mcts.c` and `src/az.c`. The reward is now only the game result; the policy
+target is the MCTS visit distribution; positions go through a replay buffer with
+hundreds of minibatch steps per generation instead of one step per generation.
+
+## Tuning: repetition draws are a search problem, not a reward problem
+
+A 40-generation pilot drifted into 74.5% threefold-repetition draws, with
+captures collapsing from 14.2 to 5.2 per game. The agents had learned to shuffle.
+
+The natural reading is that a draw is too cheap, so the draw penalty was swept
+against the simulation count (64 agents, 20 generations, mixed 960 starts):
+
+| sims | draw penalty | checkmate | repetition | captures/game | policy KL |
+|---:|---:|---:|---:|---:|---:|
+|  48 | -0.1 | 0.201 | 0.599 |  7.6 | 0.527 |
+|  48 | -0.3 | 0.191 | 0.616 |  7.4 | 0.523 |
+|  48 | -0.6 | 0.227 | 0.516 |  8.5 | 0.540 |
+|  96 | -0.1 | 0.286 | 0.275 | 10.8 | 0.478 |
+|  96 | -0.3 | 0.325 | 0.244 | 11.7 | 0.459 |
+|  96 | -0.6 | 0.347 | 0.177 | 14.4 | 0.421 |
+| 160 | -0.6 | 0.423 | 0.053 | 17.9 | 0.427 |
+| 256 | -0.6 | 0.451 | 0.027 | 18.7 | 0.379 |
+
+Tripling the draw penalty at 48 sims barely moves repetition (0.599 -> 0.516).
+Tripling the simulation count at a fixed penalty nearly eliminates it
+(0.599 -> 0.053). **The shuffling was the search failing to find a plan, not the
+reward failing to discourage a draw.** A policy that cannot see progress repeats,
+and no reward shaping fixes that -- only more search does.
+
+This is worth remembering because the first instinct, both times the population
+drifted to draws, was to change the reward. The first time (material shaping in
+the A2C trainer) that instinct also produced an agent that had learned nothing.
+
+Throughput falls roughly linearly in the simulation count, so 160 sits at the
+knee: repetition is already down to 5% and the marginal gain to 256 costs a
+third of the games.
+
+## Telemetry to watch
+
+`policy_kl` is the learning curve, NOT the raw policy cross-entropy. CE is
+`H(pi) + KL(pi || p)` and the MCTS target's own entropy `H(pi)` drifts as the
+search sharpens, so raw CE can rise while the network is improving.
+`policy_top1` (how often the network's argmax matches the search's choice) and
+`value_accuracy_decisive` are the other two that matter.
