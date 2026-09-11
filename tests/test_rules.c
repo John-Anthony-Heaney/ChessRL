@@ -432,6 +432,125 @@ static void test_castling(void)
     done("castling", before);
 }
 
+/* ------------------------------------------------ 4b. chess 960 ------- */
+
+static void test_castling_960(void)
+{
+    int before = g_fail;
+    section("castling (Chess960)");
+
+    /* Shredder-FEN and X-FEN both have to land on the same rook files. */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "1rqbkrbn/pppppppp/1n6/8/8/1N6/PPPPPPPP/1RQBKRBN w FBfb - 0 1"),
+              "Shredder-FEN rejected");
+        CHECK(p.chess960 == 1, "Shredder-FEN must set chess960");
+        CHECK(p.crook[WHITE][0] == 5 && p.crook[WHITE][1] == 1, "rook files %u/%u",
+              p.crook[WHITE][0], p.crook[WHITE][1]);
+        Position x;
+        CHECK(pos_from_fen(&x, "1rqbkrbn/pppppppp/1n6/8/8/1N6/PPPPPPPP/1RQBKRBN w KQkq - 0 1"),
+              "X-FEN rejected");
+        CHECK(x.chess960 == 1 && x.castling == p.castling
+              && x.crook[WHITE][0] == 5 && x.crook[WHITE][1] == 1,
+              "X-FEN did not resolve K/Q to the outermost rooks");
+        CHECK(x.key == p.key, "the two spellings must be the same position");
+        char fen[128];
+        pos_to_fen(&p, fen, sizeof(fen));
+        CHECK(strcmp(fen, "1rqbkrbn/pppppppp/1n6/8/8/1N6/PPPPPPPP/1RQBKRBN w FBfb - 0 1") == 0,
+              "Chess960 FEN must round-trip in Shredder form: %s", fen);
+    }
+
+    /* The king does not move at all: O-O with the king on g1, rook on h1. */
+    {
+        Position p;
+        Move m;
+        Undo u;
+        CHECK(pos_from_fen(&p, "1rk5/8/8/8/8/8/8/1R4KR w H - 0 1"), "960 FEN");
+        CHECK(move_from_uci(&p, "g1h1", &m), "king-takes-rook O-O rejected");
+        CHECK(MV_FLAG(m) == MF_KCASTLE, "g1h1 should be castling, flag %d", MV_FLAG(m));
+        char uc[6];
+        move_to_uci_pos(&p, m, uc);
+        CHECK(strcmp(uc, "g1h1") == 0, "move_to_uci_pos emitted %s", uc);
+        Position snap = p;
+        make_move(&p, m, &u);
+        CHECK(p.board[6] == KING && p.color_at[6] == WHITE, "king not on g1");
+        CHECK(p.board[5] == ROOK && p.color_at[5] == WHITE, "rook not on f1");
+        CHECK(p.board[7] == NO_PIECE, "h1 not vacated");
+        CHECK(p.key == pos_compute_key(&p), "960 castling key mismatch");
+        unmake_move(&p, m, &u);
+        CHECK(memcmp(&snap, &p, sizeof(Position)) == 0, "unmake of a null-king castle");
+    }
+
+    /* A piece that only the ROOK has to cross still blocks. */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "4k3/8/8/8/8/8/8/1R2K3 w B - 0 1"), "960 FEN");
+        CHECK(uci_legal(&p, "e1b1"), "O-O-O with the rook on b1 should be legal");
+        CHECK(pos_from_fen(&p, "4k3/8/8/8/8/8/8/1RN1K3 w B - 0 1"), "960 FEN");
+        CHECK(!uci_legal(&p, "e1b1"), "a knight on c1 must block the rook's path");
+    }
+
+    /* Vacating the castling rook must not expose the king. */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "4k3/8/8/8/8/8/8/rRK5 w B - 0 1"), "960 FEN");
+        CHECK(!in_check(&p, WHITE), "the b1 rook shields the king on c1");
+        CHECK(!uci_legal(&p, "c1b1"), "castling may not open a line onto our own king");
+    }
+
+    /* Rights follow the 960 rook files, not a1/h1. */
+    {
+        Position p;
+        Undo u;
+        Move m;
+        CHECK(pos_from_fen(&p, "1rk5/8/8/8/8/8/8/1R2K1R1 w GB - 0 1"), "960 FEN");
+        CHECK(move_from_uci(&p, "g1g2", &m), "g1g2");
+        make_move(&p, m, &u);
+        CHECK(p.castling == CR_WQ, "moving the g1 rook: rights %u, want %u", p.castling, CR_WQ);
+        CHECK(p.key == pos_compute_key(&p), "key after the rook move");
+        unmake_move(&p, m, &u);
+        CHECK(p.castling == (CR_WK | CR_WQ), "rights restored");
+
+        CHECK(pos_from_fen(&p, "1rk3r1/8/8/8/8/8/8/1R2K1R1 b GBgb - 0 1"), "960 FEN");
+        CHECK(move_from_uci(&p, "g8g1", &m), "g8g1");
+        make_move(&p, m, &u);
+        CHECK(p.castling == (CR_WQ | CR_BQ),
+              "capturing the g1 rook at home: rights %u, want %u", p.castling, CR_WQ | CR_BQ);
+        CHECK(p.key == pos_compute_key(&p), "key after the rook capture");
+        unmake_move(&p, m, &u);
+        CHECK(p.castling == CR_ALL, "rights restored after unmake");
+    }
+
+    /* Random 960 playouts must keep every invariant the classical ones do. */
+    {
+        static const char *seeds[] = {
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1",
+            "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9",
+            "1rqbkrbn/pppppppp/1n6/8/8/1N6/PPPPPPPP/1RQBKRBN w FBfb - 0 1",
+            "qnr1bkrb/pppp2pp/3np3/5p2/8/P2P2P1/NPP1PP1P/QN1RBKRB w GDg - 3 9",
+            "2k5/8/8/8/8/8/8/1RK4R w HB - 0 1",
+        };
+        const int nseeds = (int)(sizeof(seeds) / sizeof(seeds[0]));
+        for (int rep = 0; rep < 8 && g_fail == before; rep++)
+            for (int i = 0; i < nseeds && g_fail == before; i++)
+                playout(seeds[i], 120);
+        CHECK(g_fail == before, "960 playouts found a zobrist/undo inconsistency");
+    }
+
+    /* Chess960 perft, from the published tables. */
+    {
+        Position p;
+        CHECK(pos_from_fen(&p, "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9"),
+              "960 perft FEN");
+        CHECK(perft(&p, 4) == 326672u, "960 perft(4) = %llu, want 326672",
+              (unsigned long long)perft(&p, 4));
+        CHECK(pos_from_fen(&p, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1"), "960 518");
+        CHECK(perft(&p, 4) == 197281u, "id 518 must reproduce the classical perft(4)");
+    }
+
+    done("chess 960 castling", before);
+}
+
 /* ------------------------------------------------- 5. promotions ------ */
 
 static void test_promotions(void)
@@ -874,6 +993,7 @@ int main(void)
     test_zobrist();
     test_en_passant();
     test_castling();
+    test_castling_960();
     test_promotions();
     test_terminal();
     test_material();

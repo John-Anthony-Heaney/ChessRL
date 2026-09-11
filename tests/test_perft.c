@@ -67,6 +67,31 @@ static const Case CASES[] = {
     { "pos5", "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 4,  2103487u, 0 },
     { "pos5", "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 5, 89941194u, 1 },
 
+    /* ---- Chess960 (Shredder-FEN castling).  518 is the classical array, so
+           its numbers must be the classical ones even though every castling
+           decision is taken by the 960 code path.  The rest are the published
+           Chess960 perft values. ---- */
+    { "960-518", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1", 1,        20u, 0 },
+    { "960-518", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1", 3,      8902u, 0 },
+    { "960-518", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1", 5,   4865609u, 0 },
+    { "960-518", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1", 6, 119060324u, 1 },
+
+    { "960-bqnb", "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9", 2,       528u, 0 },
+    { "960-bqnb", "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9", 4,    326672u, 0 },
+    { "960-bqnb", "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9", 5,   8146062u, 0 },
+    { "960-bqnb", "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9", 6, 227689589u, 1 },
+
+    { "960-2nnr", "2nnrbkr/p1qppppp/8/1ppb4/6PP/3PP3/PPP2P2/BQNNRBKR w HEhe - 1 9", 3,     18002u, 0 },
+    { "960-2nnr", "2nnrbkr/p1qppppp/8/1ppb4/6PP/3PP3/PPP2P2/BQNNRBKR w HEhe - 1 9", 5,  16253601u, 0 },
+
+    /* only Black still has castling rights here (X-FEN "hf") */
+    { "960-qbbn", "qbbnnrkr/2pp2pp/p7/1p2pp2/8/P3PP2/1PPP1KPP/QBBNNR1R w hf - 0 9", 3,     13440u, 0 },
+    { "960-qbbn", "qbbnnrkr/2pp2pp/p7/1p2pp2/8/P3PP2/1PPP1KPP/QBBNNR1R w hf - 0 9", 5,   9183776u, 0 },
+
+    /* the king's rook on g1/d1-style files, both sides asymmetric */
+    { "960-qnr1", "qnr1bkrb/pppp2pp/3np3/5p2/8/P2P2P1/NPP1PP1P/QN1RBKRB w GDg - 3 9", 3,     26895u, 0 },
+    { "960-qnr1", "qnr1bkrb/pppp2pp/3np3/5p2/8/P2P2P1/NPP1PP1P/QN1RBKRB w GDg - 3 9", 5,  23114629u, 0 },
+
     /* ---- pos6 ---- */
     { "pos6", "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 1,        46u, 0 },
     { "pos6", "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 2,      2079u, 0 },

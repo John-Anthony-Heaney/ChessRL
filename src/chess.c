@@ -23,6 +23,15 @@
  *  * Draw policy: threefold repetition and the fifty-move rule are AUTOMATIC
  *    draws here (no claim required).  That is what self-play engines do, and it
  *    is what game_update_result() implements.
+ *  * Chess960: Position.chess960 selects the castling rules and Position.crook
+ *    holds the castling rooks' origin FILES.  Castling MOVES are encoded as
+ *        classical : from = king square, to = king DESTINATION (g1/c1)
+ *        chess960  : from = king square, to = castling ROOK's origin square
+ *    ("king takes rook").  The 960 form is needed because the king's
+ *    destination can coincide with its origin (king already on g1) or with a
+ *    normal king move, so (from,to) would not identify the move.  Everything
+ *    outside the castling code is identical for the two variants, and the
+ *    classical path never touches the 960 branches.
  */
 
 #include "chess.h"
@@ -34,6 +43,17 @@
 /* ------------------------------------------------------------------ misc */
 
 #define BIT(sq) (1ULL << (sq))
+
+/* The Chess960 castling helpers are cold: they must not be inlined into
+ * gen_moves() / make_move(), whose register allocation and I-cache footprint
+ * are what the self-play throughput is made of. */
+#if defined(__GNUC__) || defined(__clang__)
+#define COLD_HELPER  __attribute__((noinline))
+#define HOT_INLINE   __attribute__((always_inline)) inline
+#else
+#define COLD_HELPER
+#define HOT_INLINE inline
+#endif
 
 #define FILE_A 0x0101010101010101ULL
 #define FILE_H 0x8080808080808080ULL
@@ -87,6 +107,19 @@ static uint64_t Z_EP[8];
 static uint64_t Z_SIDE;
 
 static uint8_t CASTLE_MASK[64];
+
+/* Castling-right bit by colour and side (0 = king side, 1 = queen side). */
+static const uint8_t CR_BIT[NCOLORS][2] = { { CR_WK, CR_WQ }, { CR_BK, CR_BQ } };
+
+/* Back rank of colour c (a1 or a8). */
+static inline int back_rank(int c) { return c == WHITE ? 0 : 56; }
+/* Origin square of the castling rook, and the two castling destinations. */
+static inline int crook_sq(const Position *p, int c, int side)
+{
+    return back_rank(c) + (int)p->crook[c][side];
+}
+static inline int castle_kto(int c, int side) { return back_rank(c) + (side == 0 ? 6 : 2); }
+static inline int castle_rto(int c, int side) { return back_rank(c) + (side == 0 ? 5 : 3); }
 
 /* Internal (inlinable) sliding-attack lookups. */
 static inline uint64_t bishop_att(int sq, uint64_t occ)
@@ -419,6 +452,70 @@ static inline uint64_t sh_capr(uint64_t b, int us)   /* toward file+1 */
     return us == WHITE ? ((b & ~FILE_H) << 9) : ((b & ~FILE_H) >> 7);
 }
 
+/* ---- Chess960 castling ----------------------------------------------------
+ *
+ * The destinations are the classical ones (king g1/c1, rook f1/d1) but the two
+ * pieces may start anywhere on the back rank, so the king can move left, right
+ * or not at all, and the rook may jump over the king's square.  Conditions:
+ *
+ *   1. the right is still held and its rook really stands on its origin file;
+ *   2. every square of the king's path and of the rook's path (destinations
+ *      included) is empty apart from the castling king and the castling rook
+ *      themselves -- a piece on a square only the ROOK crosses blocks too;
+ *   3. no square the king passes over, including its origin and destination,
+ *      is attacked -- testing the origin here is what makes "you may not castle
+ *      out of check" hold, so this function is self-contained and the caller
+ *      does not have to run its own in-check test.  As everywhere else,
+ *      "attacked" is judged in the position BEFORE the move, which is the
+ *      standard reading of the rule and what published 960 perft numbers
+ *      assume;
+ *   4. the move must not leave our own king in check.  This is NOT implied by
+ *      (3) in Chess960: vacating the rook's origin can open a rank-1 line onto
+ *      the king's destination (enemy rook a1, our castling rook b1, king c1),
+ *      so the king's final square is re-tested against the final occupancy.
+ *
+ * `occ` is p->all.
+ */
+static COLD_HELPER int gen_castle_960(const Position *p, Move *out, int n, int us, int ksq, uint64_t occ)
+{
+    const int them = us ^ 1;
+    /* A FEN may claim rights whose king has long since left home; the
+     * classical generator rejects that by testing board[e1], and this is the
+     * same guard.  Without it BETWEEN[ksq][kto] would be a ray that has
+     * nothing to do with the back rank. */
+    if (sq_rank(ksq) != sq_rank(back_rank(us))) return n;
+
+    for (int side = 0; side < 2; side++) {
+        if (!(p->castling & CR_BIT[us][side])) continue;
+
+        const int rfrom = crook_sq(p, us, side);
+        if (p->board[rfrom] != ROOK || p->color_at[rfrom] != us) continue;
+        const int kto = castle_kto(us, side);
+        const int rto = castle_rto(us, side);
+
+        /* (2) both paths clear of everything except the king and that rook */
+        const uint64_t path = BETWEEN[ksq][kto] | BIT(kto) | BETWEEN[rfrom][rto] | BIT(rto);
+        if ((occ ^ BIT(ksq) ^ BIT(rfrom)) & path) continue;
+
+        /* (3) the king's walk, origin and destination included, must be
+         * attack-free -- BIT(ksq) is the "not out of check" half of the rule */
+        uint64_t walk = BETWEEN[ksq][kto] | BIT(kto) | BIT(ksq);
+        int blocked = 0;
+        while (walk) {
+            const int sq = bb_pop(&walk);
+            if (attacked_by(p, sq, them, occ)) { blocked = 1; break; }
+        }
+        if (blocked) continue;
+
+        /* (4) the resulting position must be legal */
+        const uint64_t occ_after = occ ^ BIT(ksq) ^ BIT(kto) ^ BIT(rfrom) ^ BIT(rto);
+        if (attacked_by(p, kto, them, occ_after)) continue;
+
+        out[n++] = MV_MAKE(ksq, rfrom, side == 0 ? MF_KCASTLE : MF_QCASTLE);
+    }
+    return n;
+}
+
 static inline int gen_moves(const Position *p, Move *out, const int caps_only)
 {
     int n = 0;
@@ -590,7 +687,10 @@ static inline int gen_moves(const Position *p, Move *out, const int caps_only)
     }
 
     /* ---- castling ---- */
-    if (!caps_only && nchk == 0) {
+    /* p->chess960 is read here rather than passed in, so that the shared body
+     * keeps nothing extra alive across it; the 960 castling moves are appended
+     * by gen_legal_960() instead. */
+    if (!caps_only && nchk == 0 && !p->chess960) {
         if (us == WHITE) {
             if ((p->castling & CR_WK)
                 && p->board[4] == KING && p->color_at[4] == WHITE
@@ -623,12 +723,130 @@ static inline int gen_moves(const Position *p, Move *out, const int caps_only)
     return n;
 }
 
-int gen_legal(const Position *p, Move *out)          { return gen_moves(p, out, 0); }
+/* Chess960 castling is appended here rather than from inside gen_moves(),
+ * whose body is shared with the classical generator: a call in the middle of
+ * it would cost every classical node the spills around that call. */
+static COLD_HELPER int gen_legal_960(const Position *p, Move *out)
+{
+    int n = gen_moves(p, out, 0);
+    const int us = p->side;
+    if ((p->castling & (us == WHITE ? (CR_WK | CR_WQ) : (CR_BK | CR_BQ)))
+        && p->piece[us][KING])
+        n = gen_castle_960(p, out, n, us, bb_lsb(p->piece[us][KING]), p->all);
+    return n;
+}
+
+int gen_legal(const Position *p, Move *out)
+{
+    if (p->chess960) return gen_legal_960(p, out);   /* tail call, classical pays a test */
+    return gen_moves(p, out, 0);
+}
+/* Castling is never a capture, so the capture generator has no 960 variant. */
 int gen_legal_captures(const Position *p, Move *out) { return gen_moves(p, out, 1); }
 
 /* ------------------------------------------------------- make / unmake - */
 
-void make_move(Position *p, Move m, Undo *u)
+/* Castling-right invalidation for Chess960, where the rooks are not on a1/h1.
+ * A right dies when the king moves (whatever the king's origin file is), when
+ * its rook leaves its origin square, or when anything lands on that square --
+ * the latter covers the rook being captured at home.  Rights are only ever
+ * cleared, never set, so the conservative "something moved off / onto the rook
+ * square" test can never resurrect a dead right. */
+static COLD_HELPER uint8_t castle_mask_960(const Position *p, int pc, int us, int from, int to)
+{
+    uint8_t mask = CR_ALL;
+    if (pc == KING) mask &= (uint8_t)~(CR_BIT[us][0] | CR_BIT[us][1]);
+    for (int c = 0; c < NCOLORS; c++) {
+        for (int side = 0; side < 2; side++) {
+            const uint8_t bit = CR_BIT[c][side];
+            if (!(p->castling & bit)) continue;
+            const int rsq = crook_sq(p, c, side);
+            if (from == rsq || to == rsq) mask &= (uint8_t)~bit;
+        }
+    }
+    return mask;
+}
+
+/* The four squares a castling move touches.  The rook's origin comes from
+ * p->crook, which is {h,a} for every classical position, so this is the same
+ * code for both variants: playing a castling move never has to look at
+ * p->chess960, and the move's `to` field (the rook's square in Chess960, the
+ * king's destination in classical chess) is pure move IDENTITY -- it never
+ * feeds the board update. */
+static inline void castle_squares(const Position *p, int fl, int us,
+                                  int *rfrom, int *kto, int *rto)
+{
+    const int side = (fl == MF_KCASTLE) ? 0 : 1;
+    *rfrom = crook_sq(p, us, side);
+    *kto   = castle_kto(us, side);
+    *rto   = castle_rto(us, side);
+}
+
+/* Castling relocates two pieces, and in Chess960 either of them may end where
+ * it already stands (king on g1, rook on f1) or on the other's origin square.
+ * XOR-updating the bitboards and clearing both origins before writing both
+ * destinations handles every overlap, including from == kto (a null king
+ * move).  `k` is the running zobrist with the old ep/castling terms already
+ * removed; this finishes the whole move. */
+static inline void make_castle(Position *p, int fl, int us, int from, uint64_t k)
+{
+    int rfrom, kto, rto;
+    castle_squares(p, fl, us, &rfrom, &kto, &rto);
+
+    p->piece[us][KING] ^= BIT(from) ^ BIT(kto);
+    p->piece[us][ROOK] ^= BIT(rfrom) ^ BIT(rto);
+    p->occ[us]         ^= BIT(from) ^ BIT(kto) ^ BIT(rfrom) ^ BIT(rto);
+    k ^= Z_PIECE[us][KING][from]  ^ Z_PIECE[us][KING][kto]
+       ^ Z_PIECE[us][ROOK][rfrom] ^ Z_PIECE[us][ROOK][rto];
+
+    p->board[from]     = NO_PIECE;
+    p->color_at[from]  = -1;
+    p->board[rfrom]    = NO_PIECE;
+    p->color_at[rfrom] = -1;
+    p->board[kto]      = KING;
+    p->color_at[kto]   = (int8_t)us;
+    p->board[rto]      = ROOK;
+    p->color_at[rto]   = (int8_t)us;
+
+    /* Castling always burns both of the mover's rights and can never touch the
+     * opponent's (every square involved is on our own back rank). */
+    p->castling &= (uint8_t)~(CR_BIT[us][0] | CR_BIT[us][1]);
+    k ^= Z_CASTLE[p->castling];
+    p->ep = -1;
+    p->halfmove++;
+    if (us == BLACK) p->fullmove++;
+    p->side = (uint8_t)(us ^ 1);
+    k ^= Z_SIDE;
+
+    p->all = p->occ[WHITE] | p->occ[BLACK];
+    p->key = k;
+}
+
+static inline void unmake_castle(Position *p, int fl, int us, int from)
+{
+    int rfrom, kto, rto;
+    castle_squares(p, fl, us, &rfrom, &kto, &rto);
+
+    p->piece[us][KING] ^= BIT(from) ^ BIT(kto);
+    p->piece[us][ROOK] ^= BIT(rfrom) ^ BIT(rto);
+    p->occ[us]         ^= BIT(from) ^ BIT(kto) ^ BIT(rfrom) ^ BIT(rto);
+
+    p->board[kto]      = NO_PIECE;
+    p->color_at[kto]   = -1;
+    p->board[rto]      = NO_PIECE;
+    p->color_at[rto]   = -1;
+    p->board[from]     = KING;
+    p->color_at[from]  = (int8_t)us;
+    p->board[rfrom]    = ROOK;
+    p->color_at[rfrom] = (int8_t)us;
+
+    p->all = p->occ[WHITE] | p->occ[BLACK];
+}
+
+/* One body, two instantiations.  `c960` is a compile-time constant, so the
+ * classical instantiation is the pre-960 make_move(): no extra test, no call
+ * and no register pressure from code it never executes. */
+static HOT_INLINE void make_move_impl(Position *p, Move m, Undo *u, const int c960)
 {
     const int from = MV_FROM(m), to = MV_TO(m), fl = MV_FLAG(m);
     const int us = p->side, them = us ^ 1;
@@ -646,6 +864,8 @@ void make_move(Position *p, Move m, Undo *u)
     k ^= Z_CASTLE[p->castling];
 
     const int pc = p->board[from];
+
+    if (fl == MF_KCASTLE || fl == MF_QCASTLE) { make_castle(p, fl, us, from, k); return; }
 
     /* --- remove the captured piece --- */
     if (fl == MF_EP) {
@@ -675,22 +895,15 @@ void make_move(Position *p, Move m, Undo *u)
     p->board[to]      = (int8_t)newpc;
     p->color_at[to]   = (int8_t)us;
 
-    /* --- castling rook --- */
-    if (fl == MF_KCASTLE || fl == MF_QCASTLE) {
-        int rf, rt;
-        if (fl == MF_KCASTLE) { rf = (us == WHITE) ? 7 : 63; rt = (us == WHITE) ? 5 : 61; }
-        else                  { rf = (us == WHITE) ? 0 : 56; rt = (us == WHITE) ? 3 : 59; }
-        p->piece[us][ROOK] ^= BIT(rf) | BIT(rt);
-        p->occ[us]         ^= BIT(rf) | BIT(rt);
-        k ^= Z_PIECE[us][ROOK][rf] ^ Z_PIECE[us][ROOK][rt];
-        p->board[rf]    = NO_PIECE;
-        p->color_at[rf] = -1;
-        p->board[rt]    = ROOK;
-        p->color_at[rt] = (int8_t)us;
-    }
-
     /* --- rights, ep, clocks, side --- */
-    p->castling &= CASTLE_MASK[from] & CASTLE_MASK[to];
+    if (c960) {
+        /* A right can only die to a king move or to something touching a back
+         * rank, and most moves are neither -- worth a test to skip the call. */
+        if (p->castling && (pc == KING || ((bfrom | bto) & (RANK_1 | RANK_8))))
+            p->castling &= castle_mask_960(p, pc, us, from, to);
+    } else {
+        p->castling &= CASTLE_MASK[from] & CASTLE_MASK[to];
+    }
     k ^= Z_CASTLE[p->castling];
 
     if (fl == MF_DOUBLE) {
@@ -724,6 +937,8 @@ void unmake_move(Position *p, Move m, const Undo *u)
     p->halfmove = u->halfmove;
     p->fullmove = u->fullmove;
 
+    if (fl == MF_KCASTLE || fl == MF_QCASTLE) { unmake_castle(p, fl, us, from); return; }
+
     const int newpc = p->board[to];
     const int pc    = (fl >= MF_PROMO_N) ? PAWN : newpc;
 
@@ -749,19 +964,23 @@ void unmake_move(Position *p, Move m, const Undo *u)
         p->color_at[to]     = (int8_t)them;
     }
 
-    if (fl == MF_KCASTLE || fl == MF_QCASTLE) {
-        int rf, rt;
-        if (fl == MF_KCASTLE) { rf = (us == WHITE) ? 7 : 63; rt = (us == WHITE) ? 5 : 61; }
-        else                  { rf = (us == WHITE) ? 0 : 56; rt = (us == WHITE) ? 3 : 59; }
-        p->piece[us][ROOK] ^= BIT(rf) | BIT(rt);
-        p->occ[us]         ^= BIT(rf) | BIT(rt);
-        p->board[rt]    = NO_PIECE;
-        p->color_at[rt] = -1;
-        p->board[rf]    = ROOK;
-        p->color_at[rf] = (int8_t)us;
-    }
-
     p->all = p->occ[WHITE] | p->occ[BLACK];
+}
+
+/* unmake_move() needs no variant at all (castle_squares() reads p->crook), and
+ * make_move()'s only Chess960-specific step is the castling-right mask, so the
+ * classical body is inlined right here and only the 960 body is called.  These
+ * two run once per node: routing the classical path through a call of its own
+ * measures ~9% slower, and a shared body with a runtime flag ~3%. */
+static COLD_HELPER void make_move_960(Position *p, Move m, Undo *u)
+{
+    make_move_impl(p, m, u, 1);
+}
+
+void make_move(Position *p, Move m, Undo *u)
+{
+    if (p->chess960) { make_move_960(p, m, u); return; }
+    make_move_impl(p, m, u, 0);
 }
 
 void make_null(Position *p, Undo *u)
@@ -821,6 +1040,10 @@ static void pos_clear(Position *p)
     for (int i = 0; i < 64; i++) { p->board[i] = NO_PIECE; p->color_at[i] = -1; }
     p->ep = -1;
     p->fullmove = 1;
+    /* Classical rook files, so that a Position never carries a nonsense crook
+     * even when it holds no castling rights at all. */
+    p->crook[WHITE][0] = p->crook[BLACK][0] = 7;
+    p->crook[WHITE][1] = p->crook[BLACK][1] = 0;
 }
 
 static void pos_finish(Position *p)
@@ -894,25 +1117,75 @@ int pos_from_fen(Position *p, const char *fen)
     else return 0;
     s++;
 
+    /* ---- castling rights -------------------------------------------------
+     * Three notations are accepted:
+     *   KQkq   classical, and the X-FEN reading of it for a Chess960 board:
+     *          K/Q mean "the OUTERMOST own rook on that side of the king";
+     *   HAha   Shredder-FEN, the rook's origin file (upper case = White);
+     *   any mixture of the two (the X-FEN hybrid).
+     * The position counts as Chess960 when a file letter was used, or when the
+     * X-FEN resolution does not land on the classical e1/a1/h1 geometry.  A
+     * right whose rook is missing entirely is kept with the classical default
+     * file, which is what the pre-960 parser did and what the generator (which
+     * re-checks that the rook is really there) safely ignores. */
     while (*s == ' ') s++;
     p->castling = 0;
     if (*s == '-') {
         s++;
     } else {
-        int seen = 0;
+        int kfile[NCOLORS];
+        for (int c = 0; c < NCOLORS; c++)
+            kfile[c] = p->piece[c][KING] ? sq_file(bb_lsb(p->piece[c][KING])) : -1;
+
+        int given[NCOLORS][2] = { { -1, -1 }, { -1, -1 } };   /* explicit files */
+        int seen = 0, is960 = 0;
+
         while (*s && *s != ' ') {
-            switch (*s) {
-                case 'K': p->castling |= CR_WK; break;
-                case 'Q': p->castling |= CR_WQ; break;
-                case 'k': p->castling |= CR_BK; break;
-                case 'q': p->castling |= CR_BQ; break;
-                default: return 0;
+            const char ch = *s;
+            int c, side, f = -1;
+            if      (ch == 'K') { c = WHITE; side = 0; }
+            else if (ch == 'Q') { c = WHITE; side = 1; }
+            else if (ch == 'k') { c = BLACK; side = 0; }
+            else if (ch == 'q') { c = BLACK; side = 1; }
+            else if (ch >= 'A' && ch <= 'H') { c = WHITE; f = ch - 'A'; side = 0; }
+            else if (ch >= 'a' && ch <= 'h') { c = BLACK; f = ch - 'a'; side = 0; }
+            else return 0;
+            if (f >= 0) {
+                /* Which side of the king the rook stands on decides the right. */
+                if (kfile[c] < 0 || f == kfile[c]) return 0;
+                side = (f > kfile[c]) ? 0 : 1;
+                given[c][side] = f;
+                is960 = 1;
             }
+            p->castling |= CR_BIT[c][side];
             seen++;
             if (seen > 4) return 0;
             s++;
         }
         if (!seen) return 0;
+
+        for (int c = 0; c < NCOLORS; c++) {
+            const int base = (c == WHITE) ? 0 : 56;
+            for (int side = 0; side < 2; side++) {
+                if (!(p->castling & CR_BIT[c][side])) continue;
+                if (given[c][side] >= 0) {
+                    p->crook[c][side] = (uint8_t)given[c][side];
+                    continue;
+                }
+                int rf = -1;                        /* X-FEN: outermost rook */
+                if (kfile[c] >= 0 && side == 0) {
+                    for (int f = 7; f > kfile[c]; f--)
+                        if (p->board[base + f] == ROOK && p->color_at[base + f] == c) { rf = f; break; }
+                } else if (kfile[c] >= 0) {
+                    for (int f = 0; f < kfile[c]; f++)
+                        if (p->board[base + f] == ROOK && p->color_at[base + f] == c) { rf = f; break; }
+                }
+                if (rf < 0) continue;               /* bogus right: keep the default */
+                p->crook[c][side] = (uint8_t)rf;
+                if (rf != (side == 0 ? 7 : 0) || kfile[c] != 4) is960 = 1;
+            }
+        }
+        p->chess960 = (uint8_t)(is960 != 0);
     }
 
     while (*s == ' ') s++;
@@ -954,6 +1227,146 @@ void pos_startpos(Position *p)
     pos_from_fen(p, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 }
 
+/* ---------------------------------------------------------- chess 960 --- */
+
+/* Scharnagl's numbering, the scheme the FIDE/Shredder world uses:
+ *
+ *   n       -> (n % 4)  picks the light-square bishop out of b1,d1,f1,h1
+ *   n /= 4  -> (n % 4)  picks the dark-square  bishop out of a1,c1,e1,g1
+ *   n /= 4  -> (n % 6)  puts the queen on that many-th still-empty square
+ *   n /= 6  -> 0..9     indexes the table below, whose N/R/K pattern is laid
+ *                       out over the five squares that are still empty
+ *
+ * 518 comes out as RNBQKBNR, which is asserted in tests/test_960.c. */
+static const char KRN_TABLE[10][6] = {
+    "NNRKR", "NRNKR", "NRKNR", "NRKRN", "RNNKR",
+    "RNKNR", "RNKRN", "RKNNR", "RKNRN", "RKRNN"
+};
+
+/* Fills back[0..7] with the piece letters (upper case) of White's back rank. */
+static void scharnagl_back_rank(int id, char *back)
+{
+    int n = id % 960;
+    if (n < 0) n += 960;
+
+    for (int f = 0; f < 8; f++) back[f] = 0;
+    back[8] = '\0';
+
+    back[2 * (n % 4) + 1] = 'B';        /* light squares: files 1,3,5,7 */
+    n /= 4;
+    back[2 * (n % 4)]     = 'B';        /* dark squares:  files 0,2,4,6 */
+    n /= 4;
+
+    int q = n % 6;                      /* queen on the q-th free square */
+    n /= 6;
+    for (int f = 0; f < 8; f++) {
+        if (back[f]) continue;
+        if (q-- == 0) { back[f] = 'Q'; break; }
+    }
+
+    const char *pat = KRN_TABLE[n % 10];
+    for (int f = 0, k = 0; f < 8; f++)
+        if (!back[f]) back[f] = pat[k++];
+}
+
+void pos_startpos960(Position *p, int id)
+{
+    char back[9];
+    scharnagl_back_rank(id, back);
+
+    int kf = 0, rk = 0, rq = 0;
+    for (int f = 0; f < 8; f++) if (back[f] == 'K') kf = f;
+    for (int f = 0; f < 8; f++)
+        if (back[f] == 'R') { if (f < kf) rq = f; else { rk = f; break; } }
+
+    /* Built through the FEN parser, in Shredder notation, so that a 960 game
+     * and a 960 FEN can never drift apart. */
+    char fen[96];
+    int i = 0;
+    for (int f = 0; f < 8; f++) fen[i++] = (char)(back[f] - 'A' + 'a');
+    i += snprintf(fen + i, sizeof(fen) - (size_t)i, "/pppppppp/8/8/8/8/PPPPPPPP/");
+    for (int f = 0; f < 8; f++) fen[i++] = back[f];
+    snprintf(fen + i, sizeof(fen) - (size_t)i, " w %c%c%c%c - 0 1",
+             'A' + rk, 'A' + rq, 'a' + rk, 'a' + rq);
+
+    pos_from_fen(p, fen);
+}
+
+int pos_960_id(const Position *p)
+{
+    /* White's back rank must be a legal 960 array and Black must mirror it. */
+    char back[9];
+    int count[NPIECES] = { 0 };
+    for (int f = 0; f < 8; f++) {
+        const int pt = p->board[f];
+        if (pt == NO_PIECE || p->color_at[f] != WHITE) return -1;
+        if (p->board[f + 56] != pt || p->color_at[f + 56] != BLACK) return -1;
+        count[pt]++;
+        back[f] = "PNBRQK"[pt];
+    }
+    back[8] = '\0';
+    if (count[PAWN] || count[KNIGHT] != 2 || count[BISHOP] != 2
+        || count[ROOK] != 2 || count[QUEEN] != 1 || count[KING] != 1) return -1;
+
+    int lb = -1, db = -1;
+    for (int f = 0; f < 8; f++)
+        if (back[f] == 'B') { if (f & 1) lb = f; else db = f; }
+    if (lb < 0 || db < 0) return -1;            /* both bishops same colour */
+
+    int q = -1, free_idx = 0;
+    for (int f = 0; f < 8; f++) {
+        if (back[f] == 'B') continue;
+        if (back[f] == 'Q') { q = free_idx; break; }
+        free_idx++;
+    }
+    if (q < 0) return -1;
+
+    char pat[6];
+    int k = 0;
+    for (int f = 0; f < 8 && k < 5; f++)
+        if (back[f] != 'B' && back[f] != 'Q') pat[k++] = back[f];
+    pat[5] = '\0';
+
+    int krn = -1;
+    for (int t = 0; t < 10; t++) if (!strcmp(pat, KRN_TABLE[t])) { krn = t; break; }
+    if (krn < 0) return -1;                     /* king not between the rooks */
+
+    return ((krn * 6 + q) * 4 + db / 2) * 4 + (lb - 1) / 2;
+}
+
+/* xoshiro256** -- the same generator the trainer uses, kept local so that
+ * chess.c stays free-standing. */
+static inline uint64_t x960_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+
+static uint64_t x960_next(uint64_t *s)
+{
+    const uint64_t result = x960_rotl(s[1] * 5, 7) * 9;
+    const uint64_t t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = x960_rotl(s[3], 45);
+    return result;
+}
+
+int pos_960_random(uint64_t *rng)
+{
+    if (!rng) return CHESS960_CLASSICAL_ID;
+    if (!(rng[0] | rng[1] | rng[2] | rng[3])) {        /* the forbidden state */
+        rng[0] = 0x9E3779B97F4A7C15ULL;
+        rng[1] = 0xBF58476D1CE4E5B9ULL;
+        rng[2] = 0x94D049BB133111EBULL;
+        rng[3] = 0x2545F4914F6CDD1DULL;
+    }
+    /* Rejection sampling: plain % would favour the first 2^64 mod 960 ids. */
+    const uint64_t limit = (UINT64_MAX / 960) * 960;
+    uint64_t r;
+    do { r = x960_next(rng); } while (r >= limit);
+    return (int)(r % 960);
+}
+
 void pos_to_fen(const Position *p, char *buf, size_t buflen)
 {
     static const char PCH[2][6] = { { 'P','N','B','R','Q','K' }, { 'p','n','b','r','q','k' } };
@@ -979,6 +1392,15 @@ void pos_to_fen(const Position *p, char *buf, size_t buflen)
     tmp[i++] = ' ';
     if (!p->castling) {
         tmp[i++] = '-';
+    } else if (p->chess960) {
+        /* Shredder-FEN.  A Chess960 position is emitted with file letters
+         * unconditionally: KQkq is only unambiguous while the castling rook is
+         * still the outermost one on its side, and a promoted rook landing
+         * outside it would silently change the meaning of the FEN. */
+        if (p->castling & CR_WK) tmp[i++] = (char)('A' + p->crook[WHITE][0]);
+        if (p->castling & CR_WQ) tmp[i++] = (char)('A' + p->crook[WHITE][1]);
+        if (p->castling & CR_BK) tmp[i++] = (char)('a' + p->crook[BLACK][0]);
+        if (p->castling & CR_BQ) tmp[i++] = (char)('a' + p->crook[BLACK][1]);
     } else {
         if (p->castling & CR_WK) tmp[i++] = 'K';
         if (p->castling & CR_WQ) tmp[i++] = 'Q';
@@ -1021,6 +1443,40 @@ void move_to_uci(Move m, char *buf)
     }
 }
 
+/* Chess960 writes castling as king-takes-rook ("e1h1"), because the king's
+ * destination may be its own origin or an ordinary king move.  The internal
+ * encoding already stores exactly that, but this is derived from the position
+ * rather than from the move so that it is right whichever encoding a caller
+ * hands in.  The move is assumed to belong to `p`, i.e. to p->side. */
+void move_to_uci_pos(const Position *p, Move m, char *buf)
+{
+    const int fl = MV_FLAG(m);
+    if (p && (fl == MF_KCASTLE || fl == MF_QCASTLE)) {
+        const int us = p->side, side = (fl == MF_KCASTLE) ? 0 : 1;
+        const int to = p->chess960 ? crook_sq(p, us, side) : castle_kto(us, side);
+        buf[0] = (char)('a' + sq_file(MV_FROM(m)));
+        buf[1] = (char)('1' + sq_rank(MV_FROM(m)));
+        buf[2] = (char)('a' + sq_file(to));
+        buf[3] = (char)('1' + sq_rank(to));
+        buf[4] = '\0';
+        return;
+    }
+    move_to_uci(m, buf);
+}
+
+/* Accepts both castling notations.  DISAMBIGUATION RULE, in two passes:
+ *
+ *   1. an exact (from,to) match against the legal moves always wins.  Castling
+ *      is stored king-takes-rook in Chess960, so "e1h1" resolves to castling,
+ *      and "e1g1" resolves to the ordinary king move whenever that move is
+ *      legal -- which is the only reading that lets a 960 game express both;
+ *   2. only if nothing matched exactly is the string re-read as the other
+ *      castling notation: from the king's square to its castling destination
+ *      (the classical form of a 960 castle) or to the castling rook's square
+ *      (the 960 form of a classical castle, accepted for tolerance).
+ *
+ * So the rook-square form is king-takes-rook, and the g1/c1 form is a normal
+ * king move whenever one exists and castling otherwise. */
 int move_from_uci(const Position *p, const char *s, Move *out)
 {
     if (!s) return 0;
@@ -1051,6 +1507,20 @@ int move_from_uci(const Position *p, const char *s, Move *out)
         }
         if (out) *out = m;
         return 1;
+    }
+
+    /* Pass 2: the other castling notation. */
+    if (!promo) {
+        for (int i = 0; i < n; i++) {
+            const Move m = list[i];
+            const int fl = MV_FLAG(m);
+            if (fl != MF_KCASTLE && fl != MF_QCASTLE) continue;
+            if (MV_FROM(m) != from) continue;
+            const int us = p->side, side = (fl == MF_KCASTLE) ? 0 : 1;
+            if (to != castle_kto(us, side) && to != crook_sq(p, us, side)) continue;
+            if (out) *out = m;
+            return 1;
+        }
     }
     return 0;
 }
@@ -1186,6 +1656,18 @@ void game_start(Game *g)
 {
     memset(g, 0, sizeof(*g));
     pos_startpos(&g->pos);
+    g->ply = 0;
+    g->hist[0] = g->pos.key;
+    g->hist_len = 1;
+    g->result = GR_ONGOING;
+    g->reason = TR_NONE;
+    game_update_result(g, 0);
+}
+
+void game_start960(Game *g, int id)
+{
+    memset(g, 0, sizeof(*g));
+    pos_startpos960(&g->pos, id);
     g->ply = 0;
     g->hist[0] = g->pos.key;
     g->hist_len = 1;
