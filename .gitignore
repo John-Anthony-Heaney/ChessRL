@@ -4,6 +4,13 @@ build/
 *.dylib
 runs/*/
 !runs/.gitkeep
+# The champion run IS the deliverable: keep its model, telemetry and report so
+# the repo can be cloned and played, and so the charts can be checked against data.
+!runs/az_main/
+!runs/az_main/best.crl
+!runs/az_main/telemetry.jsonl
+!runs/sf_ladder_az.json
+runs/az_main/checkpoint.crl
 __pycache__/
 *.pyc
 .DS_Store
