@@ -82,6 +82,15 @@
 #define NODES_PER_SIM    72
 /* Moves stored per recorded position, worst case, in the per-game scratch. */
 #define REC_MAX_MOVES    MAX_MOVES
+/* Calibration buckets for the value head: predictions are split evenly over
+ * [-1,1] and the ACTUAL outcome rate is reported per bucket.  A head that has
+ * collapsed to the mean occupies one bucket; a calibrated head has a
+ * per-bucket actual rate that tracks the per-bucket prediction. */
+#define VAL_BUCKETS      8
+/* Which minibatch of a generation carries the extra instrumentation: the
+ * policy/value gradient decomposition and the EMA-vs-raw comparison.  One step
+ * in steps_per_gen, so the cost is under 2% of the learning time. */
+#define PROBE_STEP       0
 
 _Static_assert(sizeof(Hyper) == 8 * sizeof(float), "Hyper must be 8 packed floats");
 
@@ -277,6 +286,11 @@ typedef struct {
     uint8_t  mover;                /* WHITE / BLACK -- telemetry only        */
     int16_t  agent;                /* live agent that generated the position */
     float    z;                    /* game result from the mover's view      */
+    float    q;                    /* MCTS root value AT this position, same
+                                    * view.  The search's own estimate, kept
+                                    * so the value target can be mixed
+                                    * (see AZCfg.value_mix) without replaying
+                                    * self-play.                             */
 } AZPos;
 
 typedef struct {
@@ -399,32 +413,17 @@ typedef struct { int16_t result, reason; } AZRes;
 #define HOF_IDX(id)  (-(id) - 1)
 
 /* ------------------------------------------------------------ head tensors */
-
-typedef struct { size_t off, len; } TensorSpan;
-
-#define TSPAN(field, n) { offsetof(Head, field) / sizeof(float), (size_t)(n) }
-
-static const TensorSpan HEAD_TENSORS[] = {
-    TSPAN(z,      NF_ACC),
-    TSPAN(Wv,     NF_HID),
-    TSPAN(bv,     1),
-    TSPAN(Wp,     NF_HID * NF_PDIM),
-    TSPAN(Efrom,  64 * NF_PDIM),
-    TSPAN(Eto,    64 * NF_PDIM),
-    TSPAN(Epc,    6 * NF_PDIM),
-    TSPAN(Epromo, 5 * NF_PDIM),
-    TSPAN(Ecap,   7 * NF_PDIM),
-    TSPAN(Bft,    64 * 64),
-};
-#define N_HEAD_TENSORS ((int)(sizeof HEAD_TENSORS / sizeof HEAD_TENSORS[0]))
+/* The layout table lives in net.h (NN_HEAD_TENSORS).  It used to be duplicated
+ * here, which is exactly how a clone silently stops perturbing a tensor that
+ * someone added to Head. */
 
 /* Per-tensor N(0, sigma * rms(tensor)) perturbation. */
 static void head_mutate(Head *h, float sigma, uint64_t *rng)
 {
     float *base = (float *)h;
-    for (int t = 0; t < N_HEAD_TENSORS; t++) {
-        float *v = base + HEAD_TENSORS[t].off;
-        const size_t n = HEAD_TENSORS[t].len;
+    for (int t = 0; t < NN_HEAD_NTENSORS; t++) {
+        float *v = base + NN_HEAD_TENSORS[t].off;
+        const size_t n = NN_HEAD_TENSORS[t].len;
         double ss = 0.0;
         for (size_t i = 0; i < n; i++) ss += (double)v[i] * (double)v[i];
         const float rms = (float)sqrt(ss / (double)n);
@@ -504,6 +503,8 @@ typedef struct {
     uint64_t  tgt_ent_n;
     uint64_t  resign_checked, resign_would, resign_wrong;
 
+    uint64_t  full_moves, all_moves; /* playout-cap randomisation accounting  */
+
     /* learning */
     TrunkGrad *tg;
     double     l_pol, l_val, l_ent;
@@ -512,8 +513,21 @@ typedef struct {
     double     l_tent;              /* entropy of the MCTS target, same batch  */
     uint64_t   l_top1;              /* argmax(p_net) == argmax(pi_mcts)        */
     double     l_zsum, l_zsq;       /* for the constant-predictor baseline     */
+    double     l_osum, l_osq;       /* same, for the PURE outcome target       */
+    double     l_vout;              /* (v - z)^2 against the pure outcome      */
+    double     l_qout;              /* (q_search - z)^2, the same way          */
+    double     v_sum, v_sq;         /* mean and sd of the PREDICTION           */
+    double     cal_pred[VAL_BUCKETS], cal_out[VAL_BUCKETS];
+    uint64_t   cal_n[VAL_BUCKETS];
     double     hgnorm_sum;
-    uint64_t   hgnorm_n;
+    uint64_t   hgnorm_n, hclip_n;
+
+    /* instrumentation, PROBE_STEP only */
+    int        probe;
+    TrunkGrad *tg_pol, *tg_val;     /* trunk gradient from ONE loss term each  */
+    HeadGrad  *hg_probe;            /* sink; the head half is not reported     */
+    uint64_t   ema_n, ema_top1;
+    double     ema_vdiff;
 } AZWorker;
 
 struct AZShared {
@@ -547,8 +561,22 @@ struct AZShared {
     int       *tstart;
     float      lr_now;
     double     gnorm_sum;
-    uint64_t   gnorm_n;
+    uint64_t   gnorm_n, gclip_n;
+    int        probe_nb;            /* positions in the PROBE_STEP minibatch   */
+
+    /* Polyak-averaged copy of every weight.  NULL when --ema-decay <= 0. */
+    Trunk     *ema_trunk;
+    Head      *ema_heads;
+    float      head_clip;           /* effective per-head clip                 */
+    int        cap_sims;            /* effective fast-search budget            */
 };
+
+/* e += (1 - d) * (p - e).  Polyak averaging, in place. */
+static void ema_blend(float *e, const float *p, float d, size_t n)
+{
+    const float k = 1.0f - d;
+    for (size_t i = 0; i < n; i++) e[i] += k * (p[i] - e[i]);
+}
 
 static void resolve_side(const AZShared *sh, int32_t id, const Head **h)
 {
@@ -618,10 +646,21 @@ static void az_play_one(AZWorker *w, int idx)
         const int32_t id = (side == WHITE) ? pr.white : pr.black;
         const Head *h = (side == WHITE) ? hw : hb;
 
+        /* PLAYOUT CAP RANDOMISATION (KataGo).  A "full" move gets the whole
+         * simulation budget, root noise and a slot in the replay buffer; a
+         * "fast" move gets cap_sims, no root noise, and is played but never
+         * learned from.  Nothing here is chess-specific: it is a statement
+         * about where simulation budget buys training signal, and it applies
+         * unchanged to any game. */
+        const int full  = !(c->cap_frac < 1.0f) || (az_u01(w->rng) < c->cap_frac);
+        const int nsims = full ? c->sims : sh->cap_sims;
+
         float rootv = 0.0f;
-        const int n = mcts_search(&w->m, sh->trunk, h, g, c->sims, 1,
+        const int n = mcts_search(&w->m, sh->trunk, h, g, nsims, full,
                                   w->rng, w->visits, &rootv);
         if (n <= 0) break;                        /* the search saw game over */
+        w->all_moves++;
+        if (full) w->full_moves++;
 
         const int nl = gen_legal(&g->pos, w->list);
         if (nl != n) break;                       /* cannot happen            */
@@ -634,7 +673,7 @@ static void az_play_one(AZWorker *w, int idx)
         w->tgt_ent_n++;
 
         /* ---- record: features, the visit-count policy target, the mover --- */
-        if (!IS_HOF(id) && r->n < r->npos_cap &&
+        if (full && !IS_HOF(id) && r->n < r->npos_cap &&
             r->nk + (uint64_t)n <= r->nk_cap && n <= REC_MAX_MOVES) {
             AZPos *p = &r->pos[r->n];
             p->nf     = (uint8_t)nn_features(&g->pos, p->fidx);
@@ -643,6 +682,7 @@ static void az_play_one(AZWorker *w, int idx)
             p->mover  = (uint8_t)side;
             p->agent  = (int16_t)id;
             p->z      = 0.0f;
+            p->q      = rootv;      /* the search's own estimate HERE */
             for (int i = 0; i < n; i++) {
                 nn_move_key(&g->pos, w->list[i], &r->keys[r->nk + (uint64_t)i]);
                 r->pol[r->nk + (uint64_t)i] = w->target[i];
@@ -806,10 +846,14 @@ static void az_make_batch(AZShared *sh, uint64_t *rng)
 
 /* One position's exact gradient.
  *
- *   L = -sum_a pi(a) log p(a)  +  value_coef * (v - z)^2
+ *   target      = (1 - value_mix) * z  +  value_mix * q_search
+ *   L           = -sum_a pi(a) log p(a)  +  value_coef * (v - target)^2
  *   dL/dlogit_a = p(a) - pi(a)
- *   dL/dv       = 2 * value_coef * (v - z)      [post-tanh; nn_backward applies
+ *   dL/dv       = 2 * value_coef * (v - target) [post-tanh; nn_backward applies
  *                                                the tanh derivative itself]
+ *
+ * z is the game result and q_search is the MCTS root value recorded at THIS
+ * position.  Both come from self-play; neither looks at the position.
  */
 static void az_position_grad(AZWorker *w, const AZPos *p, const MoveKey *keys,
                              const float *pi, HeadGrad *hg, const Head *h)
@@ -839,18 +883,70 @@ static void az_position_grad(AZWorker *w, const AZPos *p, const MoveKey *keys,
         dl[i] = q - pi[i];
     }
 
-    const float diff = fw.v - p->z;
+    const float mix = sh->cfg->value_mix;
+    float tgt = (1.0f - mix) * p->z + mix * p->q;
+    if (tgt >  1.0f) tgt =  1.0f;
+    if (tgt < -1.0f) tgt = -1.0f;
+
+    const float diff = fw.v - tgt;
+    const float dout = fw.v - p->z;
     const float dv = 2.0f * sh->cfg->value_coef * diff;
 
     nn_backward(sh->trunk, h, &fw, p->fidx, (int)p->nf, keys, n, dl, dv,
                 w->tg, hg);
 
+    if (w->probe) {
+        /* The gradient DECOMPOSITION: run the backward pass twice more, once
+         * with the value term silenced and once with the policy term silenced,
+         * so the trunk gradient each head actually contributes can be reported
+         * rather than guessed at. */
+        float dzero[MAX_MOVES];
+        for (int i = 0; i < n; i++) dzero[i] = 0.0f;
+        nn_backward(sh->trunk, h, &fw, p->fidx, (int)p->nf, keys, n,
+                    dl, 0.0f, w->tg_pol, w->hg_probe);
+        nn_backward(sh->trunk, h, &fw, p->fidx, (int)p->nf, keys, n,
+                    dzero, dv, w->tg_val, w->hg_probe);
+
+        if (sh->ema_trunk) {         /* how far the EMA has drifted from raw  */
+            Fwd fe;
+            float le[MAX_MOVES];
+            int be = 0;
+            nn_eval(sh->ema_trunk, &sh->ema_heads[p->agent], p->fidx,
+                    (int)p->nf, &fe);
+            nn_logits(&sh->ema_heads[p->agent], &fe, keys, n, le);
+            for (int i = 1; i < n; i++) if (le[i] > le[be]) be = i;
+            if (be == best_net) w->ema_top1++;
+            w->ema_vdiff += fabs((double)fe.v - (double)fw.v);
+            w->ema_n++;
+        }
+    }
+
     w->l_pol  += lpol;
     w->l_val  += (double)diff * (double)diff;
+    w->l_vout += (double)dout * (double)dout;
+    {   /* How good is q_search as a target in the first place?  Mixing it in
+         * can only help if the SEARCH predicts the outcome better than the
+         * bare value head does -- MSE(q,z) < MSE(v,z).  When it does not, the
+         * mix is regressing the head towards its own output. */
+        const double dq = (double)p->q - (double)p->z;
+        w->l_qout += dq * dq;
+    }
     w->l_ent  += lent;
     w->l_tent += ltent;
-    w->l_zsum += (double)p->z;
-    w->l_zsq  += (double)p->z * (double)p->z;
+    w->l_zsum += (double)tgt;
+    w->l_zsq  += (double)tgt * (double)tgt;
+    w->l_osum += (double)p->z;
+    w->l_osq  += (double)p->z * (double)p->z;
+    w->v_sum  += (double)fw.v;
+    w->v_sq   += (double)fw.v * (double)fw.v;
+    {   /* calibration: bucket the PREDICTION, average the ACTUAL outcome */
+        int b = (int)((double)(fw.v + 1.0f) * 0.5 * (double)VAL_BUCKETS);
+        if (b < 0) b = 0;
+        if (b >= VAL_BUCKETS) b = VAL_BUCKETS - 1;
+        w->cal_pred[b] += (double)fw.v;
+        w->cal_out[b]  += (double)p->z;
+        w->cal_n[b]++;
+    }
     if (best_net == best_tgt) w->l_top1++;
     w->l_n++;
     {   /* value_accuracy: does the sign of the prediction match the outcome?
@@ -874,9 +970,19 @@ static void az_learn_job(AZWorker *w)
     AZBuf *b = &sh->buf;
     const int tid = w->tid;
 
+    const float ema_d = c->ema_decay;
+    const int   ema_on = (ema_d > 0.0f) && (ema_d < 1.0f) && sh->ema_trunk;
+
     for (int step = 0; step < c->steps_per_gen; step++) {
+        w->probe = (step == PROBE_STEP);
+        if (w->probe) {
+            grad_zero(w->tg_pol,   (int)TRUNK_NPARAM);
+            grad_zero(w->tg_val,   (int)TRUNK_NPARAM);
+            grad_zero(w->hg_probe, (int)HEAD_NPARAM);
+        }
         if (tid == 0) az_make_batch(sh, w->rng);
         bar_wait(&sh->bar);
+        if (tid == 0 && w->probe) sh->probe_nb = sh->tstart[sh->nthreads];
 
         const int lo = sh->tstart[tid], hi = sh->tstart[tid + 1];
         grad_zero(w->tg, (int)TRUNK_NPARAM);
@@ -901,11 +1007,18 @@ static void az_learn_job(AZWorker *w)
                 hgp[k] *= s;
                 ss += (double)hgp[k] * (double)hgp[k];
             }
-            w->hgnorm_sum += sqrt(ss);
+            const double hn = sqrt(ss);
+            w->hgnorm_sum += hn;
             w->hgnorm_n++;
+            if (sh->head_clip > 0.0f && hn > (double)sh->head_clip) w->hclip_n++;
             adam_step(&sh->head_adam[a], (float *)&sh->heads[a], hgp,
                       sh->lr_now * sh->hypers[a].lr_scale,
-                      c->weight_decay, c->grad_clip);
+                      c->weight_decay, sh->head_clip);
+            /* This agent's head belongs to this thread alone for the whole
+             * step, so its EMA can be advanced here without a lock. */
+            if (ema_on)
+                ema_blend((float *)&sh->ema_heads[a], (const float *)&sh->heads[a],
+                          ema_d, HEAD_NPARAM);
             i = j;
         }
 
@@ -923,11 +1036,16 @@ static void az_learn_job(AZWorker *w)
                     gp[k] *= s;
                     ss += (double)gp[k] * (double)gp[k];
                 }
-                sh->gnorm_sum += sqrt(ss);
+                const double gn = sqrt(ss);
+                sh->gnorm_sum += gn;          /* PRE-clip, always */
                 sh->gnorm_n++;
+                if (c->grad_clip > 0.0f && gn > (double)c->grad_clip) sh->gclip_n++;
                 /* adam_step zeroes tgsum on the way out. */
                 adam_step(&sh->trunk_adam, (float *)sh->trunk, gp,
                           sh->lr_now, c->weight_decay, c->grad_clip);
+                if (ema_on)
+                    ema_blend((float *)sh->ema_trunk, (const float *)sh->trunk,
+                              ema_d, TRUNK_NPARAM);
             }
         }
     }
@@ -958,6 +1076,75 @@ static void az_dispatch(AZShared *sh, int job)
     if (job == JOB_SELFPLAY)   az_selfplay_job(&sh->workers[0]);
     else if (job == JOB_LEARN) az_learn_job(&sh->workers[0]);
     bar_wait(&sh->bar);
+}
+
+/* ==========================================================================
+ *                            RAW vs EMA HEAD-TO-HEAD
+ * ========================================================================== */
+/* Polyak-averaged weights are usually, but not always, stronger than the
+ * weights they average.  Rather than assume it, play the two against each
+ * other before deciding which set best.crl gets.  Called between generations,
+ * with every worker parked on the barrier, so worker 0's search scratch is
+ * free to borrow.  Returns the EMA's score in [0,1], or -1 if not measured. */
+static double az_ema_h2h(AZShared *sh, AZWorker *w, int best_i, int games,
+                         uint64_t *rng)
+{
+    const AZCfg *c = sh->cfg;
+    double score = 0.0;
+    int played = 0;
+
+    if (games <= 0 || !sh->ema_trunk) return -1.0;
+
+    for (int gi = 0; gi < games; gi++) {
+        const int ema_white = (gi & 1);
+        Game *g = &w->g;
+
+        if (c->start_mode == AZ_START_960) {
+            game_start960(g, pos_960_random(rng));
+        } else if (c->start_mode == AZ_START_MIXED) {
+            if (az_u01(rng) < 0.10f) game_start(g);
+            else                     game_start960(g, pos_960_random(rng));
+        } else {
+            game_start(g);
+        }
+
+        for (;;) {
+            if (g->result != GR_ONGOING) break;
+            if (g->ply >= c->max_plies) {
+                g->result = GR_DRAW;
+                g->reason = TR_MAX_PLIES;
+                break;
+            }
+            {
+                const int side = (int)g->pos.side;
+                const int use_ema = ((side == WHITE) == (ema_white != 0));
+                const Trunk *t = use_ema ? sh->ema_trunk : sh->trunk;
+                const Head  *h = use_ema ? &sh->ema_heads[best_i]
+                                         : &sh->heads[best_i];
+                float rv = 0.0f;
+                const int n = mcts_search(&w->m, t, h, g, c->sims, 0,
+                                          rng, w->visits, &rv);
+                int nl, pick;
+                float temp;
+                if (n <= 0) break;
+                nl = gen_legal(&g->pos, w->list);
+                if (nl != n) break;
+                /* Sampled through the opening so the games differ, greedy
+                 * afterwards so the comparison measures strength. */
+                temp = (g->ply < c->opening_plies) ? c->temp_start : 0.0f;
+                pick = mcts_pick(w->visits, n, temp, rng);
+                game_push(g, w->list[pick < 0 ? 0 : pick]);
+            }
+        }
+        {
+            int res = g->result;
+            if (res == GR_ONGOING) res = GR_DRAW;
+            if (res == GR_DRAW) score += 0.5;
+            else if ((res == GR_WHITE_WIN) == (ema_white != 0)) score += 1.0;
+            played++;
+        }
+    }
+    return played ? score / (double)played : -1.0;
 }
 
 /* ==========================================================================
@@ -1079,6 +1266,27 @@ typedef struct {
     uint64_t resign_would, resign_checked;
     double rootv_mean;
     double evals_per_move;
+
+    /* value head, properly instrumented */
+    double value_mse, value_mse_ratio;
+    double value_mse_outcome, value_mse_outcome_baseline, value_mse_outcome_ratio;
+    double search_mse_outcome, search_mse_outcome_ratio;
+    double value_pred_mean, value_pred_std;
+    double value_target_mean, value_target_std;
+    double cal_pred[VAL_BUCKETS], cal_out[VAL_BUCKETS];
+    uint64_t cal_n[VAL_BUCKETS];
+
+    /* optimisation */
+    double grad_clip_frac, head_clip_frac;
+    double grad_trunk_policy, grad_trunk_value, grad_value_share;
+    int    in_warmup;
+
+    /* EMA */
+    double ema_agree_top1, ema_value_l1, ema_h2h;
+    int    best_is_ema, ema_h2h_games;
+
+    /* playout cap randomisation */
+    double full_search_frac, recorded_per_game;
 } AZGen;
 
 static void jnum(FILE *f, double x)
@@ -1175,6 +1383,72 @@ static void write_telemetry(FILE *f, const AZShared *sh, const AZStats *st,
     fprintf(f, ",\"value_accuracy\":");       jnum(f, gs->value_acc);
     fprintf(f, ",\"value_accuracy_decisive\":"); jnum(f, gs->value_acc_decisive);
     fprintf(f, ",\"head_grad_norm\":");      jnum(f, gs->head_grad_norm);
+
+    /* ---- value head: what actually went wrong last time ----------------
+     * value_accuracy_decisive above is a sign test, and a head that has
+     * collapsed onto the mean still scores ~50% on it.  These are the
+     * numbers that show the collapse: the ratio of the value MSE to the
+     * MSE of simply predicting the mean went 0.345 -> 0.838 over the
+     * 250-generation run while the sign test barely moved.               */
+    fprintf(f, ",\"value_mse\":");            jnum(f, gs->value_mse);
+    fprintf(f, ",\"value_mse_ratio\":");      jnum(f, gs->value_mse_ratio);
+    fprintf(f, ",\"value_mse_outcome\":");    jnum(f, gs->value_mse_outcome);
+    fprintf(f, ",\"value_mse_outcome_baseline\":");
+    jnum(f, gs->value_mse_outcome_baseline);
+    fprintf(f, ",\"value_mse_outcome_ratio\":");
+    jnum(f, gs->value_mse_outcome_ratio);
+    /* The ceiling on value_mix: q_search is only worth mixing in while the
+     * SEARCH beats the bare head at predicting the result. */
+    fprintf(f, ",\"search_mse_outcome\":");   jnum(f, gs->search_mse_outcome);
+    fprintf(f, ",\"search_mse_outcome_ratio\":");
+    jnum(f, gs->search_mse_outcome_ratio);
+    fprintf(f, ",\"value_pred_mean\":");      jnum(f, gs->value_pred_mean);
+    fprintf(f, ",\"value_pred_std\":");       jnum(f, gs->value_pred_std);
+    fprintf(f, ",\"value_target_mean\":");    jnum(f, gs->value_target_mean);
+    fprintf(f, ",\"value_target_std\":");     jnum(f, gs->value_target_std);
+    fprintf(f, ",\"value_mix\":");            jnum(f, c->value_mix);
+    fprintf(f, ",\"value_coef\":");           jnum(f, c->value_coef);
+    fprintf(f, ",\"value_calibration\":[");
+    for (int b = 0; b < VAL_BUCKETS; b++) {
+        const double lo = -1.0 + 2.0 * (double)b / (double)VAL_BUCKETS;
+        const double hi = lo + 2.0 / (double)VAL_BUCKETS;
+        const double nb = gs->cal_n[b] ? (double)gs->cal_n[b] : 1.0;
+        fprintf(f, "%s{\"lo\":", b ? "," : "");    jnum(f, lo);
+        fprintf(f, ",\"hi\":");                   jnum(f, hi);
+        fprintf(f, ",\"n\":%llu", (unsigned long long)gs->cal_n[b]);
+        fprintf(f, ",\"pred\":");   jnum(f, gs->cal_n[b] ? gs->cal_pred[b] / nb : 0.0);
+        fprintf(f, ",\"actual\":"); jnum(f, gs->cal_n[b] ? gs->cal_out[b]  / nb : 0.0);
+        fputc('}', f);
+    }
+    fputc(']', f);
+
+    /* ---- optimisation: is the update being throttled? ------------------ */
+    fprintf(f, ",\"grad_norm_preclip\":");    jnum(f, gs->grad_norm);
+    fprintf(f, ",\"grad_clip\":");            jnum(f, c->grad_clip);
+    fprintf(f, ",\"grad_clip_frac\":");       jnum(f, gs->grad_clip_frac);
+    fprintf(f, ",\"head_grad_norm_preclip\":"); jnum(f, gs->head_grad_norm);
+    fprintf(f, ",\"head_grad_clip\":");       jnum(f, sh->head_clip);
+    fprintf(f, ",\"head_clip_frac\":");       jnum(f, gs->head_clip_frac);
+    fprintf(f, ",\"grad_trunk_policy\":");    jnum(f, gs->grad_trunk_policy);
+    fprintf(f, ",\"grad_trunk_value\":");     jnum(f, gs->grad_trunk_value);
+    fprintf(f, ",\"grad_value_share\":");     jnum(f, gs->grad_value_share);
+    fprintf(f, ",\"warmup_gens\":%d", c->warmup_gens);
+    fprintf(f, ",\"in_warmup\":%d", gs->in_warmup);
+
+    /* ---- weight EMA ----------------------------------------------------- */
+    fprintf(f, ",\"ema_decay\":");            jnum(f, c->ema_decay);
+    fprintf(f, ",\"ema_agree_top1\":");       jnum(f, gs->ema_agree_top1);
+    fprintf(f, ",\"ema_value_l1\":");         jnum(f, gs->ema_value_l1);
+    fprintf(f, ",\"ema_h2h_games\":%d", gs->ema_h2h_games);
+    fprintf(f, ",\"ema_h2h_score\":");        jnum(f, gs->ema_h2h);
+    fprintf(f, ",\"best_is_ema\":%d", gs->best_is_ema);
+
+    /* ---- playout cap randomisation -------------------------------------- */
+    fprintf(f, ",\"cap_frac\":");             jnum(f, c->cap_frac);
+    fprintf(f, ",\"cap_sims\":%d", sh->cap_sims);
+    fprintf(f, ",\"full_search_frac\":");     jnum(f, gs->full_search_frac);
+    fprintf(f, ",\"recorded_per_game\":");    jnum(f, gs->recorded_per_game);
+
     fprintf(f, ",\"draw_penalty\":");         jnum(f, c->draw_penalty);
     fprintf(f, ",\"best_agent\":{\"i\":%d,\"elo\":", gs->best_i);
     jnum(f, gs->elo_best);
@@ -1236,6 +1510,22 @@ void az_default_cfg(AZCfg *c)
      * R^2 0.54 -> 0.56 and, because a better value makes the search better and
      * therefore the policy targets better, policy top-1 agreement 55% -> 60%. */
     c->value_coef       = 4.0f;
+    c->grad_clip_head   = 0.0f;   /* 0 = reuse grad_clip, as before */
+
+    /* All three of the new techniques ship OFF, because "measure, do not
+     * assume" cuts both ways: none of them earned a default on the evidence a
+     * 90-second run can produce.  --value-mix, --warmup and --cap-frac turn
+     * them on; the telemetry says what they did. */
+    c->value_mix        = 0.0f;
+    c->warmup_gens      = 0;
+    c->cap_frac         = 1.0f;
+    c->cap_sims         = 0;      /* 0 = derive as max(2, sims / 5) */
+
+    /* The EMA is different: it costs one extra copy of the weights and cannot
+     * make the live network worse, because it is never trained from.  It is on
+     * by default, but it only takes over best.crl if it WINS a head-to-head. */
+    c->ema_decay        = 0.999f;
+    c->ema_h2h_games    = 8;
 
     c->elite_frac       = 0.25f;
     /* Cloning a culled agent's head discards what that head had learned, and
@@ -1284,6 +1574,20 @@ static void az_sanitise(AZCfg *c)
     if (c->lr_final > c->lr)      c->lr_final = c->lr;
     if (!(c->weight_decay >= 0.0f)) c->weight_decay = 0.0f;
     if (!(c->value_coef >= 0.0f)) c->value_coef = 1.0f;
+    if (!(c->grad_clip >= 0.0f))  c->grad_clip = 0.0f;
+    if (!(c->grad_clip_head >= 0.0f)) c->grad_clip_head = 0.0f;
+    if (!(c->value_mix >= 0.0f))  c->value_mix = 0.0f;
+    if (c->value_mix > 1.0f)      c->value_mix = 1.0f;
+    if (c->warmup_gens < 0)       c->warmup_gens = 0;
+    if (c->warmup_gens > c->generations - 1) c->warmup_gens = c->generations - 1;
+    if (c->warmup_gens < 0)       c->warmup_gens = 0;
+    if (!(c->ema_decay >= 0.0f) || c->ema_decay >= 1.0f) c->ema_decay = 0.0f;
+    if (c->ema_h2h_games < 0)     c->ema_h2h_games = 0;
+    if (c->ema_h2h_games > 64)    c->ema_h2h_games = 64;
+    if (!(c->cap_frac > 0.0f))    c->cap_frac = 1.0f;
+    if (c->cap_frac > 1.0f)       c->cap_frac = 1.0f;
+    if (c->cap_sims < 0)          c->cap_sims = 0;
+    if (c->cap_sims > c->sims)    c->cap_sims = c->sims;
     if (!(c->elite_frac > 0.0f) || c->elite_frac > 1.0f) c->elite_frac = 0.25f;
     if (!(c->cull_frac >= 0.0f) || c->cull_frac > 0.9f)  c->cull_frac = 0.20f;
     if (c->hof_every < 1)         c->hof_every = 10;
@@ -1297,6 +1601,8 @@ int az_run(AZCfg *c)
     AZShared  sh;
     Trunk    *trunk = NULL;
     Head     *heads = NULL;
+    Trunk    *ema_trunk = NULL;
+    Head     *ema_heads = NULL;
     Hyper    *hypers = NULL;
     float    *elo = NULL, *elo_sorted = NULL;
     HofEntry *hof = NULL;
@@ -1310,11 +1616,12 @@ int az_run(AZCfg *c)
     AZWorker *workers = NULL;
     pthread_t *tids = NULL;
     FILE     *tel = NULL;
-    uint64_t  master[4];
+    uint64_t  master[4], h2h_rng[4];
     char      path[1200];
     int       n, gpa, nthreads, npairs, rc = 1;
     int       adam_ready = 0, nadam = 0, nspawned = 0, bar_ready = 0;
     int       nworkers_init = 0;
+    int       h2h_next = 1, ema_wins = 0;
     double    t_run0, ema_gen = 0.0, best_saved = -1e30;
     uint64_t  total_games = 0, total_plies = 0, total_evals = 0;
     void    (*old_sigint)(int) = SIG_DFL;
@@ -1340,6 +1647,15 @@ int az_run(AZCfg *c)
 
     trunk      = (Trunk *)     calloc(1, sizeof(Trunk));
     heads      = (Head *)      calloc((size_t)n, sizeof(Head));
+    if (c->ema_decay > 0.0f) {
+        ema_trunk = (Trunk *)calloc(1, sizeof(Trunk));
+        ema_heads = (Head *) calloc((size_t)n, sizeof(Head));
+        if (!ema_trunk || !ema_heads) {
+            fprintf(stderr, "az: out of memory for the EMA weights\n");
+            free(ema_trunk); free(ema_heads);
+            ema_trunk = NULL; ema_heads = NULL;
+        }
+    }
     hypers     = (Hyper *)     calloc((size_t)n, sizeof(Hyper));
     elo        = (float *)     calloc((size_t)n, sizeof(float));
     elo_sorted = (float *)     calloc((size_t)n, sizeof(float));
@@ -1387,6 +1703,10 @@ int az_run(AZCfg *c)
         az_hyper_mutate(&hypers[i], master);
         elo[i] = ELO_SEED;
     }
+    if (ema_trunk) {                       /* the average starts AT the start */
+        *ema_trunk = *trunk;
+        memcpy(ema_heads, heads, (size_t)n * sizeof(Head));
+    }
 
     adam_init(&sh.trunk_adam, (int)TRUNK_NPARAM);
     for (nadam = 0; nadam < n; nadam++) adam_init(&head_adam[nadam], (int)HEAD_NPARAM);
@@ -1406,6 +1726,11 @@ int az_run(AZCfg *c)
     sh.head_adam = head_adam;
     sh.workers   = workers;
     sh.nthreads  = nthreads;
+    sh.ema_trunk = ema_trunk;
+    sh.ema_heads = ema_heads;
+    sh.head_clip = (c->grad_clip_head > 0.0f) ? c->grad_clip_head : c->grad_clip;
+    sh.cap_sims  = c->cap_sims > 0 ? c->cap_sims : (c->sims / 5 > 2 ? c->sims / 5 : 2);
+    if (sh.cap_sims > c->sims) sh.cap_sims = c->sims;
     sh.job       = JOB_IDLE;
     atomic_init(&sh.next, 0);
 
@@ -1421,8 +1746,12 @@ int az_run(AZCfg *c)
         w->m.c_puct          = c->c_puct;
         w->m.dirichlet_alpha = c->dirichlet_alpha;
         w->m.dirichlet_eps   = c->dirichlet_eps;
-        w->tg = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
-        if (!w->m.pool || !w->tg || !rec_init(&w->rec, c->max_plies)) {
+        w->tg       = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->tg_pol   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->tg_val   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->hg_probe = (HeadGrad *) calloc(1, sizeof(HeadGrad));
+        if (!w->m.pool || !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe ||
+            !rec_init(&w->rec, c->max_plies)) {
             fprintf(stderr, "az: out of memory (worker %d)\n", nworkers_init);
             nworkers_init++;
             goto done;
@@ -1459,6 +1788,11 @@ int az_run(AZCfg *c)
                c->buffer_positions, c->batch_size, c->steps_per_gen,
                (double)c->lr, (double)c->lr_final, (double)c->weight_decay,
                (double)c->grad_clip, (double)c->value_coef, (double)c->draw_penalty);
+        printf("            value_mix %.2f, warmup %d gens, ema %.4f (h2h %d games), "
+               "cap %.2f x %d sims, head clip %.3g\n",
+               (double)c->value_mix, c->warmup_gens, (double)c->ema_decay,
+               c->ema_h2h_games, (double)c->cap_frac, sh.cap_sims,
+               (double)sh.head_clip);
         printf("            resign %.2f (%.0f%% checked), elite %.0f%%, cull %.0f%%, "
                "hof every %d (%d%% of games), seed %llu\n",
                (double)c->resign_threshold, (double)c->resign_check_frac * 100.0,
@@ -1468,6 +1802,20 @@ int az_run(AZCfg *c)
         fflush(stdout);
     }
 
+    az_seed(h2h_rng, c->seed ^ 0x94D049BB133111EBull);
+    /* Do not compare against the EMA until its averaging window has actually
+     * filled.  Before ~1/(1-decay) optimiser steps the "average" is still
+     * mostly the random initialisation, and MEASURED at 40 games it can beat
+     * a network that has taken a hundred steps on a nearly-empty buffer -- a
+     * true result about that moment, and a terrible reason to ship it as
+     * best.crl. */
+    if (c->ema_decay > 0.0f && c->steps_per_gen > 0) {
+        const double window = 1.0 / (1.0 - (double)c->ema_decay);
+        double g = window / (double)c->steps_per_gen;
+        h2h_next = (int)(g + 0.999);
+        if (h2h_next < 1) h2h_next = 1;
+        if (h2h_next > c->generations) h2h_next = c->generations;
+    }
     t_run0 = now_sec();
 
     /* ===================================================================== */
@@ -1477,16 +1825,29 @@ int az_run(AZCfg *c)
         AZGen   gs;
 
         memset(&gs, 0, sizeof gs);
+        gs.ema_h2h = -1.0;          /* -1 = not measured this generation */
         st_zero(&st);
         sh.generation = gen;
 
-        /* cosine schedule over the whole run */
+        /* Linear warmup, then the cosine decay over what is left.  Adam's
+         * second-moment estimate is worthless for its first few dozen steps,
+         * so a full-size update there is the largest of the run applied with
+         * the least information -- which is exactly when a shared trunk picks
+         * up the scale it then has to be clipped away from.  With
+         * warmup_gens = 0 this is bit-identical to the pure cosine. */
         {
-            const double prog = (c->generations > 1)
-                              ? (double)(gen - 1) / (double)(c->generations - 1) : 1.0;
-            sh.lr_now = (float)((double)c->lr_final +
-                                0.5 * ((double)c->lr - (double)c->lr_final) *
-                                (1.0 + cos(M_PI * prog)));
+            const int W = c->warmup_gens;
+            if (W > 0 && gen <= W) {
+                sh.lr_now = (float)((double)c->lr * (double)gen / (double)(W + 1));
+                gs.in_warmup = 1;
+            } else {
+                const int span = c->generations - W;
+                const double prog = (span > 1)
+                                  ? (double)(gen - W - 1) / (double)(span - 1) : 1.0;
+                sh.lr_now = (float)((double)c->lr_final +
+                                    0.5 * ((double)c->lr - (double)c->lr_final) *
+                                    (1.0 + cos(M_PI * prog)));
+            }
         }
 
         /* -- 1. PAIR ----------------------------------------------------- */
@@ -1506,6 +1867,7 @@ int az_run(AZCfg *c)
             w->rootv_sum = 0.0; w->rootv_n = 0;
             w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
             w->resign_checked = w->resign_would = w->resign_wrong = 0;
+            w->full_moves = w->all_moves = 0;
         }
         az_dispatch(&sh, JOB_SELFPLAY);
         gs.selfplay_sec = now_sec() - t0;
@@ -1513,6 +1875,7 @@ int az_run(AZCfg *c)
         {
             double rv = 0.0, te = 0.0;
             uint64_t rvn = 0, ten = 0, rchk = 0, rwld = 0, rwrong = 0;
+            uint64_t fm = 0, am = 0;
             for (int t = 0; t < nthreads; t++) {
                 st_merge(&st, &workers[t].st);
                 gs.evals += workers[t].evals;
@@ -1521,7 +1884,11 @@ int az_run(AZCfg *c)
                 rchk   += workers[t].resign_checked;
                 rwld   += workers[t].resign_would;
                 rwrong += workers[t].resign_wrong;
+                fm += workers[t].full_moves;
+                am += workers[t].all_moves;
             }
+            gs.full_search_frac  = am ? (double)fm / (double)am : 0.0;
+            gs.recorded_per_game = st.games ? (double)fm / (double)st.games : 0.0;
             gs.rootv_mean     = rvn ? rv / (double)rvn : 0.0;
             gs.target_entropy = ten ? te / (double)ten : 0.0;
             gs.evals_per_move = rvn ? (double)gs.evals / (double)rvn : 0.0;
@@ -1537,14 +1904,24 @@ int az_run(AZCfg *c)
                 AZWorker *w = &workers[t];
                 w->l_pol = w->l_val = w->l_ent = w->l_tent = 0.0;
                 w->l_zsum = w->l_zsq = 0.0;
+                w->l_osum = w->l_osq = 0.0;
+                w->l_vout = w->l_qout = 0.0;
+                w->v_sum = w->v_sq = 0.0;
                 w->l_top1 = 0;
                 w->l_n = w->l_sign_ok = 0;
                 w->l_dec_n = w->l_dec_ok = 0;
                 w->hgnorm_sum = 0.0;
-                w->hgnorm_n = 0;
+                w->hgnorm_n = w->hclip_n = 0;
+                w->ema_n = w->ema_top1 = 0;
+                w->ema_vdiff = 0.0;
+                w->probe = 0;
+                memset(w->cal_pred, 0, sizeof w->cal_pred);
+                memset(w->cal_out,  0, sizeof w->cal_out);
+                memset(w->cal_n,    0, sizeof w->cal_n);
             }
             sh.gnorm_sum = 0.0;
-            sh.gnorm_n = 0;
+            sh.gnorm_n = sh.gclip_n = 0;
+            sh.probe_nb = 0;
             if (c->steps_per_gen > 0 && azbuf_count(&sh.buf) > 0)
                 az_dispatch(&sh, JOB_LEARN);
             gs.learn_sec = now_sec() - tl0;
@@ -1552,8 +1929,10 @@ int az_run(AZCfg *c)
 
         {
             double lp = 0.0, lv = 0.0, le = 0.0, lte = 0.0, hgn = 0.0;
-            double zs = 0.0, zq = 0.0;
+            double zs = 0.0, zq = 0.0, os = 0.0, oq = 0.0, vo = 0.0, qo = 0.0;
+            double vs = 0.0, vq = 0.0, emad = 0.0;
             uint64_t ln = 0, ok = 0, dn = 0, dok = 0, hgnn = 0, top1 = 0;
+            uint64_t hclip = 0, eman = 0, ematop = 0;
             for (int t = 0; t < nthreads; t++) {
                 lp += workers[t].l_pol;
                 lv += workers[t].l_val;
@@ -1565,12 +1944,30 @@ int az_run(AZCfg *c)
                 dok += workers[t].l_dec_ok;
                 hgn += workers[t].hgnorm_sum;
                 hgnn += workers[t].hgnorm_n;
+                hclip += workers[t].hclip_n;
                 zs += workers[t].l_zsum;
                 zq += workers[t].l_zsq;
+                os += workers[t].l_osum;
+                oq += workers[t].l_osq;
+                vo += workers[t].l_vout;
+                qo += workers[t].l_qout;
+                vs += workers[t].v_sum;
+                vq += workers[t].v_sq;
                 top1 += workers[t].l_top1;
+                eman += workers[t].ema_n;
+                ematop += workers[t].ema_top1;
+                emad += workers[t].ema_vdiff;
+                for (int b = 0; b < VAL_BUCKETS; b++) {
+                    gs.cal_pred[b] += workers[t].cal_pred[b];
+                    gs.cal_out[b]  += workers[t].cal_out[b];
+                    gs.cal_n[b]    += workers[t].cal_n[b];
+                }
             }
             gs.value_acc_decisive = dn ? (double)dok / (double)dn : 0.0;
             gs.head_grad_norm     = hgnn ? hgn / (double)hgnn : 0.0;
+            gs.head_clip_frac     = hgnn ? (double)hclip / (double)hgnn : 0.0;
+            gs.ema_agree_top1     = eman ? (double)ematop / (double)eman : 0.0;
+            gs.ema_value_l1       = eman ? emad / (double)eman : 0.0;
             if (ln) {
                 gs.loss_pol             = lp / (double)ln;
                 gs.loss_val             = lv / (double)ln;
@@ -1590,15 +1987,75 @@ int az_run(AZCfg *c)
                  *    outcome.  loss.value must beat it or the value head has
                  *    learned nothing. */
                 const double zm = zs / (double)ln;
+                const double om = os / (double)ln;
+                const double vm = vs / (double)ln;
+                double ov;
                 gs.policy_top1        = (double)top1 / (double)ln;
                 gs.value_mse_baseline = zq / (double)ln - zm * zm;
+
+                /* The headline pair.  value_mse is the head's error against
+                 * the target it was trained on; value_mse_baseline is the
+                 * error of a constant predictor sitting at the target mean.
+                 * Their ratio is 0 for a perfect head and 1 for a head that
+                 * has given up and is emitting the mean. */
+                gs.value_mse       = gs.loss_val;
+                gs.value_mse_ratio = (gs.value_mse_baseline > 1e-12)
+                                   ? gs.value_mse / gs.value_mse_baseline : 0.0;
+                /* Repeated against the PURE game outcome so runs with
+                 * different --value-mix stay comparable. */
+                ov = oq / (double)ln - om * om;
+                gs.value_mse_outcome          = vo / (double)ln;
+                gs.search_mse_outcome         = qo / (double)ln;
+                gs.search_mse_outcome_ratio   = (ov > 1e-12) ? gs.search_mse_outcome / ov : 0.0;
+                gs.value_mse_outcome_baseline = ov;
+                gs.value_mse_outcome_ratio    = (ov > 1e-12)
+                                              ? gs.value_mse_outcome / ov : 0.0;
+                gs.value_target_mean = zm;
+                gs.value_target_std  = sqrt(gs.value_mse_baseline > 0.0
+                                            ? gs.value_mse_baseline : 0.0);
+                gs.value_pred_mean   = vm;
+                {   /* a collapsed head is exactly one whose sd goes to zero */
+                    const double pv = vq / (double)ln - vm * vm;
+                    gs.value_pred_std = sqrt(pv > 0.0 ? pv : 0.0);
+                }
             }
             gs.loss_tot        = gs.loss_pol + (double)c->value_coef * gs.loss_val;
             gs.train_positions = ln;
             gs.steps           = (uint64_t)sh.gnorm_n;
             gs.grad_norm       = sh.gnorm_n ? sh.gnorm_sum / (double)sh.gnorm_n : 0.0;
+            gs.grad_clip_frac  = sh.gnorm_n ? (double)sh.gclip_n / (double)sh.gnorm_n : 0.0;
             gs.lr              = (double)sh.lr_now;
             gs.buffer_fill     = (double)azbuf_count(&sh.buf) / (double)sh.buf.cap;
+        }
+
+        /* -- 3b. GRADIENT DECOMPOSITION ---------------------------------- */
+        /* Reduce the probe step's two single-term trunk gradients.  This is
+         * the number behind "the shared trunk is shaped by the policy": the
+         * two loss VALUES say nothing about it, because they are on different
+         * scales and pass through different heads.  These are the gradients
+         * that actually reach the trunk, value_coef already applied. */
+        if (sh.probe_nb > 0) {
+            float *gp = (float *)tgsum;
+            const double s2 = 1.0 / (double)sh.probe_nb;
+            for (int pass = 0; pass < 2; pass++) {
+                double ss = 0.0;
+                memset(gp, 0, sizeof(TrunkGrad));
+                for (int t = 0; t < nthreads; t++)
+                    grad_add(gp, (const float *)(pass ? workers[t].tg_val
+                                                      : workers[t].tg_pol),
+                             (int)TRUNK_NPARAM);
+                for (size_t k = 0; k < TRUNK_NPARAM; k++) {
+                    const double v = (double)gp[k] * s2;
+                    ss += v * v;
+                }
+                if (pass) gs.grad_trunk_value  = sqrt(ss);
+                else      gs.grad_trunk_policy = sqrt(ss);
+            }
+            memset(gp, 0, sizeof(TrunkGrad));   /* leave it as adam_step does */
+            {
+                const double tot = gs.grad_trunk_policy + gs.grad_trunk_value;
+                gs.grad_value_share = (tot > 0.0) ? gs.grad_trunk_value / tot : 0.0;
+            }
         }
 
         /* -- 4. RATE ----------------------------------------------------- */
@@ -1618,6 +2075,43 @@ int az_run(AZCfg *c)
             gs.best_i   = best;
         }
 
+        /* -- 4b. EMA vs RAW ---------------------------------------------
+         * Polyak averaging is USUALLY stronger, which is not the same as
+         * always.  Before best.crl becomes the EMA copy, the two play each
+         * other; the score is logged either way.  The cost is inside gs.sec,
+         * so it shows up in the generation time rather than hiding. */
+        if (gs.elo_best >= best_saved) {
+            best_saved = gs.elo_best;
+            /* The head-to-head is ema_h2h_games full-strength games played on
+             * ONE thread while the pool is parked, so it is metered: at most
+             * once every SAVE_EVERY generations, plus the last.  Between
+             * measurements the previous verdict stands.  Unmetered it costs
+             * ~15% of a generation at the shipped sim count, which would be
+             * paying more for the decision than the decision is worth. */
+            if (ema_trunk && c->ema_h2h_games > 0 &&
+                (gen >= h2h_next || gen == c->generations)) {
+                h2h_next = gen + SAVE_EVERY;
+                gs.ema_h2h_games = c->ema_h2h_games;
+                gs.ema_h2h = az_ema_h2h(&sh, &workers[0], gs.best_i,
+                                        c->ema_h2h_games, h2h_rng);
+                ema_wins = (gs.ema_h2h > 0.5);
+            }
+            gs.best_is_ema = ema_wins;
+            if (ema_trunk) {
+                snprintf(path, sizeof path, "%s/best_ema.crl", c->run_dir);
+                if (!model_save(path, ema_trunk, ema_heads, hypers, elo, n, gen))
+                    fprintf(stderr, "az: warning: could not write %s\n", path);
+            }
+            snprintf(path, sizeof path, "%s/best_raw.crl", c->run_dir);
+            if (!model_save(path, trunk, heads, hypers, elo, n, gen))
+                fprintf(stderr, "az: warning: could not write %s\n", path);
+            snprintf(path, sizeof path, "%s/best.crl", c->run_dir);
+            if (!model_save(path, gs.best_is_ema ? ema_trunk : trunk,
+                            gs.best_is_ema ? ema_heads : heads,
+                            hypers, elo, n, gen))
+                fprintf(stderr, "az: warning: could not write %s\n", path);
+        }
+
         gs.sec = now_sec() - t0;
         total_games += st.games;
         total_plies += st.plies;
@@ -1633,7 +2127,8 @@ int az_run(AZCfg *c)
             fmt_dur(ema_gen * (double)(c->generations - gen), eta, sizeof eta);
             printf("gen %4d/%d  %5.1f g/s  %6.0f ev/s  elo %7.1f/%7.1f  "
                    "W%3.0f%% D%3.0f%% L%3.0f%%  len %5.1f  "
-                   "kl %5.3f  top1 %4.0f%%  v %5.3f/%5.3f  buf %4.1f%%  %5.2fs  eta %s\n",
+                   "kl %5.3f  top1 %4.0f%%  v %5.3f/%5.3f %4.2fx  "
+                   "|g| %5.2f %3.0f%%clip  buf %4.1f%%  %5.2fs  eta %s\n",
                    gen, c->generations, (double)st.games / (gs.sec > 0.0 ? gs.sec : 1.0),
                    (double)gs.evals / (gs.selfplay_sec > 0.0 ? gs.selfplay_sec : 1.0),
                    gs.elo_best, gs.elo_mean,
@@ -1641,7 +2136,8 @@ int az_run(AZCfg *c)
                    100.0 * (double)st.draws / gd,
                    100.0 * (double)st.black_wins / gd,
                    st.sum_len / gd, gs.policy_kl, 100.0 * gs.policy_top1,
-                   gs.loss_val, gs.value_mse_baseline,
+                   gs.loss_val, gs.value_mse_baseline, gs.value_mse_ratio,
+                   gs.grad_norm, 100.0 * gs.grad_clip_frac,
                    100.0 * gs.buffer_fill, gs.sec, eta);
             fflush(stdout);
         }
@@ -1671,6 +2167,9 @@ int az_run(AZCfg *c)
                 }
                 head_mutate(&heads[victim], hypers[victim].mutate_sigma, master);
                 az_hyper_mutate(&hypers[victim], master);
+                /* The victim's average was tracking a head that no longer
+                 * exists, so restart it from the clone's own weights. */
+                if (ema_heads) ema_heads[victim] = heads[victim];
             }
         }
 
@@ -1690,12 +2189,11 @@ int az_run(AZCfg *c)
             snprintf(path, sizeof path, "%s/checkpoint.crl", c->run_dir);
             if (!model_save(path, trunk, heads, hypers, elo, n, gen))
                 fprintf(stderr, "az: warning: could not write %s\n", path);
-        }
-        if (gs.elo_best >= best_saved) {
-            best_saved = gs.elo_best;
-            snprintf(path, sizeof path, "%s/best.crl", c->run_dir);
-            if (!model_save(path, trunk, heads, hypers, elo, n, gen))
-                fprintf(stderr, "az: warning: could not write %s\n", path);
+            if (ema_trunk) {
+                snprintf(path, sizeof path, "%s/checkpoint_ema.crl", c->run_dir);
+                if (!model_save(path, ema_trunk, ema_heads, hypers, elo, n, gen))
+                    fprintf(stderr, "az: warning: could not write %s\n", path);
+            }
         }
 
         if (g_az_interrupt) {
@@ -1719,7 +2217,8 @@ int az_run(AZCfg *c)
                (double)total_games / (dt > 0.0 ? dt : 1.0),
                (double)total_plies / (dt > 0.0 ? dt : 1.0),
                (double)total_evals / (dt > 0.0 ? dt : 1.0));
-        printf("model: %s/best.crl\n", c->run_dir);
+        printf("model: %s/best.crl  (raw %s/best_raw.crl%s)\n", c->run_dir,
+               c->run_dir, ema_trunk ? ", ema best_ema.crl" : "");
         fflush(stdout);
     }
     rc = 0;
@@ -1737,6 +2236,9 @@ done:
             mcts_free(&workers[t].m);
             rec_free(&workers[t].rec);
             free(workers[t].tg);
+            free(workers[t].tg_pol);
+            free(workers[t].tg_val);
+            free(workers[t].hg_probe);
         }
     }
     if (bar_ready) bar_destroy(&sh.bar);
@@ -1750,5 +2252,6 @@ done:
     free(tids); free(workers); free(head_adam); free(tgsum); free(hgrad);
     free(bslot); free(wslot); free(rank); free(results); free(pairs);
     free(hof); free(elo_sorted); free(elo); free(hypers); free(heads); free(trunk);
+    free(ema_heads); free(ema_trunk);
     return rc;
 }

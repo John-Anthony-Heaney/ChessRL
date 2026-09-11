@@ -55,8 +55,42 @@ typedef struct {
     float lr;
     float lr_final;          /* cosine-decayed to this by the last generation */
     float weight_decay;
-    float grad_clip;
+    float grad_clip;         /* global grad-norm clip on the shared trunk     */
+    float grad_clip_head;    /* same for a per-agent head; <=0 means "reuse
+                              * grad_clip", which is the historical behaviour */
     float value_coef;        /* weight of the value loss vs the policy loss   */
+    int   warmup_gens;       /* linear LR warmup before the cosine decay      */
+
+    /* VALUE TARGET MIXING (KataGo / Leela).  The Monte-Carlo outcome z gives
+     * every position in a game the same label, which is an unbiased but very
+     * high-variance target: a 140-ply game contributes 140 copies of one coin
+     * flip.  q_search is the MCTS root value already computed at that exact
+     * position, so
+     *
+     *     target = (1 - value_mix) * z  +  value_mix * q_search
+     *
+     * trades a little bias for a lot of variance.  It is NOT injected
+     * knowledge: q_search is this network's own search over its own value
+     * head, i.e. bootstrapping from self-play, which docs/FROM_SCRATCH.md
+     * permits in the same way it permits the MCTS visit distribution as the
+     * policy target.  Default 0 (pure outcome) so it can be measured.       */
+    float value_mix;
+
+    /* WEIGHT EMA (Polyak averaging).  An exponential moving average of the
+     * weights is kept alongside the live ones and saved as a second model.
+     * decay <= 0 disables it.                                               */
+    float ema_decay;
+    int   ema_h2h_games;     /* raw-vs-EMA games played before best.crl is
+                              * written; 0 = never promote the EMA           */
+
+    /* PLAYOUT CAP RANDOMISATION (KataGo).  Only `cap_frac` of moves run the
+     * full `sims` budget with root noise and get recorded as training data;
+     * the rest run `cap_sims` and are played but not learned from.  Most of
+     * self-play's cost buys policy targets that are thrown away by the
+     * temperature anyway, so this is throughput for free.
+     * cap_frac >= 1 disables it (every move is a full search).              */
+    float cap_frac;
+    int   cap_sims;          /* 0 = derive as max(2, sims / 5)               */
 
     /* population dynamics */
     float elite_frac;

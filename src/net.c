@@ -5,38 +5,102 @@
  *   W0    [f * NF_ACC + i]      row per input feature, contiguous over acc.
  *   W1    [j * NF_ACC + i]      row per hidden unit,   contiguous over acc.
  *   Wp    [k * NF_HID + j]      row per policy dim,    contiguous over hidden.
+ *   W0v   [f * NF_VACC + i]     row per input feature, value trunk.
+ *   Wvh   [k * NF_VACC + i]     row per value dim,     contiguous over hv0.
  *   E*    [row * NF_PDIM + k]
  *   Bft   [from * 64 + to]
  *
- * W1/Wp are stored output-major so the inner reduction runs over a contiguous
- * span (NF_ACC / NF_HID, both compile-time constants and multiples of 8).  The
- * reductions use four independent accumulators: clang's SLP vectoriser folds
- * them into one NEON vector accumulator, which plain `-O3` cannot do to a
- * single-chain float reduction because that would require reassociation.
+ * W1/Wp/Wvh are stored output-major so the inner reduction runs over a
+ * contiguous span (NF_ACC / NF_HID, both compile-time constants and multiples
+ * of 8).  The reductions use four independent accumulators: clang's SLP
+ * vectoriser folds them into one NEON vector accumulator, which plain `-O3`
+ * cannot do to a single-chain float reduction because that would require
+ * reassociation.
  *
- * nn_eval() is the hot path (~120k calls/second); everything in it is a
- * contiguous float loop over a constant trip count with restrict-qualified
- * pointers so no bounds/aliasing check survives into the loop body.
+ * nn_eval() is the hot path; everything in it is a contiguous float loop over a
+ * constant trip count with restrict-qualified pointers so no bounds/aliasing
+ * check survives into the loop body.
+ *
+ * ---------------------------------------------------------------------------
+ * LAYERNORM, AND WHY NOT RMSNORM
+ * ---------------------------------------------------------------------------
+ * Both were implemented and measured (4200 self-play games, held out by game,
+ * 3 seeds, identical batches and optimiser settings).  LayerNorm won on the
+ * value metric that motivated the change -- held-out MSE/Var 0.811 against
+ * RMSNorm's 0.835, with the same residual and the same value head -- and the
+ * reason is specific to this input encoding rather than a general preference:
+ *
+ *   acc is a SUM of ~35 one-hot rows of W0, and the number of active features
+ *   falls from 37 in the opening to 5 in a bare-king endgame.  That makes the
+ *   MEAN of acc a strong, nuisance-correlated function of game phase: it drifts
+ *   monotonically over a game and drags every relu gate with it.  RMSNorm
+ *   divides that drift out of the scale but leaves it in the location, so the
+ *   gate pattern still tracks it.  LayerNorm removes it.  The cost is one extra
+ *   pass over the layer to find the mean, measured at 2.9% of the evaluation
+ *   rate (117589 vs 121136 evaluations/sec, same configuration otherwise) --
+ *   cheap against a 3% reduction in held-out value MSE.
+ *
+ * The normalisation is applied BEFORE each nonlinearity -- four of them: the
+ * accumulator's relu, the residual block's relu, the value trunk's relu and the
+ * value head's relu.  The scalar tanh at the output is not normalised, because
+ * a LayerNorm over one number is exactly zero.
  */
 
 #include "net.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
-_Static_assert(sizeof(Trunk) ==
-               (size_t)(NF_INPUT * NF_ACC + NF_ACC + NF_ACC * NF_HID + NF_HID) * sizeof(float),
+#define TRUNK_FLOATS (NF_INPUT * NF_ACC + 3 * NF_ACC + NF_ACC * NF_HID + 3 * NF_HID + \
+                      NF_INPUT * NF_VACC + 3 * NF_VACC)
+#define HEAD_FLOATS  (NF_ACC + NF_VACC * NF_VHID + 3 * NF_VHID + NF_VHID + 1 + \
+                      NF_HID * NF_PDIM + (64 + 64 + 6 + 5 + 7) * NF_PDIM + 64 * 64)
+
+_Static_assert(sizeof(Trunk) == (size_t)TRUNK_FLOATS * sizeof(float),
                "Trunk must be pure float storage with no padding");
-_Static_assert(sizeof(Head) ==
-               (size_t)(NF_ACC + NF_HID + 1 + NF_HID * NF_PDIM + 64 * NF_PDIM + 64 * NF_PDIM +
-                        6 * NF_PDIM + 5 * NF_PDIM + 7 * NF_PDIM + 64 * 64) * sizeof(float),
+_Static_assert(sizeof(Head) == (size_t)HEAD_FLOATS * sizeof(float),
                "Head must be pure float storage with no padding");
 _Static_assert(sizeof(Hyper) == 8 * sizeof(float), "Hyper must be 8 floats");
-_Static_assert(NF_ACC % 8 == 0 && NF_HID % 8 == 0 && NF_PDIM % 8 == 0,
+_Static_assert(NF_ACC % 8 == 0 && NF_HID % 8 == 0 && NF_PDIM % 8 == 0 &&
+               NF_VHID % 8 == 0 && NF_VACC % 8 == 0,
                "layer widths must be multiples of 8");
 
 #define HYPER_NPARAM (sizeof(Hyper) / sizeof(float))
+
+/* LayerNorm epsilon.  Inside the sqrt, as in every standard implementation, so
+ * the backward pass needs no special case when a layer is momentarily flat. */
+#define NN_EPS 1e-5f
+
+/* ------------------------------------------------------- head tensor table */
+
+#define TSPAN(field, n) { offsetof(Head, field) / sizeof(float), (size_t)(n) }
+
+const NnTensorSpan NN_HEAD_TENSORS[] = {
+    TSPAN(z,      NF_ACC),
+    TSPAN(Wvh,    NF_VACC * NF_VHID),
+    TSPAN(bvh,    NF_VHID),
+    TSPAN(gv,     NF_VHID),
+    TSPAN(cv,     NF_VHID),
+    TSPAN(Wv,     NF_VHID),
+    TSPAN(bv,     1),
+    TSPAN(Wp,     NF_HID * NF_PDIM),
+    TSPAN(Efrom,  64 * NF_PDIM),
+    TSPAN(Eto,    64 * NF_PDIM),
+    TSPAN(Epc,    6 * NF_PDIM),
+    TSPAN(Epromo, 5 * NF_PDIM),
+    TSPAN(Ecap,   7 * NF_PDIM),
+    TSPAN(Bft,    64 * 64),
+};
+const int NN_HEAD_NTENSORS = (int)(sizeof NN_HEAD_TENSORS / sizeof NN_HEAD_TENSORS[0]);
+
+/* The table must cover the head exactly once: a tensor added to Head and not
+ * added here would silently never be mutated by PBT. */
+_Static_assert((size_t)HEAD_FLOATS == HEAD_NPARAM,
+               "NN_HEAD_TENSORS must span every float of Head exactly once");
+
+#undef TSPAN
 
 /* ------------------------------------------------------------ hyper-params */
 
@@ -177,6 +241,58 @@ void nn_move_key(const Position *p, Move m, MoveKey *k)
     }
 }
 
+/* ------------------------------------------------------------- LayerNorm */
+/*
+ *   mu     = mean(x)
+ *   sigma  = sqrt(mean((x - mu)^2) + eps)
+ *   xhat_i = (x_i - mu) / sigma
+ *   y_i    = g_i * xhat_i + c_i
+ *
+ * and, writing a_i = dy_i * g_i and r = 1/sigma,
+ *
+ *   dL/dg_i = dy_i * xhat_i
+ *   dL/dc_i = dy_i
+ *   dL/dx_i = r * (a_i - mean(a) - xhat_i * mean(a * xhat))
+ *
+ * The two correction terms are what make the output invariant to the scale AND
+ * the offset of x; they are also what makes dL/dx sum to exactly zero, so a
+ * bias applied before the norm can only ever move the layer along directions
+ * the norm does not remove.
+ */
+
+/* Returns 1/sigma and writes the mean through mu_out. */
+static inline float norm_stats(const float *restrict x, int n, float *mu_out)
+{
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += x[i];
+    const float mu = s / (float)n;
+
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) { const float d = x[i] - mu; ss += d * d; }
+
+    *mu_out = mu;
+    return 1.0f / sqrtf(ss / (float)n + NN_EPS);
+}
+
+/* dy -> (gain grad, bias grad, dx).  `dx` must not alias `dy`. */
+static inline void norm_bwd(const float *restrict dy, const float *restrict xhat,
+                            const float *restrict g, float r, int n,
+                            float *restrict gg, float *restrict gc,
+                            float *restrict dx)
+{
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float a = dy[i] * g[i];
+        gg[i] += dy[i] * xhat[i];
+        gc[i] += dy[i];
+        s1 += a;
+        s2 += a * xhat[i];
+    }
+    const float m1 = s1 / (float)n, m2 = s2 / (float)n;
+    for (int i = 0; i < n; i++)
+        dx[i] = r * (dy[i] * g[i] - m1 - xhat[i] * m2);
+}
+
 /* -------------------------------------------------------------------- init */
 
 void nn_init(Trunk *t, Head *h, uint64_t seed)
@@ -186,20 +302,40 @@ void nn_init(Trunk *t, Head *h, uint64_t seed)
 
     if (t) {
         /* ~35 rows are summed into the accumulator, so scale by 1/sqrt(35) to
-         * keep the pre-activation O(1) rather than O(sqrt(35)). */
+         * keep the pre-activation O(1) rather than O(sqrt(35)).  LayerNorm makes
+         * this cosmetic for the forward pass -- it divides the scale out -- but
+         * it still sets where the gain starts relative to the data. */
         fill_normal(t->W0, (size_t)NF_INPUT * NF_ACC, 0.5f / sqrtf(35.0f), st);
         memset(t->b0, 0, sizeof t->b0);
         fill_normal(t->W1, (size_t)NF_ACC * NF_HID, sqrtf(2.0f / (float)NF_ACC), st);
         memset(t->b1, 0, sizeof t->b1);
+        for (int i = 0; i < NF_ACC; i++) { t->g0[i] = 1.0f; t->c0[i] = 0.0f; }
+        for (int j = 0; j < NF_HID; j++) { t->g1[j] = 1.0f; t->c1[j] = 0.0f; }
+
+        /* the value trunk, same sparse-gather scaling */
+        fill_normal(t->W0v, (size_t)NF_INPUT * NF_VACC, 0.5f / sqrtf(35.0f), st);
+        memset(t->b0v, 0, sizeof t->b0v);
+        for (int i = 0; i < NF_VACC; i++) { t->g0v[i] = 1.0f; t->c0v[i] = 0.0f; }
     }
 
     if (h) {
-        memset(h->z, 0, sizeof h->z);                     /* style vector starts flat */
-        fill_normal(h->Wp, (size_t)NF_HID * NF_PDIM, sqrtf(2.0f / (float)NF_HID), st);
+        memset(h->z, 0, sizeof h->z);
+
+        /* The initial POLICY must be near uniform -- tests/test_scratch.c fails
+         * the build if an untrained network has an opinion about chess -- so the
+         * logits have to start at the same scale as before the rewrite, std
+         * ~0.67.  Working backwards: logit_std = sqrt(NF_PDIM) * q_std *
+         * sqrt(5) * es, so q_std must be 0.474; and q = Wp.h2 with h2 now
+         * normalised, where E[relu(unit normal)^2] = 1/2 and E[relu] =
+         * 1/sqrt(2pi), so the residual gives E[h2^2] = 1/2 + 2/(2pi) + 1/2 =
+         * 1.3183 per unit.  Hence the divisor below.  Without it the LayerNorm
+         * would multiply the initial logits by ~4 and the untrained policy
+         * would be visibly opinionated. */
+        const float wp_std = 0.474f / sqrtf(1.3183f * (float)NF_HID);
+        fill_normal(h->Wp, (size_t)NF_HID * NF_PDIM, wp_std, st);
 
         /* Five embedding rows are summed before the dot with q, so use a fan-in
-         * of 5*NF_PDIM; that keeps the initial logits at std ~0.7 (policy is
-         * close to uniform but not degenerate). */
+         * of 5*NF_PDIM. */
         const float es = sqrtf(2.0f / (5.0f * (float)NF_PDIM));
         fill_normal(h->Efrom,  (size_t)64 * NF_PDIM, es, st);
         fill_normal(h->Eto,    (size_t)64 * NF_PDIM, es, st);
@@ -208,8 +344,13 @@ void nn_init(Trunk *t, Head *h, uint64_t seed)
         fill_normal(h->Ecap,   (size_t)7  * NF_PDIM, es, st);
         memset(h->Bft, 0, sizeof h->Bft);
 
-        /* Value head starts ~0 so the first predictions are unbiased draws. */
-        fill_normal(h->Wv, NF_HID, 1.0e-3f, st);
+        /* Value head.  The hidden layer is He-initialised; the OUTPUT layer
+         * starts at ~0 so the first predictions are unbiased draws, which is the
+         * other thing test_scratch.c checks. */
+        fill_normal(h->Wvh, (size_t)NF_VACC * NF_VHID, sqrtf(2.0f / (float)NF_VACC), st);
+        memset(h->bvh, 0, sizeof h->bvh);
+        for (int k = 0; k < NF_VHID; k++) { h->gv[k] = 1.0f; h->cv[k] = 0.0f; }
+        fill_normal(h->Wv, NF_VHID, 1.0e-3f, st);
         h->bv[0] = 0.0f;
     }
 }
@@ -218,11 +359,10 @@ void nn_init(Trunk *t, Head *h, uint64_t seed)
 
 void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *fw)
 {
-    float *restrict acc = fw->acc;
-    float *restrict h1  = fw->h1;
-    float *restrict z2  = fw->z2;
-    float *restrict h2  = fw->h2;
-    float *restrict q   = fw->q;
+    float acc[NF_ACC];
+    float *restrict h1 = fw->h1;
+    float *restrict h2 = fw->h2;
+    float *restrict q  = fw->q;
 
     {   /* acc = b0 + z */
         const float *restrict b0 = t->b0;
@@ -230,7 +370,8 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
         for (int i = 0; i < NF_ACC; i++) acc[i] = b0[i] + zz[i];
     }
 
-    {   /* acc += sum of the W0 rows named by the active features */
+    {   /* acc += sum of the W0 rows named by the active features.
+         * THE sparse step: ~35 gathered rows, never a dense matmul. */
         const float *restrict W0 = t->W0;
         for (int f = 0; f < nf; f++) {
             const float *restrict w = W0 + (size_t)fidx[f] * NF_ACC;
@@ -238,12 +379,23 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
         }
     }
 
-    for (int i = 0; i < NF_ACC; i++) {
-        const float a = acc[i];
-        h1[i] = a > 0.0f ? a : 0.0f;
+    {   /* h1 = relu(g0 * norm(acc) + c0) */
+        float mu;
+        const float r = norm_stats(acc, NF_ACC, &mu);
+        fw->r1 = r;
+        float *restrict x1 = fw->x1;
+        const float *restrict g0 = t->g0;
+        const float *restrict c0 = t->c0;
+        for (int i = 0; i < NF_ACC; i++) {
+            const float xh = (acc[i] - mu) * r;
+            x1[i] = xh;
+            const float a = g0[i] * xh + c0[i];
+            h1[i] = a > 0.0f ? a : 0.0f;
+        }
     }
 
-    {   /* z2 = W1.h1 + b1 ; h2 = relu(z2) */
+    float z2[NF_HID];
+    {   /* z2 = W1.h1 + b1 */
         const float *restrict W1 = t->W1;
         const float *restrict b1 = t->b1;
         for (int j = 0; j < NF_HID; j++) {
@@ -255,9 +407,22 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
                 s2 += w[i + 2] * h1[i + 2];
                 s3 += w[i + 3] * h1[i + 3];
             }
-            const float s = ((s0 + s1) + (s2 + s3)) + b1[j];
-            z2[j] = s;
-            h2[j] = s > 0.0f ? s : 0.0f;
+            z2[j] = ((s0 + s1) + (s2 + s3)) + b1[j];
+        }
+    }
+
+    {   /* h2 = relu(g1 * norm(z2) + c1) + h1   -- the residual block */
+        float mu;
+        const float r = norm_stats(z2, NF_HID, &mu);
+        fw->r2 = r;
+        float *restrict x2 = fw->x2;
+        const float *restrict g1 = t->g1;
+        const float *restrict c1 = t->c1;
+        for (int j = 0; j < NF_HID; j++) {
+            const float xh = (z2[j] - mu) * r;
+            x2[j] = xh;
+            const float a = g1[j] * xh + c1[j];
+            h2[j] = (a > 0.0f ? a : 0.0f) + h1[j];
         }
     }
 
@@ -276,14 +441,73 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
         }
     }
 
-    {   /* raw_v = Wv.h2 + bv ; v = tanh(raw_v) */
+    {   /* THE VALUE TRUNK.  A second sparse gather over the same ~35 active
+         * features, into its own 64-wide accumulator.  Nothing on this path is
+         * shared with the policy, so nothing on it is shaped by the policy
+         * loss -- which is the entire point. */
+        float av[NF_VACC];
+        {
+            const float *restrict b0v = t->b0v;
+            for (int i = 0; i < NF_VACC; i++) av[i] = b0v[i];
+            const float *restrict W0v = t->W0v;
+            for (int f = 0; f < nf; f++) {
+                const float *restrict w = W0v + (size_t)fidx[f] * NF_VACC;
+                for (int i = 0; i < NF_VACC; i++) av[i] += w[i];
+            }
+        }
+        float mu0;
+        const float r0 = norm_stats(av, NF_VACC, &mu0);
+        fw->rv0 = r0;
+        float *restrict xv0 = fw->xv0;
+        float *restrict hv0 = fw->hv0;
+        {
+            const float *restrict g0v = t->g0v;
+            const float *restrict c0v = t->c0v;
+            for (int i = 0; i < NF_VACC; i++) {
+                const float xh = (av[i] - mu0) * r0;
+                xv0[i] = xh;
+                const float a = g0v[i] * xh + c0v[i];
+                hv0[i] = a > 0.0f ? a : 0.0f;
+            }
+        }
+
+        /* the value head's own hidden layer, then the scalar */
+        float zv[NF_VHID];
+        const float *restrict Wvh = h->Wvh;
+        const float *restrict bvh = h->bvh;
+        for (int k = 0; k < NF_VHID; k++) {
+            const float *restrict w = Wvh + (size_t)k * NF_VACC;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (int i = 0; i < NF_VACC; i += 4) {
+                s0 += w[i + 0] * hv0[i + 0];
+                s1 += w[i + 1] * hv0[i + 1];
+                s2 += w[i + 2] * hv0[i + 2];
+                s3 += w[i + 3] * hv0[i + 3];
+            }
+            zv[k] = ((s0 + s1) + (s2 + s3)) + bvh[k];
+        }
+
+        float mu;
+        const float r = norm_stats(zv, NF_VHID, &mu);
+        fw->rv = r;
+        float *restrict xv = fw->xv;
+        float *restrict hv = fw->hv;
+        const float *restrict gv = h->gv;
+        const float *restrict cv = h->cv;
+        for (int k = 0; k < NF_VHID; k++) {
+            const float xh = (zv[k] - mu) * r;
+            xv[k] = xh;
+            const float a = gv[k] * xh + cv[k];
+            hv[k] = a > 0.0f ? a : 0.0f;
+        }
+
         const float *restrict wv = h->Wv;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-        for (int j = 0; j < NF_HID; j += 4) {
-            s0 += wv[j + 0] * h2[j + 0];
-            s1 += wv[j + 1] * h2[j + 1];
-            s2 += wv[j + 2] * h2[j + 2];
-            s3 += wv[j + 3] * h2[j + 3];
+        for (int k = 0; k < NF_VHID; k += 4) {
+            s0 += wv[k + 0] * hv[k + 0];
+            s1 += wv[k + 1] * hv[k + 1];
+            s2 += wv[k + 2] * hv[k + 2];
+            s3 += wv[k + 3] * hv[k + 3];
         }
         fw->raw_v = ((s0 + s1) + (s2 + s3)) + h->bv[0];
         fw->v = tanhf(fw->raw_v);
@@ -331,7 +555,9 @@ void nn_backward(const Trunk *t, const Head *h, const Fwd *fw,
     float dh2[NF_HID];
     float dh1[NF_ACC];
 
-    for (int k = 0; k < NF_PDIM; k++) dq[k] = 0.0f;
+    for (int k = 0; k < NF_PDIM; k++) dq[k]  = 0.0f;
+    for (int j = 0; j < NF_HID;  j++) dh2[j] = 0.0f;
+    for (int i = 0; i < NF_ACC;  i++) dh1[i] = 0.0f;
 
     /* ---- policy: logit_m = q . (Efrom+Eto+Epc+Epromo+Ecap) + Bft[from,to] */
     if (keys && dlogits && n > 0) {
@@ -363,19 +589,6 @@ void nn_backward(const Trunk *t, const Head *h, const Fwd *fw,
         }
     }
 
-    /* ---- value: v = tanh(raw_v), so d/draw_v = dvalue * (1 - v^2) */
-    const float draw_v = dvalue * (1.0f - fw->v * fw->v);
-    {
-        const float *restrict h2 = fw->h2;
-        const float *restrict wv = h->Wv;
-        float *restrict gv = hg->Wv;
-        for (int j = 0; j < NF_HID; j++) {
-            gv[j] += draw_v * h2[j];
-            dh2[j] = draw_v * wv[j];
-        }
-        hg->bv[0] += draw_v;
-    }
-
     /* ---- q = Wp.h2 */
     {
         const float *restrict h2 = fw->h2;
@@ -391,17 +604,75 @@ void nn_backward(const Trunk *t, const Head *h, const Fwd *fw,
         }
     }
 
-    /* ---- h2 = relu(z2) ; z2 = W1.h1 + b1 */
-    for (int i = 0; i < NF_ACC; i++) dh1[i] = 0.0f;
+    /* ---- value head.  v = tanh(raw_v), so d/draw_v = dvalue * (1 - v^2). */
     {
-        const float *restrict z2 = fw->z2;
+        const float draw_v = dvalue * (1.0f - fw->v * fw->v);
+        const float *restrict hv = fw->hv;
+        const float *restrict wv = h->Wv;
+        float dhv[NF_VHID], dzv[NF_VHID];
+
+        for (int k = 0; k < NF_VHID; k++) {
+            hg->Wv[k] += draw_v * hv[k];
+            /* relu gate: hv[k] > 0 exactly when the pre-activation was */
+            dhv[k] = (hv[k] > 0.0f) ? draw_v * wv[k] : 0.0f;
+        }
+        hg->bv[0] += draw_v;
+
+        norm_bwd(dhv, fw->xv, h->gv, fw->rv, NF_VHID, hg->gv, hg->cv, dzv);
+
+        float dhv0[NF_VACC];
+        for (int i = 0; i < NF_VACC; i++) dhv0[i] = 0.0f;
+
+        const float *restrict hv0 = fw->hv0;
+        const float *restrict Wvh = h->Wvh;
+        for (int k = 0; k < NF_VHID; k++) {
+            const float d = dzv[k];
+            hg->bvh[k] += d;
+            const float *restrict w  = Wvh      + (size_t)k * NF_VACC;
+            float       *restrict gw = hg->Wvh  + (size_t)k * NF_VACC;
+            for (int i = 0; i < NF_VACC; i++) {
+                gw[i] += d * hv0[i];
+                dhv0[i] += d * w[i];
+            }
+        }
+
+        /* back through the value trunk's relu, LayerNorm and sparse gather */
+        float dav[NF_VACC], dacc_v[NF_VACC];
+        for (int i = 0; i < NF_VACC; i++) dav[i] = (hv0[i] > 0.0f) ? dhv0[i] : 0.0f;
+        norm_bwd(dav, fw->xv0, t->g0v, fw->rv0, NF_VACC, tg->g0v, tg->c0v, dacc_v);
+        for (int i = 0; i < NF_VACC; i++) tg->b0v[i] += dacc_v[i];
+        for (int f = 0; f < nf; f++) {
+            float *restrict gw = tg->W0v + (size_t)fidx[f] * NF_VACC;
+            for (int i = 0; i < NF_VACC; i++) gw[i] += dacc_v[i];
+        }
+    }
+
+    /* ---- residual block: h2 = relu(g1 * x2 + c1) + h1 ; z2 = W1.h1 + b1 */
+    {
+        float da2[NF_HID], dz2[NF_HID];
+        const float *restrict g1 = t->g1;
+        const float *restrict c1 = t->c1;
+        const float *restrict x2 = fw->x2;
+
+        /* The relu gate cannot be read off h2 -- the identity term is added to
+         * it -- so recompute the pre-activation.  Two flops per unit. */
+        for (int j = 0; j < NF_HID; j++)
+            da2[j] = (g1[j] * x2[j] + c1[j] > 0.0f) ? dh2[j] : 0.0f;
+
+        norm_bwd(da2, x2, g1, fw->r2, NF_HID, tg->g1, tg->c1, dz2);
+
+        /* THE identity path.  It is what lets the policy gradient reach W0
+         * without being attenuated by W1's relu gate -- the reason the first
+         * layer of the old design learned so slowly late in a run. */
+        for (int i = 0; i < NF_ACC; i++) dh1[i] += dh2[i];
+
         const float *restrict h1 = fw->h1;
         const float *restrict W1 = t->W1;
         float *restrict gb1 = tg->b1;
         for (int j = 0; j < NF_HID; j++) {
-            if (z2[j] <= 0.0f) continue;              /* relu gate */
-            const float d = dh2[j];
+            const float d = dz2[j];
             gb1[j] += d;
+            if (d == 0.0f) continue;
             const float *restrict w  = W1     + (size_t)j * NF_ACC;
             float       *restrict gw = tg->W1 + (size_t)j * NF_ACC;
             for (int i = 0; i < NF_ACC; i++) {
@@ -411,21 +682,24 @@ void nn_backward(const Trunk *t, const Head *h, const Fwd *fw,
         }
     }
 
-    /* ---- h1 = relu(acc) ; acc = b0 + z + sum of active W0 rows */
+    /* ---- h1 = relu(g0 * x1 + c0) ; acc = b0 + z + sum of active W0 rows */
     {
-        const float *restrict acc = fw->acc;
+        float da1[NF_ACC], dacc[NF_ACC];
+        const float *restrict h1 = fw->h1;
+        for (int i = 0; i < NF_ACC; i++) da1[i] = (h1[i] > 0.0f) ? dh1[i] : 0.0f;
+
+        norm_bwd(da1, fw->x1, t->g0, fw->r1, NF_ACC, tg->g0, tg->c0, dacc);
+
         float *restrict gb0 = tg->b0;
         float *restrict gz  = hg->z;
         for (int i = 0; i < NF_ACC; i++) {
-            const float d = (acc[i] > 0.0f) ? dh1[i] : 0.0f;
-            dh1[i] = d;
-            gb0[i] += d;
-            gz[i]  += d;
+            gb0[i] += dacc[i];
+            gz[i]  += dacc[i];
         }
         float *restrict W0g = tg->W0;
         for (int f = 0; f < nf; f++) {
             float *restrict gw = W0g + (size_t)fidx[f] * NF_ACC;
-            for (int i = 0; i < NF_ACC; i++) gw[i] += dh1[i];
+            for (int i = 0; i < NF_ACC; i++) gw[i] += dacc[i];
         }
     }
 }
@@ -646,6 +920,9 @@ int model_load(const char *path, Trunk *t, Head *heads, Hyper *hy, float *elo,
         fclose(f);
         return 0;
     }
+    /* The version check is what makes an old checkpoint fail cleanly.  A
+     * version-3 file has the same magic and the same NF_INPUT/NF_ACC/NF_PDIM;
+     * only the version and NF_HID differ, and relying on NF_HID would be luck. */
     if (magic != MODEL_MAGIC || ver != MODEL_VERSION ||
         ni != (uint32_t)NF_INPUT || nacc != (uint32_t)NF_ACC ||
         nhid != (uint32_t)NF_HID || npd != (uint32_t)NF_PDIM ||
@@ -654,14 +931,21 @@ int model_load(const char *path, Trunk *t, Head *heads, Hyper *hy, float *elo,
         return 0;
     }
 
-    /* Reject truncated files up front so the skip paths cannot read past EOF. */
+    /* The file is a fixed-size record, so its LENGTH is a checksum on the
+     * layout, and it is required to match exactly rather than merely to be long
+     * enough.  Being strict here is what catches a width the header does not
+     * record: NF_VACC and NF_VHID are not among the eight header fields, so a
+     * checkpoint written with a different value of either has the same magic,
+     * the same version and the same four widths, and would otherwise be read as
+     * a correctly-shaped model made of shifted numbers.  It also still rejects
+     * the truncated file the skip paths must never be handed. */
     const long long want = (long long)MODEL_HDR_BYTES +
         (long long)sizeof(float) *
         ((long long)TRUNK_NPARAM +
          (long long)na * ((long long)HEAD_NPARAM + (long long)HYPER_NPARAM + 1));
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     const long long have = (long long)ftell(f);
-    if (have < want || fseek(f, MODEL_HDR_BYTES, SEEK_SET) != 0) { fclose(f); return 0; }
+    if (have != want || fseek(f, MODEL_HDR_BYTES, SEEK_SET) != 0) { fclose(f); return 0; }
 
     const int file_n = (int)na;
     const int want_arrays = (heads != NULL) || (hy != NULL) || (elo != NULL);

@@ -162,12 +162,19 @@ static int cmd_az(int argc, char **argv)
     c.buffer_positions = (int)opt_int(argc, argv, "--buffer",          c.buffer_positions);
     c.hof_every        = (int)opt_int(argc, argv, "--hof-every",       c.hof_every);
     c.hof_frac_pct     = (int)opt_int(argc, argv, "--hof-pct",         c.hof_frac_pct);
+    c.warmup_gens      = (int)opt_int(argc, argv, "--warmup",          c.warmup_gens);
+    c.ema_h2h_games    = (int)opt_int(argc, argv, "--ema-h2h",         c.ema_h2h_games);
+    c.cap_sims         = (int)opt_int(argc, argv, "--cap-sims",        c.cap_sims);
 
     c.lr               = (float)opt_num(argc, argv, "--lr",           c.lr);
     c.lr_final         = (float)opt_num(argc, argv, "--lr-final",     c.lr_final);
     c.weight_decay     = (float)opt_num(argc, argv, "--wd",           c.weight_decay);
     c.grad_clip        = (float)opt_num(argc, argv, "--clip",         c.grad_clip);
+    c.grad_clip_head   = (float)opt_num(argc, argv, "--clip-head",    c.grad_clip_head);
     c.value_coef       = (float)opt_num(argc, argv, "--value-coef",   c.value_coef);
+    c.value_mix        = (float)opt_num(argc, argv, "--value-mix",    c.value_mix);
+    c.ema_decay        = (float)opt_num(argc, argv, "--ema-decay",    c.ema_decay);
+    c.cap_frac         = (float)opt_num(argc, argv, "--cap-frac",     c.cap_frac);
     c.draw_penalty     = (float)opt_num(argc, argv, "--draw-penalty", c.draw_penalty);
     c.c_puct           = (float)opt_num(argc, argv, "--cpuct",        c.c_puct);
     c.dirichlet_alpha  = (float)opt_num(argc, argv, "--dir-alpha",    c.dirichlet_alpha);
@@ -705,7 +712,15 @@ static int usage(void)
 "    --threads N           worker threads                  (default %d here)\n"
 "    --batch N             minibatch positions             (default 256)\n"
 "    --steps N             optimiser steps per generation  (default 200)\n"
-"    --lr X --lr-final X --wd X --clip X --value-coef X\n"
+"    --lr X --lr-final X --wd X --clip X --clip-head X --value-coef X\n"
+"    --value-mix X         blend MCTS root value into the value target\n"
+"                          target = (1-X)*result + X*q_search   (default 0)\n"
+"    --warmup N            linear LR warmup over the first N generations\n"
+"    --ema-decay X         Polyak weight averaging       (default 0.999, 0 off)\n"
+"    --ema-h2h N           raw-vs-EMA games before best.crl        (default 8)\n"
+"    --cap-frac X          fraction of moves given the full sim budget AND\n"
+"                          recorded for training         (default 1.0 = every)\n"
+"    --cap-sims N          budget for the other moves    (default sims/5)\n"
 "    --draw-penalty X --buffer N --max-plies N --opening-plies N\n"
 "    --temp-start X --temp-end X --cpuct X --dir-alpha X --dir-eps X\n"
 "    --resign X --resign-check X --elite F --cull F --mutate-sigma X\n"

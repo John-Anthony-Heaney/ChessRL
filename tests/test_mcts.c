@@ -26,8 +26,9 @@
 #include <string.h>
 #include <time.h>
 
-/* Not in mcts.h (headers are fixed); defined in mcts.c.  See the report. */
-uint64_t mcts_pool_exhausted(const Mcts *m);
+/* mcts_pool_exhausted() is declared in mcts.h now, as a proper part of the
+ * interface, and the counter is a field of Mcts rather than a hidden block in
+ * front of the node pool. */
 
 /* ------------------------------------------------------------ harness */
 
@@ -697,36 +698,587 @@ static void t_deep_and_const(void)
     mcts_free(&m);
 }
 
+/* ============================== 13. subtree reuse changes nothing ========= */
+
+static int same_visits(const int32_t *a, const int32_t *b, int n)
+{
+    for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+/* Plays `plies` moves, searching every ply with two engines: one that inherits
+ * the subtree under the move played (and caches evaluations) and one that
+ * rebuilds from scratch with no cache.  Returns the number of plies at which
+ * the two disagreed about anything.
+ *
+ * With the root noise off this must be ZERO, and not by luck.  A simulation
+ * that descends from the old root into child C and carries on applies the same
+ * PUCT rule to C's own statistics that a search rooted at C would, so after N
+ * visits to C its subtree IS the tree a root-at-C search holds after N-1
+ * simulations.  `sims` is a TOTAL budget, so topping up to sims + 1 finishes
+ * exactly that sequence -- and no simulation reads the rng, so the two engines
+ * agree bit for bit, every visit count and the root value.
+ *
+ * `stride` is how many plies pass between searches: 1 is self-play's cadence,
+ * 2 is an engine playing one side of a game. */
+static int reuse_disagreements(const char *fen, int sims, int plies, int stride,
+                               uint64_t *hits, uint64_t *misses)
+{
+    Game g; if (fen) load(&g, fen); else game_start(&g);
+
+    Mcts a, b;
+    mcts_init(&a, 200000);                  /* inherits, and caches           */
+    mcts_init(&b, 200000);
+    b.reuse = 0; b.cache = 0;               /* rebuilds every move, no cache  */
+
+    int32_t va[MAX_MOVES], vb[MAX_MOVES];
+    float   rva = 0.0f, rvb = 0.0f;
+    uint64_t ra[4], rb[4];
+    Move list[MAX_MOVES];
+    int bad = 0;
+
+    seed_rng(ra, 4242u);
+    seed_rng(rb, 4242u);
+
+    for (int p = 0; p < plies && g.result == GR_ONGOING; p++) {
+        int n = gen_legal(&g.pos, list);
+        if (n <= 0) break;
+        if (p % stride == 0) {
+            const int na = mcts_search(&a, &g_trunk, &g_head, &g, sims, 0, ra, va, &rva);
+            const int nb = mcts_search(&b, &g_trunk, &g_head, &g, sims, 0, rb, vb, &rvb);
+            if (na != nb || na != n)               { bad++; break; }
+            if (!same_visits(va, vb, na))            bad++;
+            else if (rva != rvb)                     bad++;
+            if (sum_i(va, na) != sims)               bad++;
+            if (a.pool[0].N != sims + 1)             bad++;
+            /* the caller's visits[] is only meaningful if the root children are
+             * gen_legal()'s list, in order */
+            for (int i = 0; i < na; i++)
+                if (a.pool[a.pool[0].first + i].move != list[i]) { bad++; break; }
+            game_push(&g, list[argmax_i(va, na)]);
+        } else {
+            game_push(&g, list[argmax_i(vb, n > 0 ? n : 1)]);
+        }
+    }
+    if (hits)   *hits   = a.reuse_hits;
+    if (misses) *misses = a.reuse_misses;
+
+    mcts_free(&a);
+    mcts_free(&b);
+    return bad;
+}
+
+static void t_reuse_is_a_fresh_search(void)
+{
+    const struct { const char *fen; int sims; int plies; int stride; } cases[] = {
+        { NULL,                                                    300, 20, 1 },
+        { NULL,                                                    300, 20, 2 },
+        { "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+                                                                   600, 14, 1 },
+        /* a shuffling position: the repetition window moves under the tree     */
+        { "8/8/1p6/pPp5/PkP5/8/1K6/8 w - - 0 1",                  800, 16, 1 },
+        /* nothing but pawn moves and captures, so the halfmove clock resets    */
+        { "4k3/pp3ppp/8/8/8/2r5/PP3PPP/3RK3 w - - 0 1",           400, 16, 1 },
+    };
+
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        uint64_t hits = 0, misses = 0;
+        const int bad = reuse_disagreements(cases[k].fen, cases[k].sims,
+                                            cases[k].plies, cases[k].stride,
+                                            &hits, &misses);
+        printf("  %-46s sims=%3d stride=%d  reuse %llu/%llu  disagreements: %d\n",
+               cases[k].fen ? cases[k].fen : "(start position)",
+               cases[k].sims, cases[k].stride,
+               (unsigned long long)hits, (unsigned long long)(hits + misses), bad);
+        CHECK(bad == 0, "reuse/cache changed the search result in %s",
+              cases[k].fen ? cases[k].fen : "the start position");
+        CHECK(hits > 0, "no subtree was ever inherited in %s -- the test is vacuous",
+              cases[k].fen ? cases[k].fen : "the start position");
+    }
+}
+
+/* The 32, 64, 128, ... ramp uci.c and api.c use to honour a movetime cap.
+ * Re-rooting at the SAME position makes each pass a top-up of the last, and the
+ * answer must be the answer a single search of the final budget would give. */
+static void t_reuse_ramp(void)
+{
+    Game g; load(&g, "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+
+    Mcts a, b;
+    mcts_init(&a, 200000);
+    mcts_init(&b, 200000);
+    b.reuse = 0; b.cache = 0;
+
+    int32_t va[MAX_MOVES], vb[MAX_MOVES];
+    float   rva = 0.0f, rvb = 0.0f;
+    uint64_t ra[4], rb[4]; seed_rng(ra, 9u); seed_rng(rb, 9u);
+
+    const int target = 800;
+    int na = 0;
+    for (int run = 32; ; run = (run * 2 > target) ? target : run * 2) {
+        na = mcts_search(&a, &g_trunk, &g_head, &g, run, 0, ra, va, &rva);
+        if (run >= target) break;
+    }
+    const int nb = mcts_search(&b, &g_trunk, &g_head, &g, target, 0, rb, vb, &rvb);
+
+    printf("  ramp 32..800 evals=%llu vs one 800-sim search evals=%llu "
+           "(%.2fx)  identical: %s\n",
+           (unsigned long long)a.evals, (unsigned long long)b.evals,
+           (double)b.evals / (double)(a.evals ? a.evals : 1),
+           (na == nb && same_visits(va, vb, na) && rva == rvb) ? "yes" : "NO");
+    CHECK(na == nb, "ramp returned %d moves, single search %d", na, nb);
+    CHECK(same_visits(va, vb, na), "the ramp did not land on the single search's tree");
+    CHECK(rva == rvb, "ramp root value %+.8f vs %+.8f", (double)rva, (double)rvb);
+    CHECK(sum_i(va, na) == target, "ramp visits sum to %d, want %d", sum_i(va, na), target);
+
+    mcts_free(&a);
+    mcts_free(&b);
+}
+
+/* ====================== 14. a stale tree is never used for a wrong position */
+
+/* The most-visited two-ply path through the standing tree, which is the path a
+ * real game is most likely to take and the one with statistics worth keeping. */
+static int best_two_ply(const Mcts *m, Move *m0, Move *m1)
+{
+    const MctsNode *root = &m->pool[0];
+    if (root->first < 0 || root->nchild <= 0) return 0;
+
+    int b0 = 0;
+    for (int i = 1; i < root->nchild; i++)
+        if (m->pool[root->first + i].N > m->pool[root->first + b0].N) b0 = i;
+    const MctsNode *c = &m->pool[root->first + b0];
+    *m0 = c->move;
+    if (c->first < 0 || c->nchild <= 0) return 1;
+
+    int b1 = 0;
+    for (int i = 1; i < c->nchild; i++)
+        if (m->pool[c->first + i].N > m->pool[c->first + b1].N) b1 = i;
+    const MctsNode *gc = &m->pool[c->first + b1];
+    if (gc->N <= 0 || gc->first < 0) return 1;
+    *m1 = gc->move;
+    return 2;
+}
+
+static void t_reuse_refuses_stale(void)
+{
+    Move mv;
+    int32_t v[MAX_MOVES], vfresh[MAX_MOVES];
+    float rv = 0.0f, rvf = 0.0f;
+    uint64_t rng[4];
+
+    Mcts m;  mcts_init(&m, 400000);
+    Mcts f;  mcts_init(&f, 400000); f.reuse = 0; f.cache = 0;
+
+    /* Game A: a tree is built, then the two most-visited plies of that tree are
+     * played, which is the case a real engine hits between its own moves. */
+    Game a; game_start(&a);
+    Move a0 = MV_NONE, a1 = MV_NONE;
+    seed_rng(rng, 17u);
+    mcts_search(&m, &g_trunk, &g_head, &a, 4000, 0, rng, v, &rv);
+    CHECK(best_two_ply(&m, &a0, &a1) == 2, "the tree has no two-ply path to follow");
+    game_push(&a, a0);
+    game_push(&a, a1);
+    mcts_search(&m, &g_trunk, &g_head, &a, 4000, 0, rng, v, &rv);
+    const uint64_t hits_after_a = m.reuse_hits;
+    CHECK(hits_after_a > 0, "the two-ply advance did not inherit anything");
+
+    /* Game B: a DIFFERENT game, the same number of plies in.  The ply counter
+     * agrees, so only the position check can catch this. */
+    {
+        Game b; game_start(&b);
+        const char *bmoves[] = { "d2d4", "d7d5" };
+        for (int i = 0; i < 2; i++) {
+            CHECK(move_from_uci(&b.pos, bmoves[i], &mv) != 0, "illegal setup move");
+            game_push(&b, mv);
+        }
+        uint64_t r1[4], r2[4]; seed_rng(r1, 5u); seed_rng(r2, 5u);
+        const int n1 = mcts_search(&m, &g_trunk, &g_head, &b, 400, 0, r1, v,      &rv);
+        const int n2 = mcts_search(&f, &g_trunk, &g_head, &b, 400, 0, r2, vfresh, &rvf);
+        printf("  a different game at the same ply: inherited %s, answer matches a "
+               "fresh tree: %s\n",
+               (m.reuse_hits == hits_after_a) ? "nothing" : "SOMETHING",
+               (n1 == n2 && same_visits(v, vfresh, n1)) ? "yes" : "NO");
+        CHECK(m.reuse_hits == hits_after_a, "a tree from another game was inherited");
+        CHECK(n1 == n2 && same_visits(v, vfresh, n1),
+              "the answer for a foreign position was not a fresh search's answer");
+    }
+
+    /* Three plies at once: beyond what the tree can be re-rooted on. */
+    {
+        Game c = a;
+        Move cl[MAX_MOVES];
+        for (int i = 0; i < 3; i++) {
+            const int n = gen_legal(&c.pos, cl);
+            CHECK(n > 0, "no legal move to play");
+            game_push(&c, cl[0]);
+        }
+        /* re-root the standing tree on game A again first */
+        uint64_t r[4]; seed_rng(r, 3u);
+        mcts_search(&m, &g_trunk, &g_head, &a, 400, 0, r, v, &rv);
+        const uint64_t before = m.reuse_hits;
+        mcts_search(&m, &g_trunk, &g_head, &c, 400, 0, r, v, &rv);
+        printf("  a three-ply jump: inherited %s\n",
+               (m.reuse_hits == before) ? "nothing" : "SOMETHING");
+        CHECK(m.reuse_hits == before, "a three-ply jump inherited a subtree");
+    }
+
+    /* Same position, same ply, but the caller's repetition history is shorter
+     * than the one the standing tree was built under.  A cached TR_REPETITION
+     * inside that tree would be a fact about a history this caller does not
+     * have, so the tree must be refused. */
+    {
+        /* A pawnless position with the fifty-move clock already running, so six
+         * plies of argmax play cannot reset it.  The earlier fixture was pawn-locked
+         * and a pawn move zeroed the clock, which collapsed the repetition window to
+         * one ply and made truncating the history a no-op -- the assertion below then
+         * tested nothing.  halfmove > 1 is what gives this case its teeth. */
+        Game d; load(&d, "8/8/8/3k4/8/8/8/3K3R w - - 12 40");
+        uint64_t r[4]; seed_rng(r, 21u);
+        Move list[MAX_MOVES];
+        for (int p = 0; p < 6 && d.result == GR_ONGOING; p++) {
+            const int n = mcts_search(&m, &g_trunk, &g_head, &d, 300, 0, r, v, &rv);
+            if (n <= 0) break;
+            gen_legal(&d.pos, list);
+            game_push(&d, list[argmax_i(v, n)]);
+        }
+        mcts_search(&m, &g_trunk, &g_head, &d, 300, 0, r, v, &rv);
+        const uint64_t before = m.reuse_hits;
+
+        Game e = d;                       /* same position, same ply, no history */
+        e.hist_len = 1;
+        e.hist[0]  = e.pos.key;
+        CHECK(e.pos.halfmove > 1, "the history-truncation case needs a halfmove clock");
+
+        uint64_t r1[4], r2[4]; seed_rng(r1, 8u); seed_rng(r2, 8u);
+        const int n1 = mcts_search(&m, &g_trunk, &g_head, &e, 300, 0, r1, v,      &rv);
+        const int n2 = mcts_search(&f, &g_trunk, &g_head, &e, 300, 0, r2, vfresh, &rvf);
+        printf("  a truncated repetition history: inherited %s, answer matches a "
+               "fresh tree: %s\n",
+               (m.reuse_hits == before) ? "nothing" : "SOMETHING",
+               (n1 == n2 && same_visits(v, vfresh, n1)) ? "yes" : "NO");
+        CHECK(m.reuse_hits == before,
+              "a subtree was inherited across a change of repetition history");
+        CHECK(n1 == n2 && same_visits(v, vfresh, n1),
+              "the answer after refusing a tree was not a fresh search's answer");
+    }
+
+    /* A changed network invalidates everything.  In self-play the two sides are
+     * different agents, so this fires on every ply. */
+    {
+        uint64_t r[4]; seed_rng(r, 2u);
+        mcts_search(&m, &g_trunk, &g_head, &a, 400, 0, r, v, &rv);
+        const uint64_t before = m.reuse_hits, flush0 = m.cache_flushes;
+
+        Game a2 = a;
+        Move al[MAX_MOVES];
+        CHECK(gen_legal(&a2.pos, al) > 0, "no legal move to play");
+        game_push(&a2, al[0]);
+
+        net_seed(0xFEEDu);                       /* the weights move */
+        mcts_search(&m, &g_trunk, &g_head, &a2, 400, 0, r, v, &rv);
+        printf("  the weights changed: inherited %s, cache flushed: %s\n",
+               (m.reuse_hits == before) ? "nothing" : "SOMETHING",
+               (m.cache_flushes > flush0) ? "yes" : "NO");
+        CHECK(m.reuse_hits == before, "a subtree survived a change of weights");
+        CHECK(m.cache_flushes > flush0, "the cache survived a change of weights");
+        net_seed(12345u);                        /* restore the shared net */
+    }
+
+    mcts_free(&m);
+    mcts_free(&f);
+}
+
+/* ======================= 15. the cache keys on the whole network input ===== */
+
+static float root_v(Mcts *m, const char *fen)
+{
+    Game g; load(&g, fen);
+    int32_t v[MAX_MOVES];
+    float rv = 0.0f;
+    uint64_t rng[4]; seed_rng(rng, 1u);
+    /* sims = 0 leaves root.N = 1 and root.W = V(s), so the root value IS the
+     * value head's output for this position and nothing else. */
+    mcts_search(m, &g_trunk, &g_head, &g, 0, 0, rng, v, &rv);
+    return rv;
+}
+
+static void t_cache_keys_on_the_input(void)
+{
+    /* Two positions that the ZOBRIST KEY cannot tell apart: the halfmove clock
+     * is not hashed.  The network sees them differently -- feature 780 + the
+     * clock bucket -- so a cache keyed on the bare zobrist key would hand the
+     * second one the first one's evaluation. */
+    const char *h0  = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+    const char *h91 = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 91 50";
+
+    Game a, b; load(&a, h0); load(&b, h91);
+    printf("  clock 4 vs 91: same zobrist key: %s (buckets %d and %d)\n",
+           a.pos.key == b.pos.key ? "yes" : "no",
+           a.pos.halfmove / 13, b.pos.halfmove / 13 > 7 ? 7 : b.pos.halfmove / 13);
+    CHECK(a.pos.key == b.pos.key,
+          "the two clocks gave different zobrist keys -- this test proves nothing");
+
+    Mcts warm;  mcts_init(&warm, 20000);              /* cache on  */
+    Mcts cold;  mcts_init(&cold, 20000); cold.cache = 0;
+
+    const float v0_cold = root_v(&cold, h0);
+    const float v91_cold = root_v(&cold, h91);
+    const float v0_warm = root_v(&warm, h0);          /* fills the cache */
+    const float v91_warm = root_v(&warm, h91);        /* must NOT hit v0 */
+
+    printf("  V(clock 4)=%+.6f  V(clock 91)=%+.6f   cached: %+.6f / %+.6f\n",
+           (double)v0_cold, (double)v91_cold, (double)v0_warm, (double)v91_warm);
+    CHECK(v0_cold != v91_cold,
+          "the clock bucket did not change the value head -- test is vacuous");
+    CHECK(v0_warm == v0_cold && v91_warm == v91_cold,
+          "the cache returned the wrong position's evaluation");
+
+    /* Castling rights and the en-passant square ARE in the zobrist key, so the
+     * key alone separates them.  Check that, since the cache relies on it. */
+    {
+        Game c, d, e;
+        load(&c, "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQ - 4 4");
+        load(&d, "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
+        load(&e, "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3");
+        printf("  castling rights change the key: %s   en passant: %s\n",
+               a.pos.key != c.pos.key ? "yes" : "NO",
+               d.pos.key != e.pos.key ? "yes" : "NO");
+        CHECK(a.pos.key != c.pos.key, "castling rights are not in the zobrist key");
+        CHECK(d.pos.key != e.pos.key, "the en-passant file is not in the zobrist key");
+    }
+
+    /* And the cache must never change an answer.  A whole game, cache on vs
+     * cache off, tree reuse out of the picture on both sides. */
+    {
+        Game g; game_start(&g);
+        Mcts on, off;
+        mcts_init(&on, 200000);  on.reuse = 0;
+        mcts_init(&off, 200000); off.reuse = 0; off.cache = 0;
+        int32_t va[MAX_MOVES], vb[MAX_MOVES];
+        float rva, rvb;
+        uint64_t ra[4], rb[4]; seed_rng(ra, 6u); seed_rng(rb, 6u);
+        Move list[MAX_MOVES];
+        int bad = 0;
+
+        for (int p = 0; p < 16 && g.result == GR_ONGOING; p++) {
+            const int na = mcts_search(&on,  &g_trunk, &g_head, &g, 300, 0, ra, va, &rva);
+            const int nb = mcts_search(&off, &g_trunk, &g_head, &g, 300, 0, rb, vb, &rvb);
+            if (na != nb || !same_visits(va, vb, na) || rva != rvb) bad++;
+            if (na <= 0) break;
+            gen_legal(&g.pos, list);
+            game_push(&g, list[argmax_i(va, na)]);
+        }
+        const double hr = 100.0 * (double)on.cache_hits
+                        / (double)(on.cache_hits + on.cache_misses);
+        printf("  16 plies, cache on vs off: disagreements %d   hit rate %.1f%%  "
+               "(%llu hits, %llu network evaluations)\n",
+               bad, hr, (unsigned long long)on.cache_hits,
+               (unsigned long long)on.evals);
+        CHECK(bad == 0, "the cache changed the search result");
+        CHECK(on.cache_hits > 0, "the cache never hit -- the test is vacuous");
+        CHECK(on.evals < off.evals, "the cache saved no network evaluations");
+        mcts_free(&on);
+        mcts_free(&off);
+    }
+
+    mcts_free(&warm);
+    mcts_free(&cold);
+}
+
+/* ============================= 16. FPU reduction, which DOES change play === */
+
+static void t_fpu_reduction(void)
+{
+    Game g; load(&g, "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+
+    Mcts flat, red;
+    mcts_init(&flat, 200000);
+    mcts_init(&red,  200000);
+    red.fpu_reduction = 0.2f;
+
+    int32_t vf[MAX_MOVES], vr[MAX_MOVES];
+    float rvf, rvr;
+    uint64_t r1[4], r2[4]; seed_rng(r1, 12u); seed_rng(r2, 12u);
+
+    const int nf = mcts_search(&flat, &g_trunk, &g_head, &g, 800, 0, r1, vf, &rvf);
+    const int nr = mcts_search(&red,  &g_trunk, &g_head, &g, 800, 0, r2, vr, &rvr);
+
+    int touched_f = 0, touched_r = 0;
+    for (int i = 0; i < nf; i++) if (vf[i] > 0) touched_f++;
+    for (int i = 0; i < nr; i++) if (vr[i] > 0) touched_r++;
+
+    printf("  fpu_reduction 0.0 vs 0.2: distributions differ: %s   "
+           "moves given a visit: %d vs %d of %d\n",
+           same_visits(vf, vr, nf) ? "NO" : "yes", touched_f, touched_r, nf);
+    CHECK(nf == nr, "fpu_reduction changed the legal move count");
+    CHECK(!same_visits(vf, vr, nf),
+          "fpu_reduction 0.2 changed nothing -- it is not wired in");
+    /* whatever it does to the shape, the conventions are not negotiable */
+    CHECK(sum_i(vr, nr) == 800, "fpu_reduction broke sum(visits) == sims (%d)",
+          sum_i(vr, nr));
+    CHECK(red.pool[0].N == 801, "fpu_reduction broke root.N == sims + 1 (%d)",
+          red.pool[0].N);
+
+    /* 0 must reproduce the flat rule exactly, so the default is the old search. */
+    {
+        Mcts zero; mcts_init(&zero, 200000);
+        zero.fpu_reduction = 0.0f;
+        int32_t vz[MAX_MOVES]; float rvz;
+        uint64_t r3[4]; seed_rng(r3, 12u);
+        const int nz = mcts_search(&zero, &g_trunk, &g_head, &g, 800, 0, r3, vz, &rvz);
+        printf("  fpu_reduction 0.0 == the flat fpu, exactly: %s\n",
+               (nz == nf && same_visits(vz, vf, nz) && rvz == rvf) ? "yes" : "NO");
+        CHECK(nz == nf && same_visits(vz, vf, nz) && rvz == rvf,
+              "fpu_reduction = 0 is not the old behaviour");
+        mcts_free(&zero);
+    }
+
+    /* and it must still find a forced mate, which comes from the rules */
+    {
+        Game mate; load(&mate, "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1");
+        const int mi = idx_of(&mate.pos, "a1a8");
+        int32_t v[MAX_MOVES]; float rv;
+        uint64_t r[4]; seed_rng(r, 7u);
+        const int n = mcts_search(&red, &g_trunk, &g_head, &mate, 400, 0, r, v, &rv);
+        printf("  with fpu_reduction on, mate in 1 is still found: %s (root value %+.3f)\n",
+               argmax_i(v, n) == mi ? "yes" : "NO", (double)rv);
+        CHECK(argmax_i(v, n) == mi, "fpu_reduction lost a mate in 1");
+        CHECK(rv > 0.80f, "fpu_reduction root value %+.4f, want ~+1", (double)rv);
+    }
+
+    mcts_free(&flat);
+    mcts_free(&red);
+}
+
+/* ================= 17. reuse under root noise, and under a starved pool === */
+
+static void t_reuse_rough_conditions(void)
+{
+    /* Root noise on.  Reuse is NOT equivalent to a fresh search here -- a fresh
+     * search noises the root priors before its first simulation and an
+     * inherited subtree was built without them -- so the guarantee tested is
+     * the one callers depend on: the conventions hold and the answer is a legal
+     * move distribution over gen_legal()'s list. */
+    {
+        Game g; game_start(&g);
+        Mcts m; mcts_init(&m, 200000);
+        uint64_t rng[4]; seed_rng(rng, 88u);
+        int32_t v[MAX_MOVES]; float rv;
+        Move list[MAX_MOVES];
+        int bad = 0;
+
+        for (int p = 0; p < 20 && g.result == GR_ONGOING; p++) {
+            const int n = mcts_search(&m, &g_trunk, &g_head, &g, 400, 1, rng, v, &rv);
+            const int nl = gen_legal(&g.pos, list);
+            if (n != nl || sum_i(v, n) != 400 || m.pool[0].N != 401) bad++;
+            for (int i = 0; i < n; i++)
+                if (m.pool[m.pool[0].first + i].move != list[i]) { bad++; break; }
+            if (n <= 0) break;
+            game_push(&g, list[mcts_pick(v, n, 1.0f, rng)]);
+        }
+        printf("  20 noisy plies with reuse on: violations %d   inherited %llu/%llu\n",
+               bad, (unsigned long long)m.reuse_hits,
+               (unsigned long long)(m.reuse_hits + m.reuse_misses));
+        CHECK(bad == 0, "reuse under root noise broke a convention");
+        CHECK(m.reuse_hits > 0, "reuse never fired under root noise");
+        mcts_free(&m);
+    }
+
+    /* A pool far too small for the budget, played out over many moves.  The
+     * inherited subtree competes with the new one for the same pool, so this is
+     * where a compaction bug would show up as an overflow or a lost node. */
+    {
+        Game g; game_start(&g);
+        Mcts m; mcts_init(&m, 1500);
+        uint64_t rng[4]; seed_rng(rng, 606u);
+        int32_t v[MAX_MOVES]; float rv;
+        Move list[MAX_MOVES];
+        int bad = 0;
+
+        for (int p = 0; p < 24 && g.result == GR_ONGOING; p++) {
+            const int n = mcts_search(&m, &g_trunk, &g_head, &g, 800, 0, rng, v, &rv);
+            if (n <= 0) break;
+            if (sum_i(v, n) != 800 || m.used > m.cap || m.pool[0].N != 801) bad++;
+            gen_legal(&g.pos, list);
+            game_push(&g, list[argmax_i(v, n)]);
+        }
+        printf("  24 plies with a 1500-node pool: violations %d  used %d/%d  "
+               "exhausted %llu\n", bad, m.used, m.cap,
+               (unsigned long long)mcts_pool_exhausted(&m));
+        CHECK(bad == 0, "a starved pool plus reuse broke a convention");
+        CHECK(mcts_pool_exhausted(&m) > 0, "a 1500-node pool was not exhausted");
+        mcts_free(&m);
+    }
+}
+
 /* ------------------------------------------------------ 11. benchmark */
+
+/* One configuration, measured over a GAME rather than over one position
+ * searched again and again: repeating a single search is the one case the cache
+ * answers almost for free, and it would flatter these numbers badly.  `stride`
+ * is the plies between searches -- 1 as in self-play, 2 as when playing one
+ * side.  Returns wall-clock seconds; the caller keeps the minimum over repeats,
+ * because this may well be sharing the machine. */
+static double bench_run(int sims, int stride, int reuse, int cache,
+                        uint64_t *evals, uint64_t *hits, uint64_t *misses,
+                        int *moves)
+{
+    Game g; game_start(&g);
+    Mcts m; mcts_init(&m, 1 + sims * 80);
+    m.reuse = reuse;
+    m.cache = cache;
+
+    int32_t v[MAX_MOVES]; float rv;
+    uint64_t rng[4]; seed_rng(rng, 1u);
+    Move list[MAX_MOVES];
+    double secs = 0.0;
+    int nm = 0;
+
+    for (int p = 0; p < 40 && g.result == GR_ONGOING; p++) {
+        int n = gen_legal(&g.pos, list);
+        if (n <= 0) break;
+        if (p % stride == 0) {
+            const double t0 = now_s();
+            n = mcts_search(&m, &g_trunk, &g_head, &g, sims, 0, rng, v, &rv);
+            secs += now_s() - t0;
+            if (n <= 0) break;
+            nm++;
+        }
+        game_push(&g, list[argmax_i(v, n)]);
+    }
+    *evals = m.evals; *hits = m.cache_hits; *misses = m.cache_misses; *moves = nm;
+    mcts_free(&m);
+    return secs;
+}
 
 static void t_bench(void)
 {
-    Game g; game_start(&g);
-    Mcts m; mcts_init(&m, 400000);
-    int32_t v[MAX_MOVES]; float rv;
-    uint64_t rng[4]; seed_rng(rng, 1u);
+    const int sims = 400;
 
-    const int cfg[2]  = { 64, 400 };
-    const int reps[2] = { 400, 100 };
-
-    for (int c = 0; c < 2; c++) {
-        /* warm up */
-        mcts_search(&m, &g_trunk, &g_head, &g, cfg[c], 0, rng, v, &rv);
-
-        const uint64_t e0 = m.evals;
-        const double t0 = now_s();
-        for (int i = 0; i < reps[c]; i++)
-            mcts_search(&m, &g_trunk, &g_head, &g, cfg[c], 1, rng, v, &rv);
-        const double dt = now_s() - t0;
-
-        const double sims = (double)cfg[c] * (double)reps[c];
-        printf("  %3d sims/move: %7.0f sims/s   %7.0f evals/s   %6.1f us/sim   "
-               "%.2f ms/move   max depth %d\n",
-               cfg[c], sims / dt, (double)(m.evals - e0) / dt,
-               1.0e6 * dt / sims, 1000.0 * dt / (double)reps[c], m.max_depth_seen);
-        CHECK(dt > 0.0, "benchmark timer did not advance");
+    for (int stride = 1; stride <= 2; stride++) {
+        printf("  %d sims/move, %s:\n", sims,
+               stride == 1 ? "a search every ply (self-play's cadence)"
+                           : "a search every other ply (playing one side)");
+        for (int cfg = 0; cfg < 4; cfg++) {
+            const int reuse = cfg & 1, cache = (cfg >> 1) & 1;
+            double best = 1.0e9;
+            uint64_t ev = 0, hi = 0, mi = 0;
+            int moves = 1;
+            for (int rep = 0; rep < 3; rep++) {
+                uint64_t e, h, s; int mv;
+                const double dt = bench_run(sims, stride, reuse, cache, &e, &h, &s, &mv);
+                if (dt < best) { best = dt; ev = e; hi = h; mi = s; moves = mv; }
+            }
+            CHECK(best > 0.0, "benchmark timer did not advance");
+            printf("    reuse %-3s cache %-3s  %7.0f sims/s  %7.0f evals/s  "
+                   "%6.1f evals/move  %5.2f ms/move  hit rate %4.1f%%\n",
+                   reuse ? "on" : "off", cache ? "on" : "off",
+                   (double)(sims * moves) / best, (double)ev / best,
+                   (double)ev / moves, 1000.0 * best / moves,
+                   (hi + mi) ? 100.0 * (double)hi / (double)(hi + mi) : 0.0);
+        }
     }
-    mcts_free(&m);
 }
 
 /* ------------------------------------------------------------ main */
@@ -780,7 +1332,23 @@ int main(void)
     banner("11b. deep forced lines; the caller's Game is not touched");
     t_deep_and_const();
 
-    banner("12. benchmark (single core)");
+    banner("13. subtree reuse is exactly a fresh search of the same budget");
+    t_reuse_is_a_fresh_search();
+    t_reuse_ramp();
+
+    banner("14. a stale tree is never used for the wrong position");
+    t_reuse_refuses_stale();
+
+    banner("15. the evaluation cache keys on the whole network input");
+    t_cache_keys_on_the_input();
+
+    banner("16. FPU reduction (it changes play by design, so it is tested alone)");
+    t_fpu_reduction();
+
+    banner("17. reuse under root noise and under a starved pool");
+    t_reuse_rough_conditions();
+
+    banner("18. benchmark (single core)");
     t_bench();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);

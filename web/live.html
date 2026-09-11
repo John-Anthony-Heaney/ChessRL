@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>ChessRL — live training</title>
+<style>
+/* ------------------------------------------------------------------ tokens */
+:root {
+  --bg:        #f6f6f4;
+  --panel:     #ffffff;
+  --panel-2:   #fbfbfa;
+  --ink:       #14161b;
+  --ink-2:     #565d6b;
+  --ink-3:     #8a92a0;
+  --rule:      #e6e6e1;
+  --rule-2:    #f0f0ec;
+  --accent:    #3457d5;
+  --accent-2:  rgba(52, 87, 213, .13);
+  --good:      #17795a;
+  --good-2:    rgba(23, 121, 90, .14);
+  --warn:      #a8501f;
+  --warn-2:    rgba(168, 80, 31, .13);
+  --grid:      rgba(20, 22, 27, .07);
+  --s1: #3457d5; --s2: #0f8f8f; --s3: #b0762a; --s4: #8455c8;
+  --s5: #c05464; --s6: #4a7a2f; --s7: #6b7280;
+  --shadow: 0 1px 2px rgba(16, 18, 24, .05), 0 1px 1px rgba(16, 18, 24, .04);
+  --radius: 10px;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:      #0d0f12;
+    --panel:   #15181d;
+    --panel-2: #191d23;
+    --ink:     #e9ebef;
+    --ink-2:   #a2a9b6;
+    --ink-3:   #6e7684;
+    --rule:    #232830;
+    --rule-2:  #1c2027;
+    --accent:  #7ea1ff;
+    --accent-2: rgba(126, 161, 255, .16);
+    --good:    #4cc38a;
+    --good-2:  rgba(76, 195, 138, .16);
+    --warn:    #e0925f;
+    --warn-2:  rgba(224, 146, 95, .16);
+    --grid:    rgba(233, 235, 239, .09);
+    --s1: #7ea1ff; --s2: #4fc4c0; --s3: #dfae62; --s4: #b494ec;
+    --s5: #ee8a9c; --s6: #8dc46a; --s7: #98a0ad;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+  }
+}
+
+/* ------------------------------------------------------------------- base */
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv05", "ss01";
+}
+h1, h2, h3 { margin: 0; font-weight: 600; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums;
+       font-feature-settings: "tnum"; letter-spacing: -.01em; }
+
+/* ----------------------------------------------------------------- header */
+.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  padding: 10px clamp(12px, 2.4vw, 26px);
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+}
+@supports (backdrop-filter: blur(8px)) {
+  .top { background: color-mix(in srgb, var(--bg) 86%, transparent);
+         backdrop-filter: saturate(1.4) blur(10px); }
+}
+.brand { display: flex; align-items: baseline; gap: 8px; margin-right: auto; }
+.brand h1 { font-size: 15px; letter-spacing: -.01em; }
+.brand .sub { color: var(--ink-3); font-size: 12px; letter-spacing: .04em;
+              text-transform: uppercase; }
+.pick { display: flex; align-items: center; gap: 7px; }
+.pick > span { color: var(--ink-3); font-size: 11px; letter-spacing: .08em;
+               text-transform: uppercase; }
+select {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--panel); border: 1px solid var(--rule);
+  border-radius: 7px; padding: 4px 8px; max-width: 52vw;
+  box-shadow: var(--shadow);
+}
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.status { display: flex; align-items: center; gap: 7px; font-size: 12.5px;
+          color: var(--ink-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3);
+       flex: none; position: relative; }
+.status.live .dot { background: var(--good); }
+.status.live .dot::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  border: 1px solid var(--good); opacity: .55;
+  animation: pulse 2.2s ease-out infinite;
+}
+.status.done .dot { background: var(--ink-3); }
+.status.off  .dot { background: var(--warn); }
+@keyframes pulse { 0% { transform: scale(.6); opacity: .7; }
+                   100% { transform: scale(1.5); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .status.live .dot::after { animation: none; } }
+
+/* ------------------------------------------------------------------ strip */
+.wrap { padding: 14px clamp(12px, 2.4vw, 26px) 40px; }
+.strip {
+  display: grid; gap: 1px; background: var(--rule);
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  overflow: hidden; box-shadow: var(--shadow);
+  grid-template-columns: repeat(auto-fit, minmax(122px, 1fr));
+}
+.tile { background: var(--panel); padding: 9px 12px 10px; min-width: 0; }
+.tile .k { color: var(--ink-3); font-size: 10.5px; letter-spacing: .09em;
+           text-transform: uppercase; white-space: nowrap; }
+.tile .v { font-size: 19px; line-height: 1.25; margin-top: 2px;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .v small { font-size: 12px; color: var(--ink-3); font-weight: 400; }
+
+.notice {
+  margin-top: 12px; padding: 9px 12px; border-radius: var(--radius);
+  border: 1px solid var(--rule); background: var(--panel);
+  color: var(--ink-2); font-size: 13px;
+  display: flex; align-items: center; gap: 8px;
+}
+.notice.warn { border-color: color-mix(in srgb, var(--warn) 40%, var(--rule));
+               background: var(--warn-2); color: var(--ink); }
+.notice[hidden] { display: none; }
+
+/* --------------------------------------------------------------- sections */
+.sec { margin-top: 22px; }
+.sec[hidden] { display: none; }
+.sec > h2 {
+  font-size: 11px; letter-spacing: .11em; text-transform: uppercase;
+  color: var(--ink-3); margin: 0 0 9px 2px;
+  display: flex; align-items: center; gap: 9px;
+}
+.sec > h2::after { content: ""; height: 1px; flex: 1; background: var(--rule); }
+.grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 232px), 1fr));
+}
+
+/* ------------------------------------------------------------------- card */
+.card {
+  background: var(--panel); border: 1px solid var(--rule);
+  border-radius: var(--radius); padding: 10px 11px 9px;
+  box-shadow: var(--shadow); min-width: 0;
+  display: flex; flex-direction: column;
+}
+.card h3 {
+  font-size: 11.5px; font-weight: 550; color: var(--ink-2);
+  letter-spacing: .005em; line-height: 1.3;
+  display: flex; align-items: baseline; gap: 6px;
+  min-height: 30px;                 /* two lines: keeps every plot aligned */
+}
+.card h3 .key { color: var(--ink-3); font-size: 9.5px; font-family: var(--mono);
+                margin-left: auto; opacity: .55; white-space: nowrap;
+                overflow: hidden; text-overflow: ellipsis; max-width: 44%;
+                min-width: 0; }
+.row1 { display: flex; align-items: baseline; gap: 8px; margin-top: 3px;
+        min-height: 27px; }
+.val { font-size: 21px; line-height: 1.2; }
+.val.na { color: var(--ink-3); }
+.trend { margin-left: auto; font-size: 11px; color: var(--ink-3);
+         white-space: nowrap; display: flex; align-items: baseline; gap: 3px; }
+.trend .d { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.trend.up   { color: var(--ink-2); }
+.trend.down { color: var(--ink-2); }
+.trend.good { color: var(--good); }
+.trend.bad  { color: var(--warn); }
+
+.plot { position: relative; height: 58px; margin: 6px -2px 0; }
+.plot canvas { display: block; width: 100%; height: 100%; }
+.head { position: absolute; width: 5px; height: 5px; border-radius: 50%;
+        background: var(--s1); margin: -2.5px 0 0 -2.5px; top: 0; left: 0;
+        pointer-events: none; transition: transform .18s ease-out; }
+@media (prefers-reduced-motion: reduce) { .head { transition: none; } }
+.head[hidden] { display: none; }
+.head.nofx { transition: none; }     /* no fly-across when an axis rescales */
+
+.foot { display: flex; gap: 8px; margin-top: 5px; font-size: 10.5px;
+        color: var(--ink-3); min-height: 14px; align-items: baseline; }
+.foot .mx { margin-left: auto; }
+.foot b { font-weight: 500; font-family: var(--mono);
+          font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.legend { display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 5px;
+          font-size: 10.5px; color: var(--ink-3); }
+.legend i { display: inline-block; width: 7px; height: 7px; border-radius: 2px;
+            margin-right: 4px; vertical-align: baseline; }
+.legend b { font-weight: 500; color: var(--ink-2); font-family: var(--mono);
+            font-variant-numeric: tabular-nums; }
+
+/* headline */
+.card.headline { border-color: color-mix(in srgb, var(--accent) 34%, var(--rule));
+                 background: var(--panel); }
+.card.headline .plot { height: 132px; }
+.card.headline .val { font-size: 34px; letter-spacing: -.02em; }
+.card.headline h3 { font-size: 12.5px; color: var(--ink); }
+.card.headline .note { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+@media (min-width: 620px) { .card.headline { grid-column: span 2; } }
+
+.empty { color: var(--ink-3); font-size: 13px; padding: 28px 4px; }
+footer.legal { margin-top: 26px; color: var(--ink-3); font-size: 11.5px;
+               border-top: 1px solid var(--rule); padding-top: 10px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <h1>ChessRL</h1>
+    <span class="sub">live training</span>
+  </div>
+  <label class="pick"><span>run</span>
+    <select id="runsel" aria-label="run"></select>
+  </label>
+  <div class="status" id="status"><span class="dot"></span><span id="statustext">connecting…</span></div>
+</header>
+
+<div class="wrap">
+  <section class="strip" id="strip" aria-label="summary"></section>
+  <div class="notice" id="notice" hidden></div>
+  <div id="board"></div>
+  <div class="empty" id="empty">Waiting for the first generation…</div>
+  <footer class="legal">
+    Polling <span class="num" id="pollinfo">/api/telemetry</span> every 2&nbsp;s ·
+    charts are drawn point-by-point into a canvas; a full repaint happens only when an
+    axis has to grow.
+    <span class="num" id="paintinfo"></span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+(function () {
+
+/* ===================================================================== util */
+
+const POLL_MS = 2000, POLL_HIDDEN_MS = 10000, BACKOFF_MAX = 10000;
+const RUNS_MS = 15000, TREND_WINDOW = 10;
+
+const $ = (id) => document.getElementById(id);
+
+function num(v) {
+  return (typeof v === "number" && isFinite(v)) ? v : null;
+}
+
+function autoFmt(v) {
+  const a = Math.abs(v);
+  if (v === 0) return "0";
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + "M";
+  if (a >= 1e4) return Math.round(v).toLocaleString("en-US");
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 10) return v.toFixed(2);
+  if (a >= 1) return v.toFixed(3);
+  if (a >= 1e-3) return v.toFixed(4);
+  return v.toExponential(1);
+}
+
+const FMT = {
+  auto: autoFmt,
+  ratio: (v) => v.toFixed(3),
+  r2: (v) => v.toFixed(2),
+  pct: (v) => (100 * v).toFixed(1) + "%",
+  pct0: (v) => (100 * v).toFixed(0) + "%",
+  int: (v) => Math.round(v).toLocaleString("en-US"),
+  elo: (v) => Math.round(v).toLocaleString("en-US"),
+  sec: (v) => v < 10 ? v.toFixed(2) + "s" : v.toFixed(1) + "s",
+  sci: (v) => v === 0 ? "0" : v.toExponential(1),
+  perg: (v) => v.toFixed(1),
+};
+const fmtOf = (name) => FMT[name] || FMT.auto;
+
+function fmtDur(s) {
+  if (!isFinite(s) || s < 0) return "—";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), q = s % 60;
+  if (h) return h + "h " + String(m).padStart(2, "0") + "m";
+  if (m) return m + "m " + String(q).padStart(2, "0") + "s";
+  return q + "s";
+}
+
+function flatten(obj, prefix, out) {
+  out = out || {};
+  for (const k in obj) {
+    const v = obj[k], key = prefix ? prefix + "." + k : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) flatten(v, key, out);
+    else if (typeof v === "number" && isFinite(v)) out[key] = v;
+  }
+  return out;
+}
+
+function css(el, name) {
+  return getComputedStyle(el).getPropertyValue(name).trim();
+}
+
+/* ================================================================== charts */
+
+/* Canvas line / stacked-area plot that appends one point at a time and only
+   repaints in full when a domain has to change. */
+function Chart(canvas, opts) {
+  this.cv = canvas;
+  this.ctx = canvas.getContext("2d");
+  this.opts = opts;                 /* {mode, fixed:[lo,hi], include:[], refs:[]} */
+  this.series = [];                 /* [{color}] */
+  this.xs = [];
+  this.ys = [];
+  this.x0 = null; this.x1 = null;
+  this.y0 = 0; this.y1 = 1;
+  this.dmin = Infinity; this.dmax = -Infinity;
+  this.w = 0; this.h = 0; this.dpr = 1;
+  this.ready = false;
+  this.pad = { t: 4, b: 4, l: 1, r: 1 };
+  Chart.all.push(this);
+}
+Chart.all = [];
+Chart.repaints = 0;
+Chart.appends = 0;
+
+Chart.prototype.addSeries = function (spec) {
+  this.series.push(spec);
+  const col = new Array(this.xs.length).fill(null);
+  this.ys.push(col);
+  this.ready = false;
+};
+
+Chart.prototype.color = function (i) {
+  const s = this.series[i];
+  return css(this.cv, s.varName || "--s1") || "#888";
+};
+
+/* "#rrggbb" -> "rgba(r,g,b,a)"; anything else returns null so the caller can
+   fall back to a flat translucent fill. */
+Chart.prototype.rgba = function (col, a) {
+  if (!col || col.charAt(0) !== "#") return null;
+  let h = col.slice(1);
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (h.length !== 6) return null;
+  const n = parseInt(h, 16);
+  if (!isFinite(n)) return null;
+  return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," +
+         (n & 255) + "," + a + ")";
+};
+
+/* Vertical fade under a sparkline, cached until the colour or height moves. */
+Chart.prototype.fillGrad = function (col) {
+  const key = col + "|" + this.h;
+  if (this._gk === key) return this._g;
+  const top = this.rgba(col, .26), bot = this.rgba(col, .01);
+  this._gk = key;
+  if (!top) { this._g = null; return null; }
+  const g = this.ctx.createLinearGradient(0, this.pad.t, 0, this.h - this.pad.b);
+  g.addColorStop(0, top);
+  g.addColorStop(1, bot);
+  this._g = g;
+  return g;
+};
+
+Chart.prototype.resize = function () {
+  const r = this.cv.getBoundingClientRect();
+  const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  if (w === this.w && h === this.h && dpr === this.dpr) return false;
+  this.w = w; this.h = h; this.dpr = dpr;
+  this.cv.width = Math.round(w * dpr);
+  this.cv.height = Math.round(h * dpr);
+  this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  this.ready = false;
+  return true;
+};
+
+Chart.prototype.X = function (x) {
+  const span = (this.x1 - this.x0) || 1;
+  return this.pad.l + (x - this.x0) / span * (this.w - this.pad.l - this.pad.r);
+};
+Chart.prototype.Y = function (v) {
+  const span = (this.y1 - this.y0) || 1;
+  const inner = this.h - this.pad.t - this.pad.b;
+  return this.pad.t + (1 - (v - this.y0) / span) * inner;
+};
+
+/* The x axis is granted ~12% headroom, rounded to a round number, so that
+   most generations land inside the current frame and only need one segment
+   drawn.  The axis grows (and the chart repaints) a few dozen times over a
+   long run instead of once per generation. */
+Chart.prototype.nextX1 = function (maxX) {
+  const want = Math.max(8, (maxX - this.x0) * 1.12 + 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(want)));
+  const r = want / mag;
+  const q = r > 5 ? mag : (r > 2 ? mag / 2 : mag / 5);
+  return this.x0 + Math.max(8, Math.ceil(want / q) * q);
+};
+
+Chart.prototype.fitY = function (v) {
+  if (v == null) return false;
+  let changed = false;
+  if (v < this.dmin) { this.dmin = v; }
+  if (v > this.dmax) { this.dmax = v; }
+  if (this.opts.fixed) {
+    if (this.y0 !== this.opts.fixed[0] || this.y1 !== this.opts.fixed[1]) {
+      this.y0 = this.opts.fixed[0]; this.y1 = this.opts.fixed[1];
+      changed = true;
+    }
+    return changed;
+  }
+  let lo = this.dmin, hi = this.dmax;
+  for (const inc of (this.opts.include || [])) {
+    if (inc < lo) lo = inc;
+    if (inc > hi) hi = inc;
+  }
+  if (this.y1 > this.y0 && lo >= this.y0 && hi <= this.y1) return false;
+  if (hi - lo < 1e-12) {
+    const bump = Math.max(Math.abs(hi) * 0.08, 1e-6);
+    lo -= bump; hi += bump;
+  }
+  const pad = (hi - lo) * 0.22;       /* generous: refits stay rare */
+  this.y0 = lo - pad; this.y1 = hi + pad;
+  return true;
+};
+
+Chart.prototype.push = function (x, vals) {
+  const first = this.xs.length === 0;
+  if (first) { this.x0 = x; this.x1 = this.nextX1(x); }
+  this.xs.push(x);
+  for (let i = 0; i < this.ys.length; i++) this.ys[i].push(num(vals[i]));
+
+  let dirty = !this.ready;
+  if (x > this.x1) { this.x1 = this.nextX1(x); dirty = true; }
+  if (this.opts.mode === "stack") {
+    let sum = 0;
+    for (let i = 0; i < vals.length; i++) sum += num(vals[i]) || 0;
+    if (this.fitY(sum)) dirty = true;
+    if (this.fitY(0)) dirty = true;
+  } else {
+    for (let i = 0; i < vals.length; i++) if (this.fitY(num(vals[i]))) dirty = true;
+  }
+  this.lastFull = !!(first || dirty);
+  if (this.lastFull) this.repaint();
+  else this.append(this.xs.length - 1);
+};
+
+Chart.prototype.grid = function () {
+  const c = this.ctx;
+  c.clearRect(0, 0, this.w, this.h);
+  const gridCol = css(this.cv, "--grid") || "rgba(0,0,0,.08)";
+  c.lineWidth = 1;
+  /* a zero line, when zero is inside the frame and is not the floor */
+  if (this.y0 < 0 && this.y1 > 0) {
+    const y = Math.round(this.Y(0)) + .5;
+    c.strokeStyle = gridCol;
+    c.beginPath(); c.moveTo(0, y); c.lineTo(this.w, y); c.stroke();
+  }
+  for (const ref of (this.opts.refs || [])) {
+    if (ref.y < this.y0 || ref.y > this.y1) continue;
+    const y = Math.round(this.Y(ref.y)) + .5;
+    c.save();
+    c.strokeStyle = css(this.cv, "--warn") || "#a50";
+    c.globalAlpha = .5;
+    c.setLineDash([3, 3]);
+    c.beginPath(); c.moveTo(0, y); c.lineTo(this.w, y); c.stroke();
+    c.restore();
+    if (ref.label) {
+      c.save();
+      c.fillStyle = css(this.cv, "--ink-3") || "#888";
+      c.globalAlpha = .9;
+      c.font = '10px ' + (css(this.cv, "--sans") || "sans-serif");
+      c.textAlign = "right"; c.textBaseline = "bottom";
+      c.fillText(ref.label, this.w - 3, y - 2);
+      c.restore();
+    }
+  }
+};
+
+Chart.prototype.repaint = function () {
+  if (!this.w) { if (!this.resize()) return; }
+  Chart.repaints++;
+  this.grid();
+  const n = this.xs.length;
+  this.ready = true;
+  if (!n) return;
+  if (this.opts.mode === "stack") this.paintStack(1, n - 1, true);
+  else this.paintLines(1, n - 1, true);
+};
+
+Chart.prototype.append = function (i) {
+  Chart.appends++;
+  if (this.opts.mode === "stack") this.paintStack(i, i, false);
+  else this.paintLines(i, i, false);
+};
+
+/* Line mode.  `from`..`to` are segment end indices. */
+Chart.prototype.paintLines = function (from, to, full) {
+  const c = this.ctx, n = this.xs.length;
+  if (n === 0) return;
+  const single = this.series.length === 1;
+  for (let s = 0; s < this.series.length; s++) {
+    const ys = this.ys[s], col = this.color(s);
+    if (single) {
+      /* translucent area under the new segments */
+      c.save();
+      const grad = this.fillGrad(col);
+      if (grad) { c.fillStyle = grad; }
+      else { c.globalAlpha = .10; c.fillStyle = col; }
+      const base = this.h - this.pad.b;
+      for (let i = Math.max(1, from); i <= to; i++) {
+        const a = ys[i - 1], b = ys[i];
+        if (a == null || b == null) continue;
+        c.beginPath();
+        c.moveTo(this.X(this.xs[i - 1]), this.Y(a));
+        c.lineTo(this.X(this.xs[i]), this.Y(b));
+        c.lineTo(this.X(this.xs[i]), base);
+        c.lineTo(this.X(this.xs[i - 1]), base);
+        c.closePath(); c.fill();
+      }
+      c.restore();
+    }
+    c.save();
+    c.strokeStyle = col;
+    c.lineWidth = single ? 1.5 : 1.25;
+    c.lineJoin = "round"; c.lineCap = "round";
+    if (this.series[s].dash) c.setLineDash(this.series[s].dash);
+    c.beginPath();
+    let open = false;
+    for (let i = Math.max(1, from); i <= to; i++) {
+      const a = ys[i - 1], b = ys[i];
+      if (a == null || b == null) { open = false; continue; }
+      if (!open) { c.moveTo(this.X(this.xs[i - 1]), this.Y(a)); open = true; }
+      c.lineTo(this.X(this.xs[i]), this.Y(b));
+    }
+    c.stroke();
+    /* a lone first point would otherwise be invisible */
+    if (full && n === 1 && ys[0] != null) {
+      c.fillStyle = col;
+      c.beginPath();
+      c.arc(this.X(this.xs[0]), this.Y(ys[0]), 1.6, 0, 6.2832);
+      c.fill();
+    }
+    c.restore();
+  }
+};
+
+/* Stacked-area mode: one quad per band per step. */
+Chart.prototype.paintStack = function (from, to, full) {
+  const c = this.ctx;
+  const m = this.series.length;
+  for (let i = Math.max(1, from); i <= to; i++) {
+    const xa = this.X(this.xs[i - 1]), xb = this.X(this.xs[i]);
+    let accA = 0, accB = 0;
+    for (let s = 0; s < m; s++) {
+      const a = this.ys[s][i - 1] || 0, b = this.ys[s][i] || 0;
+      const ya0 = this.Y(accA), yb0 = this.Y(accB);
+      accA += a; accB += b;
+      if (a === 0 && b === 0) continue;
+      c.save();
+      c.fillStyle = this.color(s);
+      c.globalAlpha = .72;
+      c.beginPath();
+      c.moveTo(xa, ya0); c.lineTo(xb, yb0);
+      c.lineTo(xb, this.Y(accB)); c.lineTo(xa, this.Y(accA));
+      c.closePath(); c.fill();
+      c.restore();
+    }
+  }
+  if (full && this.xs.length === 1) {
+    /* single column: draw a thin bar so the mix is visible immediately */
+    let acc = 0;
+    const x = this.X(this.xs[0]);
+    for (let s = 0; s < m; s++) {
+      const v = this.ys[s][0] || 0;
+      if (v > 0) {
+        c.save(); c.fillStyle = this.color(s); c.globalAlpha = .72;
+        c.fillRect(x - 1.5, this.Y(acc + v), 3, this.Y(acc) - this.Y(acc + v));
+        c.restore();
+      }
+      acc += v;
+    }
+  }
+};
+
+Chart.prototype.headPos = function () {
+  const n = this.xs.length;
+  if (!n || !this.w) return null;
+  for (let i = n - 1; i >= 0; i--) {
+    const v = this.ys[0] ? this.ys[0][i] : null;
+    if (v != null) return { x: this.X(this.xs[i]), y: this.Y(v) };
+  }
+  return null;
+};
+
+Chart.prototype.reset = function () {
+  this.xs = [];
+  this.ys = this.series.map(() => []);
+  this.x0 = this.x1 = null;
+  this.dmin = Infinity; this.dmax = -Infinity;
+  this.y0 = 0; this.y1 = 1;
+  this.ready = false;
+  if (this.w) { this.ctx.clearRect(0, 0, this.w, this.h); }
+};
+
+/* ============================================================ metric specs */
+
+const GROUPS = [
+  ["value", "Value head — the collapse diagnostic"],
+  ["policy", "Policy head"],
+  ["optim", "Optimiser, gradients and data"],
+  ["ema", "EMA weights"],
+  ["play", "Self-play"],
+  ["speed", "Throughput"],
+  ["other", "Everything else the trainer reports"],
+];
+
+/* label, group, fmt, better ("up"/"down"/null), order */
+const SPEC = {
+  "value_mse_ratio": { label: "Value MSE ratio", group: "value", fmt: "ratio",
+    better: "down", order: 0, headline: true,
+    note: "value loss ÷ variance baseline · 1.00 means the head has stopped predicting and is emitting the mean",
+    refs: [{ y: 1, label: "mean predictor" }], include: [0, 1] },
+  "value_mse_outcome_ratio": { label: "MSE ratio · outcome only", group: "value",
+    fmt: "ratio", better: "down", order: 0.5,
+    refs: [{ y: 1, label: "mean predictor" }], include: [0, 1] },
+  "value_accuracy": { label: "Value sign accuracy", group: "value", fmt: "pct", better: "up", order: 1 },
+  "value_accuracy_decisive": { label: "Sign accuracy · decisive", group: "value", fmt: "pct", better: "up", order: 2 },
+  "value_pred_std": { label: "Prediction spread σ", group: "value", fmt: "ratio", better: "up", order: 2.5,
+    note: "σ → 0 is the collapse" },
+  "value_target_std": { label: "Target spread σ", group: "value", fmt: "ratio", order: 2.6 },
+  "value_mse": { label: "Value MSE", group: "value", fmt: "ratio", better: "down", order: 3 },
+  "value_mse_baseline": { label: "Variance baseline", group: "value", fmt: "ratio", order: 3.1 },
+  "value_mse_outcome": { label: "Value MSE · outcome", group: "value", fmt: "ratio", better: "down", order: 3.2 },
+  "value_mse_outcome_baseline": { label: "Outcome variance baseline", group: "value", fmt: "ratio", order: 3.3 },
+  "loss.value": { label: "Value loss (weighted)", group: "value", fmt: "ratio", better: "down", order: 4 },
+  "value_pred_mean": { label: "Prediction mean", group: "value", fmt: "ratio", order: 4.5 },
+  "value_target_mean": { label: "Target mean", group: "value", fmt: "ratio", order: 4.6 },
+  "mcts_root_value_mean": { label: "MCTS root value (mean)", group: "value", fmt: "ratio", order: 5 },
+  "value_mix": { label: "Bootstrap / outcome mix", group: "value", fmt: "ratio", order: 5.5 },
+  "draw_penalty": { label: "Draw penalty", group: "value", fmt: "r2", order: 6 },
+
+  "policy_kl": { label: "Policy KL", group: "policy", fmt: "ratio", better: "down", order: 10 },
+  "policy_top1": { label: "Top-1 agreement", group: "policy", fmt: "pct", better: "up", order: 11 },
+  "policy_entropy": { label: "Policy entropy", group: "policy", fmt: "ratio", order: 12 },
+  "target_entropy": { label: "Target entropy", group: "policy", fmt: "ratio", order: 13 },
+  "batch_target_entropy": { label: "Batch target entropy", group: "policy", fmt: "ratio", order: 14 },
+  "loss.policy": { label: "Policy loss", group: "policy", fmt: "ratio", better: "down", order: 15 },
+  "loss.total": { label: "Total loss", group: "policy", fmt: "ratio", better: "down", order: 16 },
+
+  "grad_value_share": { label: "Value share of trunk gradient", group: "optim",
+    fmt: "pct", better: "up", order: 18,
+    note: "how much of the trunk gradient comes from the value head" },
+  "grad_trunk_policy": { label: "Trunk gradient · from policy", group: "optim", fmt: "ratio", order: 18.1 },
+  "grad_trunk_value": { label: "Trunk gradient · from value", group: "optim", fmt: "ratio", order: 18.2 },
+  "grad_norm": { label: "Gradient norm · post-clip", group: "optim", fmt: "ratio", order: 20 },
+  "grad_norm_preclip": { label: "Gradient norm · pre-clip", group: "optim", fmt: "ratio", order: 19.5 },
+  "grad_norm_pre_clip": { label: "Gradient norm · pre-clip", group: "optim", fmt: "ratio", order: 19.5 },
+  "grad_clip": { label: "Clip threshold", group: "optim", fmt: "ratio", order: 21 },
+  "grad_clip_frac": { label: "Clip fraction", group: "optim", fmt: "pct", better: "down", order: 22 },
+  "clip_fraction": { label: "Clip fraction", group: "optim", fmt: "pct", better: "down", order: 22 },
+  "clip_frac": { label: "Clip fraction", group: "optim", fmt: "pct", better: "down", order: 22 },
+  "clipped_fraction": { label: "Clip fraction", group: "optim", fmt: "pct", better: "down", order: 22 },
+  "head_grad_norm": { label: "Head gradient norm", group: "optim", fmt: "ratio", order: 23 },
+  "head_grad_norm_preclip": { label: "Head gradient · pre-clip", group: "optim", fmt: "ratio", order: 23.1 },
+  "head_grad_clip": { label: "Head clip threshold", group: "optim", fmt: "ratio", order: 23.2 },
+  "head_clip_frac": { label: "Head clip fraction", group: "optim", fmt: "pct", better: "down", order: 23.3 },
+  "value_coef": { label: "Value loss weight", group: "optim", fmt: "r2", order: 23.6 },
+  "lr": { label: "Learning rate", group: "optim", fmt: "sci", order: 24 },
+  "in_warmup": { label: "In warm-up", group: "optim", fmt: "int", order: 24.5 },
+  "warmup_gens": { label: "Warm-up generations", group: "optim", fmt: "int", order: 24.6 },
+  "buffer_fill": { label: "Buffer fill", group: "optim", fmt: "pct", order: 25 },
+  "buffer_positions": { label: "Buffer positions", group: "optim", fmt: "int", order: 26 },
+  "steps": { label: "Optimiser steps", group: "optim", fmt: "int", order: 27 },
+  "train_positions": { label: "Train positions", group: "optim", fmt: "int", order: 28 },
+  "best_agent.lr_scale": { label: "Best agent LR scale", group: "optim", fmt: "ratio", order: 29 },
+
+  "elo": { label: "Elo", group: "play", fmt: "elo", better: "up", order: 30 },
+  "draw": { label: "Draw rate", group: "play", fmt: "pct", order: 31 },
+  "white_win": { label: "White win rate", group: "play", fmt: "pct", order: 32 },
+  "black_win": { label: "Black win rate", group: "play", fmt: "pct", order: 33 },
+  "term": { label: "Termination mix", group: "play", fmt: "pct", order: 34 },
+  "avg_len": { label: "Game length (plies)", group: "play", fmt: "perg", order: 35 },
+  "captures_per_game": { label: "Captures / game", group: "play", fmt: "perg", order: 36 },
+  "checks_per_game": { label: "Checks / game", group: "play", fmt: "perg", order: 37 },
+  "castle_rate": { label: "Castles / game", group: "play", fmt: "ratio", order: 38 },
+  "promo_rate": { label: "Promotions / game", group: "play", fmt: "ratio", order: 39 },
+  "ep_rate": { label: "En passant / game", group: "play", fmt: "ratio", order: 40 },
+  "recorded_per_game": { label: "Positions kept / game", group: "play", fmt: "perg", order: 36.5 },
+  "resign_false_positive_rate": { label: "Resign false positives", group: "play", fmt: "pct", better: "down", order: 41 },
+  "resign_checks": { label: "Resign checks", group: "play", fmt: "int", order: 42 },
+  "resign_would": { label: "Resigns avoided", group: "play", fmt: "int", order: 43 },
+  "full_search_frac": { label: "Full-search fraction", group: "play", fmt: "pct", order: 44 },
+  "cap_frac": { label: "Capped-search fraction", group: "play", fmt: "pct", order: 45 },
+  "cap_sims": { label: "Capped sims", group: "play", fmt: "int", order: 46 },
+
+  "ema_agree_top1": { label: "EMA top-1 agreement", group: "ema", fmt: "pct", order: 60 },
+  "ema_value_l1": { label: "EMA value L1 gap", group: "ema", fmt: "ratio", better: "down", order: 61 },
+  "ema_h2h_score": { label: "EMA head-to-head score", group: "ema", fmt: "ratio", order: 62 },
+  "ema_h2h_games": { label: "EMA head-to-head games", group: "ema", fmt: "int", order: 63 },
+  "best_is_ema": { label: "Best agent is the EMA", group: "ema", fmt: "int", order: 64 },
+  "ema_decay": { label: "EMA decay", group: "ema", fmt: "auto", order: 65 },
+
+  "gps": { label: "Games / second", group: "speed", fmt: "perg", better: "up", order: 50 },
+  "sec": { label: "Generation time", group: "speed", fmt: "sec", better: "down", order: 51 },
+  "selfplay_sec": { label: "Self-play time", group: "speed", fmt: "sec", order: 52 },
+  "learn_sec": { label: "Learning time", group: "speed", fmt: "sec", order: 53 },
+  "evals_per_sec": { label: "Net evals / second", group: "speed", fmt: "int", better: "up", order: 54 },
+  "evals_per_move": { label: "Evals / move", group: "speed", fmt: "perg", order: 55 },
+  "evals": { label: "Evals this generation", group: "speed", fmt: "int", order: 56 },
+  "games": { label: "Games this generation", group: "speed", fmt: "int", order: 57 },
+  "plies": { label: "Plies this generation", group: "speed", fmt: "int", order: 58 },
+  "sims_per_move": { label: "Sims / move", group: "speed", fmt: "int", order: 59 },
+
+  "best_agent.i": { label: "Best agent index", group: "other", fmt: "int", order: 900 },
+  "best_agent.material_shaping_weight": {
+    label: "Material shaping weight", group: "other", fmt: "ratio", order: 901,
+    note: "audit field — must stay 0" },
+};
+
+/* Keys folded into a composite chart and therefore not charted on their own. */
+const COMPOSITES = [
+  { id: "elo", keys: ["elo_best", "elo_mean", "elo_p10"],
+    names: ["best", "mean", "p10"], vars: ["--s1", "--s2", "--s7"],
+    dashes: [null, null, [2, 2]] },
+];
+const FOLDED = new Set();
+COMPOSITES.forEach((c) => c.keys.forEach((k) => FOLDED.add(k)));
+
+const STACK_PREFIX = "term.";
+const STACK_ID = "term";
+const STACK_VARS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
+
+/* ==================================================================== cards */
+
+const board = $("board");
+const sections = {};
+for (const [id, title] of GROUPS) {
+  const sec = document.createElement("section");
+  sec.className = "sec";
+  sec.hidden = true;
+  const h = document.createElement("h2");
+  h.textContent = title;
+  const g = document.createElement("div");
+  g.className = "grid";
+  sec.appendChild(h); sec.appendChild(g);
+  board.appendChild(sec);
+  sections[id] = { sec, grid: g };
+}
+
+const metrics = new Map();     /* id -> metric */
+let ro = null;
+if (window.ResizeObserver) {
+  ro = new ResizeObserver((entries) => {
+    for (const e of entries) {
+      const m = metrics.get(e.target.dataset.mid);
+      if (m && m.chart.resize()) { m.chart.repaint(); m.place(true); }
+    }
+  });
+}
+
+function insertOrdered(grid, node, order) {
+  for (const child of grid.children) {
+    if (Number(child.dataset.order) > order) { grid.insertBefore(node, child); return; }
+  }
+  grid.appendChild(node);
+}
+
+function makeMetric(id, spec, seriesSpecs, chartOpts) {
+  const group = spec.group || "other";
+  const host = sections[group] || sections.other;
+  const card = document.createElement("article");
+  card.className = "card" + (spec.headline ? " headline" : "");
+  card.dataset.order = String(spec.order == null ? 1000 : spec.order);
+  card.dataset.mid = id;
+
+  const h3 = document.createElement("h3");
+  h3.textContent = spec.label || id;
+  if (!spec.headline && (spec.label || id) !== id) {
+    const k = document.createElement("span");
+    k.className = "key"; k.textContent = id;
+    h3.appendChild(k);
+  }
+
+  const row1 = document.createElement("div");
+  row1.className = "row1";
+  const val = document.createElement("span");
+  val.className = "val num na"; val.textContent = "—";
+  const trend = document.createElement("span");
+  trend.className = "trend";
+  trend.innerHTML = '<span class="a"></span><span class="d"></span>' +
+                    '<span class="w" style="opacity:.7"></span>';
+  row1.appendChild(val); row1.appendChild(trend);
+
+  const plot = document.createElement("div");
+  plot.className = "plot";
+  plot.dataset.mid = id;
+  const cv = document.createElement("canvas");
+  const head = document.createElement("span");
+  head.className = "head"; head.hidden = true;
+  plot.appendChild(cv); plot.appendChild(head);
+
+  const foot = document.createElement("div");
+  foot.className = "foot";
+  const mn = document.createElement("span"), mx = document.createElement("span");
+  mn.innerHTML = 'min <b>—</b>'; mx.className = "mx"; mx.innerHTML = 'max <b>—</b>';
+  foot.appendChild(mn); foot.appendChild(mx);
+
+  card.appendChild(h3); card.appendChild(row1); card.appendChild(plot);
+
+  const stacked = !!(chartOpts && chartOpts.mode === "stack");
+  let legend = null;
+  if (!stacked) card.appendChild(foot);
+  if (seriesSpecs.length > 1 || stacked) {
+    legend = document.createElement("div");
+    legend.className = "legend";
+    card.appendChild(legend);
+  }
+  if (spec.note) {
+    const note = document.createElement("div");
+    note.className = "note";
+    note.style.cssText = "font-size:11px;color:var(--ink-3);margin-top:4px";
+    note.textContent = spec.note;
+    card.appendChild(note);
+  }
+
+  insertOrdered(host.grid, card, Number(card.dataset.order));
+  host.sec.hidden = false;
+
+  const chart = new Chart(cv, chartOpts || {});
+  seriesSpecs.forEach((s) => chart.addSeries(s));
+  chart.resize();
+  if (ro) ro.observe(plot);
+
+  const fmt = fmtOf(spec.fmt);
+  const m = {
+    id, spec, chart, card, legend,
+    keys: seriesSpecs.map((s) => s.key),
+    seriesSpecs,
+    vals: [],            /* primary-series history for trend / min / max */
+    mnEl: mn.querySelector("b"), mxEl: mx.querySelector("b"),
+    valEl: val, trendEl: trend, headEl: head, plotEl: plot,
+    min: Infinity, max: -Infinity,
+
+    addKey(key, varName) {
+      this.keys.push(key);
+      this.seriesSpecs.push({ key, varName, name: key.slice(STACK_PREFIX.length) });
+      this.chart.addSeries({ key, varName });
+      /* backfill so the new band lines up with the existing x values */
+      const col = this.chart.ys[this.chart.ys.length - 1];
+      while (col.length < this.chart.xs.length) col.push(0);
+      this.chart.repaint();
+    },
+
+    push(x, flat) {
+      const vals = this.keys.map((k) => num(flat[k]));
+      this.chart.push(x, vals);
+      const v = vals[0];
+      this.vals.push(v);
+      if (v != null) {
+        if (v < this.min) this.min = v;
+        if (v > this.max) this.max = v;
+      }
+      this.render();
+    },
+
+    render() {
+      const n = this.vals.length;
+      let v = n ? this.vals[n - 1] : null;
+      let suffix = "";
+      if (stacked && n) {
+        /* a mix has no single "value": show the band that dominates now */
+        let bestI = -1, bestV = -Infinity;
+        for (let i = 0; i < this.chart.ys.length; i++) {
+          const col = this.chart.ys[i], lv = col.length ? col[col.length - 1] : null;
+          if (lv != null && lv > bestV) { bestV = lv; bestI = i; }
+        }
+        if (bestI >= 0) { v = bestV; suffix = " " + this.seriesSpecs[bestI].name; }
+      }
+      if (v == null) { this.valEl.textContent = "—"; this.valEl.classList.add("na"); }
+      else {
+        this.valEl.textContent = fmt(v);
+        this.valEl.classList.remove("na");
+      }
+      if (suffix) {
+        const s = document.createElement("small");
+        s.style.cssText = "font-size:11px;color:var(--ink-3);margin-left:5px";
+        s.textContent = suffix.trim();
+        this.valEl.appendChild(s);
+      }
+
+      if (this.min < Infinity) this.mnEl.textContent = fmt(this.min);
+      if (this.max > -Infinity) this.mxEl.textContent = fmt(this.max);
+
+      /* trend over the last TREND_WINDOW generations */
+      const t = this.trendEl;
+      let ref = null, back = 0;
+      for (let i = n - 2; i >= Math.max(0, n - 1 - TREND_WINDOW); i--) {
+        if (this.vals[i] != null) { ref = this.vals[i]; back = (n - 1) - i; }
+      }
+      t.className = "trend";
+      if (stacked || v == null || ref == null) {
+        t.querySelector(".a").textContent = "";
+        t.querySelector(".d").textContent = "";
+        t.querySelector(".w").textContent = "";
+      } else {
+        const d = v - ref;
+        const scale = Math.max(Math.abs(ref), Math.abs(v), 1e-9);
+        const flat = Math.abs(d) < scale * 0.005;
+        t.querySelector(".a").textContent = flat ? "→" : (d > 0 ? "↑" : "↓");
+        t.querySelector(".d").textContent = flat ? "" :
+          (d > 0 ? "+" : "−") + fmt(Math.abs(d)).replace("−", "");
+        t.querySelector(".w").textContent = back + "g";
+        if (!flat && this.spec.better) {
+          const good = (this.spec.better === "up") === (d > 0);
+          t.classList.add(good ? "good" : "bad");
+        } else if (!flat) {
+          t.classList.add(d > 0 ? "up" : "down");
+        }
+      }
+
+      if (this.legend) {
+        const parts = [];
+        for (let i = 0; i < this.seriesSpecs.length; i++) {
+          const s = this.seriesSpecs[i];
+          const col = this.chart.ys[i];
+          const last = col.length ? col[col.length - 1] : null;
+          if (this.chart.opts.mode === "stack" && (last == null || last <= 0)) continue;
+          parts.push('<span><i style="background:var(' + (s.varName || "--s1") +
+            ')"></i>' + s.name + " <b>" +
+            (last == null ? "—" : fmt(last)) + "</b></span>");
+        }
+        this.legend.innerHTML = parts.join("");
+      }
+      this.place();
+    },
+
+    place(jump) {
+      const p = this.chart.headPos();
+      if (!p || this.chart.opts.mode === "stack" || this.seriesSpecs.length > 1) {
+        this.headEl.hidden = true; return;
+      }
+      /* The marker eases to the new point as a generation lands, but must not
+         animate across the card when the axis itself moved. */
+      if (jump || this.chart.lastFull) this.headEl.classList.add("nofx");
+      this.headEl.hidden = false;
+      this.headEl.style.transform = "translate(" + p.x.toFixed(1) + "px," +
+                                    p.y.toFixed(1) + "px)";
+      if (this.headEl.classList.contains("nofx")) {
+        const el = this.headEl;
+        requestAnimationFrame(() => el.classList.remove("nofx"));
+      }
+    },
+
+    reset() {
+      this.chart.reset();
+      this.vals = [];
+      this.min = Infinity; this.max = -Infinity;
+      this.render();
+    },
+  };
+  metrics.set(id, m);
+  return m;
+}
+
+function ensureMetric(key, flat) {
+  if (metrics.has(key)) return metrics.get(key);
+  const spec = Object.assign({ label: prettify(key), group: "other", fmt: "auto",
+                               order: 1000 }, SPEC[key] || {});
+  const chartOpts = { refs: spec.refs, include: spec.include, fixed: spec.fixed };
+  const m = makeMetric(key, spec, [{ key, varName: "--s1", name: spec.label }],
+                       chartOpts);
+  /* backfill the generations already on screen so the x axis stays aligned */
+  for (let i = 0; i < state.gens.length; i++) m.push(state.gens[i], {});
+  return m;
+}
+
+function prettify(key) {
+  const leaf = key.split(".").pop();
+  return leaf.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+function ensureComposites() {
+  for (const c of COMPOSITES) {
+    if (metrics.has(c.id)) continue;
+    const spec = SPEC[c.id] || { label: c.id, group: "other", order: 1000 };
+    const series = c.keys.map((k, i) => ({
+      key: k, varName: c.vars[i], name: c.names[i], dash: c.dashes[i] }));
+    const m = makeMetric(c.id, spec, series, { refs: spec.refs });
+    for (let i = 0; i < state.gens.length; i++) m.push(state.gens[i], {});
+  }
+}
+
+function ensureStack(flat) {
+  const keys = Object.keys(flat).filter((k) => k.indexOf(STACK_PREFIX) === 0);
+  if (!keys.length) return null;
+  let m = metrics.get(STACK_ID);
+  if (!m) {
+    const spec = SPEC[STACK_ID];
+    const series = keys.map((k, i) => ({
+      key: k, varName: STACK_VARS[i % STACK_VARS.length],
+      name: k.slice(STACK_PREFIX.length) }));
+    m = makeMetric(STACK_ID, spec, series,
+                   { mode: "stack", fixed: [0, 1] });
+    for (let i = 0; i < state.gens.length; i++) m.push(state.gens[i], {});
+  } else {
+    for (const k of keys) {
+      if (m.keys.indexOf(k) < 0) {
+        m.addKey(k, STACK_VARS[m.keys.length % STACK_VARS.length]);
+      }
+    }
+  }
+  return m;
+}
+
+/* Used when the viewer switches run: the next run may report a different set
+   of fields, so the cards are rebuilt from scratch rather than left empty. */
+function destroyAll() {
+  for (const m of metrics.values()) {
+    if (ro) ro.unobserve(m.plotEl);
+    const i = Chart.all.indexOf(m.chart);
+    if (i >= 0) Chart.all.splice(i, 1);
+    m.card.remove();
+  }
+  metrics.clear();
+  for (const id in sections) sections[id].sec.hidden = true;
+}
+
+/* =================================================================== state */
+
+const state = {
+  runId: null, token: null, have: 0, total: 0,
+  gens: [], lastX: 0,
+  sumSec: 0, sumGames: 0, recentSec: [],
+  last: null, live: false, trainer: null, connected: true,
+  age: null, runs: [], resync: false,
+};
+
+function resetAll() {
+  state.gens = []; state.lastX = 0; state.have = 0; state.total = 0;
+  state.sumSec = 0; state.sumGames = 0; state.recentSec = []; state.last = null;
+  for (const m of metrics.values()) m.reset();
+}
+
+function ingest(rows) {
+  for (const row of rows) {
+    const flat = flatten(row);
+    /* The headline number.  Newer trainers publish it directly; for older runs
+       it is value loss ÷ the variance baseline, which is the same quantity. */
+    if (flat["value_mse_ratio"] == null) {
+      const vb = flat["value_mse_baseline"];
+      const vl = flat["value_mse"] != null ? flat["value_mse"] : flat["loss.value"];
+      if (vb != null && vl != null && vb > 1e-12) flat["value_mse_ratio"] = vl / vb;
+    }
+
+    const gv = num(flat["gen"]);
+    const x = (gv != null && gv > state.lastX) ? gv : state.lastX + 1;
+    state.lastX = x;
+
+    ensureComposites();
+    ensureStack(flat);
+    for (const k in flat) {
+      if (k === "gen" || FOLDED.has(k) || k.indexOf(STACK_PREFIX) === 0) continue;
+      ensureMetric(k, flat);
+    }
+    for (const m of metrics.values()) m.push(x, flat);
+    state.gens.push(x);
+
+    state.sumSec += num(flat["sec"]) || 0;
+    state.sumGames += num(flat["games"]) || 0;
+    const s = num(flat["sec"]);
+    if (s != null) {
+      state.recentSec.push(s);
+      if (state.recentSec.length > 10) state.recentSec.shift();
+    }
+    state.last = flat;
+  }
+}
+
+/* ================================================================== header */
+
+const TILES = [
+  ["gen", "Generation"], ["elapsed", "Elapsed"], ["eta", "ETA"],
+  ["gps", "Games / sec"], ["games", "Total games"], ["elo", "Elo best"],
+];
+const strip = $("strip");
+const tileEls = {};
+for (const [id, label] of TILES) {
+  const t = document.createElement("div");
+  t.className = "tile";
+  t.innerHTML = '<div class="k">' + label + '</div><div class="v num">—</div>';
+  strip.appendChild(t);
+  tileEls[id] = t.querySelector(".v");
+}
+
+function renderHeader() {
+  const f = state.last;
+  const target = state.trainer && state.trainer.gens ? state.trainer.gens : null;
+  if (!f) {
+    for (const k in tileEls) tileEls[k].textContent = "—";
+    return;
+  }
+  const gen = state.lastX;
+  tileEls.gen.innerHTML = FMT.int(gen) +
+    (target ? ' <small>/ ' + FMT.int(target) + "</small>" : "");
+  tileEls.elapsed.textContent = fmtDur(state.sumSec);
+
+  const mean = state.recentSec.length
+    ? state.recentSec.reduce((a, b) => a + b, 0) / state.recentSec.length : null;
+  if (target && mean != null && state.live && target > gen) {
+    tileEls.eta.textContent = fmtDur(mean * (target - gen));
+  } else if (target && target <= gen) {
+    tileEls.eta.textContent = "done";
+  } else if (mean != null) {
+    tileEls.eta.innerHTML = FMT.sec(mean) + ' <small>/ gen</small>';
+  } else {
+    tileEls.eta.textContent = "—";
+  }
+
+  const gps = num(f["gps"]);
+  tileEls.gps.textContent = gps == null ? "—" : gps.toFixed(1);
+  tileEls.games.textContent = FMT.int(state.sumGames);
+  const elo = num(f["elo_best"]);
+  tileEls.elo.innerHTML = elo == null ? "—" : FMT.elo(elo) +
+    (num(f["elo_mean"]) != null ? ' <small>/ ' + FMT.elo(f["elo_mean"]) + "</small>" : "");
+}
+
+const statusEl = $("status"), statusText = $("statustext");
+const notice = $("notice"), emptyEl = $("empty");
+
+function renderStatus() {
+  let cls = "status", text;
+  if (!state.connected) {
+    cls += " off";
+    text = "disconnected — retrying";
+  } else if (!state.total) {
+    cls += " done";
+    text = "waiting for data";
+  } else if (state.live) {
+    cls += " live";
+    text = "live" + (state.trainer && state.trainer.pid ? " · pid " + state.trainer.pid : "") +
+      (state.age != null ? " · " + Math.max(0, Math.round(state.age)) + "s ago" : "");
+  } else {
+    cls += " done";
+    text = "finished · " + fmtDur(state.age || 0) + " ago";
+  }
+  statusEl.className = cls;
+  statusText.textContent = text;
+  emptyEl.hidden = state.total > 0;
+  $("paintinfo").textContent = " · " + Chart.repaints.toLocaleString("en-US") +
+    " repaints / " + Chart.appends.toLocaleString("en-US") + " appended points";
+}
+
+function setNotice(msg, warn) {
+  if (!msg) { notice.hidden = true; return; }
+  notice.hidden = false;
+  notice.textContent = msg;
+  notice.className = "notice" + (warn ? " warn" : "");
+}
+
+/* ================================================================= polling */
+
+const runsel = $("runsel");
+let timer = null, backoff = POLL_MS, runsTimer = 0;
+
+function schedule(ms) {
+  clearTimeout(timer);
+  timer = setTimeout(tick, ms);
+}
+
+async function loadRuns() {
+  const r = await fetch("api/runs", { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const d = await r.json();
+  state.runs = d.runs || [];
+  const cur = state.runId || d.default;
+  runsel.innerHTML = "";
+  for (const run of state.runs) {
+    const o = document.createElement("option");
+    o.value = run.id;
+    o.textContent = run.name + " · " + (run.gens || 0) + " gen" +
+      (run.live ? " · live" : "");
+    runsel.appendChild(o);
+  }
+  if (!state.runs.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "no runs found";
+    runsel.appendChild(o);
+  }
+  if (cur && state.runs.some((x) => x.id === cur)) {
+    state.runId = cur;
+    runsel.value = cur;
+  } else if (state.runs.length) {
+    state.runId = state.runs[0].id;
+    runsel.value = state.runId;
+  }
+}
+
+async function tick() {
+  try {
+    if (!state.runId || Date.now() - runsTimer > RUNS_MS) {
+      runsTimer = Date.now();
+      await loadRuns();
+    }
+    if (!state.runId) {
+      state.connected = true;
+      setNotice("No run found. Start one with " +
+                "./build/chessrl az --run runs/NAME", false);
+      renderStatus();
+      schedule(POLL_MS);
+      return;
+    }
+    const url = "api/telemetry?run=" + encodeURIComponent(state.runId) +
+                "&since=" + state.have;
+    const r = await fetch(url, { cache: "no-store" });
+    if (r.status === 404) {
+      state.connected = true;
+      setNotice("Run “" + state.runId + "” is not on the server any more.", true);
+      state.runId = null;
+      schedule(POLL_MS);
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+
+    state.connected = true;
+    backoff = POLL_MS;
+
+    const stale = (d.token !== state.token) || (d.total < state.have) ||
+                  (d.from > state.have);
+    if (stale) {
+      state.token = d.token;
+      resetAll();
+      if (d.from > 0) { schedule(0); return; }    /* refetch from the start */
+    }
+
+    state.total = d.total;
+    state.live = !!(d.run && d.run.live);
+    state.age = d.run ? d.run.age : null;
+    state.trainer = d.trainer || null;
+
+    if (d.rows && d.rows.length) {
+      ingest(d.rows);
+      state.have = d.from + d.rows.length;
+    } else {
+      state.have = Math.min(state.have, d.total);
+    }
+
+    if (d.run && !d.run.exists) {
+      setNotice("Waiting for " + (d.run.file || "telemetry.jsonl") +
+                " — the run has not written a generation yet.", false);
+    } else if (d.skipped) {
+      setNotice(d.skipped + " unparseable line(s) in the telemetry file were skipped.", true);
+    } else {
+      setNotice(null);
+    }
+
+    renderHeader();
+    renderStatus();
+    schedule(d.more ? 0 : (document.hidden ? POLL_HIDDEN_MS : POLL_MS));
+  } catch (err) {
+    state.connected = false;
+    renderStatus();
+    setNotice("Cannot reach the dashboard server (" + (err && err.message) +
+              "). Retrying every " + Math.round(backoff / 1000) + "s.", true);
+    backoff = Math.min(BACKOFF_MAX, Math.round(backoff * 1.5));
+    schedule(backoff);
+  }
+}
+
+runsel.addEventListener("change", () => {
+  state.runId = runsel.value || null;
+  state.token = null;
+  destroyAll();
+  resetAll();
+  try { localStorage.setItem("chessrl.live.run", state.runId || ""); } catch (e) {}
+  if (location.hash.slice(1) !== state.runId) {
+    history.replaceState(null, "", "#" + encodeURIComponent(state.runId || ""));
+  }
+  renderHeader(); renderStatus();
+  schedule(0);
+});
+
+window.addEventListener("hashchange", () => {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h && h !== state.runId) { runsel.value = h; runsel.dispatchEvent(new Event("change")); }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) schedule(0);
+});
+
+/* repaint every chart when the colour scheme flips */
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  const onScheme = () => { for (const c of Chart.all) c.repaint();
+                           for (const m of metrics.values()) m.render(); };
+  if (mq.addEventListener) mq.addEventListener("change", onScheme);
+  else if (mq.addListener) mq.addListener(onScheme);
+}
+window.addEventListener("resize", () => {
+  for (const m of metrics.values()) {
+    if (m.chart.resize()) { m.chart.repaint(); m.place(true); }
+  }
+});
+
+/* boot */
+const fromHash = decodeURIComponent(location.hash.slice(1));
+let stored = "";
+try { stored = localStorage.getItem("chessrl.live.run") || ""; } catch (e) {}
+state.runId = fromHash || stored || null;
+renderStatus();
+tick();
+
+/* exposed for the smoke test in tests/ and for console poking */
+window.__live = { state, metrics, Chart, ingest, flatten, fmtDur, autoFmt };
+
+})();
+</script>
+</body>
+</html>

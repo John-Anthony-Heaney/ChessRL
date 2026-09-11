@@ -6,6 +6,12 @@
  * every training run meaningless.  So every parameter tensor is compared
  * against central finite differences of the actual forward pass.
  *
+ * Every parameter tensor means EVERY one: the LayerNorm gains and biases
+ * (g0/c0, g1/c1, gv/cv) and the value head's hidden layer (Wvh/bvh) are checked
+ * exactly like the weight matrices, because a normalisation whose backward pass
+ * is subtly wrong is the easiest way in the world to train a network that
+ * almost works.
+ *
  * Sections
  *   1. feature encoding + side-to-move mirroring
  *   2. move keys
@@ -427,7 +433,7 @@ static void test_move_keys(void)
 
 /* ==================================================== 3. GRADIENT CHECK */
 
-#define NTENSOR 14
+#define NTENSOR 26
 
 typedef struct {
     const char *name;
@@ -448,7 +454,9 @@ typedef struct {
 } Stat;
 
 static const char *TENSOR_NAMES[NTENSOR] = {
-    "W0", "b0", "W1", "b1", "z", "Wv", "bv", "Wp",
+    "W0", "b0", "g0", "c0", "W1", "b1", "g1", "c1",
+    "W0v", "b0v", "g0v", "c0v",
+    "z", "Wvh", "bvh", "gv", "cv", "Wv", "bv", "Wp",
     "Efrom", "Eto", "Epc", "Epromo", "Ecap", "Bft"
 };
 
@@ -461,6 +469,9 @@ static const char *GRAD_FENS[] = {
     "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",         /* en passant  */
 };
 #define NGRAD_FEN ((int)(sizeof GRAD_FENS / sizeof GRAD_FENS[0]))
+
+/* Total number of relu gates in one forward pass. */
+#define NGATE (NF_ACC + NF_HID + NF_VACC + NF_VHID)
 
 /* Forward pass + scalar loss, plus the relu gate pattern so kinks can be seen. */
 static double fwd_loss(const Trunk *t, const Head *h, const uint16_t *fidx, int nf,
@@ -476,8 +487,15 @@ static double fwd_loss(const Trunk *t, const Head *h, const uint16_t *fidx, int 
     L += (double)dv * (double)fw.v;
     if (fwout) *fwout = fw;
     if (gate) {
-        for (int i = 0; i < NF_ACC; i++) gate[i] = fw.acc[i] > 0.0f;
-        for (int j = 0; j < NF_HID; j++) gate[NF_ACC + j] = fw.z2[j] > 0.0f;
+        /* The three relu gate patterns, read off fields that survive the
+         * residual: h1 is a plain relu, the block's relu is h2 minus the
+         * identity term, and hv is a plain relu.  A central difference is only
+         * valid while all three are unchanged. */
+        int n = 0;
+        for (int i = 0; i < NF_ACC; i++)  gate[n++] = fw.h1[i] > 0.0f;
+        for (int j = 0; j < NF_HID; j++)  gate[n++] = (fw.h2[j] - fw.h1[j]) > 0.0f;
+        for (int i = 0; i < NF_VACC; i++) gate[n++] = fw.hv0[i] > 0.0f;
+        for (int k = 0; k < NF_VHID; k++) gate[n++] = fw.hv[k] > 0.0f;
     }
     return L;
 }
@@ -517,8 +535,30 @@ static void perturb_weights(Trunk *t, Head *h)
     for (size_t i = 0; i < (size_t)NF_ACC * NF_HID; i++) t->W1[i] += 0.02f * rnd_norm();
     for (int j = 0; j < NF_HID; j++) t->b1[j] += 0.30f * rnd_norm();
 
+    /* The LayerNorm gains start at exactly 1 and the biases at exactly 0.  A
+     * gain left at 1 would hide a missing factor of g in the backward pass and
+     * a bias left at 0 would hide a sign error, so both are moved well away
+     * from their initial values -- the gains stay positive so the relu gate
+     * pattern is not shredded. */
+    for (int i = 0; i < NF_ACC; i++) { t->g0[i] += 0.40f * rnd_sym(); t->c0[i] += 0.30f * rnd_norm(); }
+    for (int j = 0; j < NF_HID; j++) { t->g1[j] += 0.40f * rnd_sym(); t->c1[j] += 0.30f * rnd_norm(); }
+
+    for (size_t i = 0; i < (size_t)NF_INPUT * NF_VACC; i++) t->W0v[i] += 0.02f * rnd_norm();
+    for (int i = 0; i < NF_VACC; i++) {
+        t->b0v[i] += 0.30f * rnd_norm();
+        t->g0v[i] += 0.40f * rnd_sym();
+        t->c0v[i] += 0.30f * rnd_norm();
+    }
+
     for (int i = 0; i < NF_ACC; i++) h->z[i]  += 0.30f * rnd_norm();
-    for (int j = 0; j < NF_HID; j++) h->Wv[j] += 0.20f * rnd_norm();
+
+    for (size_t i = 0; i < (size_t)NF_VACC * NF_VHID; i++) h->Wvh[i] += 0.02f * rnd_norm();
+    for (int k = 0; k < NF_VHID; k++) {
+        h->bvh[k] += 0.30f * rnd_norm();
+        h->gv[k]  += 0.40f * rnd_sym();
+        h->cv[k]  += 0.30f * rnd_norm();
+        h->Wv[k]  += 0.20f * rnd_norm();
+    }
     h->bv[0] += 0.20f * rnd_norm();
     for (size_t i = 0; i < (size_t)NF_HID * NF_PDIM; i++) h->Wp[i]    += 0.02f * rnd_norm();
     for (size_t i = 0; i < (size_t)64 * NF_PDIM; i++)     h->Efrom[i] += 0.05f * rnd_norm();
@@ -595,7 +635,7 @@ static void grad_sweep(Trunk *t, Head *h, float H, double tol,
         grad_zero(tg, (int)TRUNK_NPARAM);
         grad_zero(hg, (int)HEAD_NPARAM);
         Fwd fw;
-        unsigned char gate0[NF_ACC + NF_HID];
+        unsigned char gate0[NGATE];
         fwd_loss(t, h, fidx, nf, keys, nm, dl, dv, &fw, gate0);
         nn_backward(t, h, &fw, fidx, nf, keys, nm, dl, dv, tg, hg);
 
@@ -621,6 +661,7 @@ static void grad_sweep(Trunk *t, Head *h, float H, double tol,
 
         if (verbose) {                    /* unreached entries must be exactly zero */
             check_zero_rows("W0",     tg->W0,    NF_INPUT, NF_ACC,  rows_w0, nf);
+            check_zero_rows("W0v",    tg->W0v,   NF_INPUT, NF_VACC, rows_w0, nf);
             check_zero_rows("Efrom",  hg->Efrom, 64, NF_PDIM, r_from,  n_from);
             check_zero_rows("Eto",    hg->Eto,   64, NF_PDIM, r_to,    n_to);
             check_zero_rows("Epc",    hg->Epc,    6, NF_PDIM, r_pc,    n_pc);
@@ -632,10 +673,22 @@ static void grad_sweep(Trunk *t, Head *h, float H, double tol,
         const Tensor ts[NTENSOR] = {
             { "W0",     t->W0,     tg->W0,     NF_INPUT*NF_ACC, NF_ACC,  rows_w0, nf,      NULL,  0 },
             { "b0",     t->b0,     tg->b0,     NF_ACC,          0,       NULL,    0,       NULL,  0 },
+            { "g0",     t->g0,     tg->g0,     NF_ACC,          0,       NULL,    0,       NULL,  0 },
+            { "c0",     t->c0,     tg->c0,     NF_ACC,          0,       NULL,    0,       NULL,  0 },
             { "W1",     t->W1,     tg->W1,     NF_ACC*NF_HID,   0,       NULL,    0,       NULL,  0 },
             { "b1",     t->b1,     tg->b1,     NF_HID,          0,       NULL,    0,       NULL,  0 },
+            { "g1",     t->g1,     tg->g1,     NF_HID,          0,       NULL,    0,       NULL,  0 },
+            { "c1",     t->c1,     tg->c1,     NF_HID,          0,       NULL,    0,       NULL,  0 },
+            { "W0v",    t->W0v,    tg->W0v,    NF_INPUT*NF_VACC, NF_VACC, rows_w0, nf,     NULL,  0 },
+            { "b0v",    t->b0v,    tg->b0v,    NF_VACC,         0,       NULL,    0,       NULL,  0 },
+            { "g0v",    t->g0v,    tg->g0v,    NF_VACC,         0,       NULL,    0,       NULL,  0 },
+            { "c0v",    t->c0v,    tg->c0v,    NF_VACC,         0,       NULL,    0,       NULL,  0 },
             { "z",      h->z,      hg->z,      NF_ACC,          0,       NULL,    0,       NULL,  0 },
-            { "Wv",     h->Wv,     hg->Wv,     NF_HID,          0,       NULL,    0,       NULL,  0 },
+            { "Wvh",    h->Wvh,    hg->Wvh,    NF_VACC*NF_VHID, 0,       NULL,    0,       NULL,  0 },
+            { "bvh",    h->bvh,    hg->bvh,    NF_VHID,         0,       NULL,    0,       NULL,  0 },
+            { "gv",     h->gv,     hg->gv,     NF_VHID,         0,       NULL,    0,       NULL,  0 },
+            { "cv",     h->cv,     hg->cv,     NF_VHID,         0,       NULL,    0,       NULL,  0 },
+            { "Wv",     h->Wv,     hg->Wv,     NF_VHID,         0,       NULL,    0,       NULL,  0 },
             { "bv",     h->bv,     hg->bv,     1,               0,       NULL,    0,       NULL,  0 },
             { "Wp",     h->Wp,     hg->Wp,     NF_HID*NF_PDIM,  0,       NULL,    0,       NULL,  0 },
             { "Efrom",  h->Efrom,  hg->Efrom,  64*NF_PDIM,      NF_PDIM, r_from,  n_from,  NULL,  0 },
@@ -666,7 +719,7 @@ static void grad_sweep(Trunk *t, Head *h, float H, double tol,
 
                 float *w = &T->w[idx];
                 const float orig = *w;
-                unsigned char gp[NF_ACC + NF_HID], gm[NF_ACC + NF_HID];
+                unsigned char gp[NGATE], gm[NGATE];
 
                 *w = orig + H;
                 const double Lp = fwd_loss(t, h, fidx, nf, keys, nm, dl, dv, NULL, gp);
@@ -732,13 +785,101 @@ static void test_gradients(void)
     nn_init(t, h, 0xC0FFEEULL);
     perturb_weights(t, h);
 
-    {   /* the check would be vacuous if a tensor were still all zero */
+    {   /* The check would be vacuous if a tensor were still at its initial
+         * value.  For the LayerNorm gains that means 1, not 0: a gradient bug
+         * that drops the gain entirely is invisible while g == 1. */
         double s_z = 0, s_bft = 0, s_wv = 0, s_b0 = 0, s_b1 = 0;
-        for (int i = 0; i < NF_ACC; i++) { s_z += fabs(h->z[i]); s_b0 += fabs(t->b0[i]); }
-        for (int i = 0; i < NF_HID; i++) { s_wv += fabs(h->Wv[i]); s_b1 += fabs(t->b1[i]); }
+        double s_wvh = 0, s_bvh = 0, s_cv = 0, s_c0 = 0, s_c1 = 0, s_b0v = 0, s_c0v = 0;
+        int g_at_one = 0;
+        for (int i = 0; i < NF_ACC; i++) {
+            s_z += fabs(h->z[i]); s_b0 += fabs(t->b0[i]); s_c0 += fabs(t->c0[i]);
+            if (t->g0[i] == 1.0f) g_at_one++;
+        }
+        for (int i = 0; i < NF_HID; i++) {
+            s_b1 += fabs(t->b1[i]); s_c1 += fabs(t->c1[i]);
+            if (t->g1[i] == 1.0f) g_at_one++;
+        }
+        for (int k = 0; k < NF_VHID; k++) {
+            s_wv += fabs(h->Wv[k]); s_bvh += fabs(h->bvh[k]); s_cv += fabs(h->cv[k]);
+            if (h->gv[k] == 1.0f) g_at_one++;
+        }
+        for (size_t i = 0; i < (size_t)NF_VACC * NF_VHID; i++) s_wvh += fabs(h->Wvh[i]);
+        for (int i = 0; i < NF_VACC; i++) {
+            s_b0v += fabs(t->b0v[i]); s_c0v += fabs(t->c0v[i]);
+            if (t->g0v[i] == 1.0f) g_at_one++;
+        }
         for (int i = 0; i < 64 * 64; i++) s_bft += fabs(h->Bft[i]);
-        CHECK(s_z > 0 && s_bft > 0 && s_wv > 0 && s_b0 > 0 && s_b1 > 0 && h->bv[0] != 0.0f,
+        CHECK(s_z > 0 && s_bft > 0 && s_wv > 0 && s_b0 > 0 && s_b1 > 0 && h->bv[0] != 0.0f &&
+              s_wvh > 0 && s_bvh > 0 && s_cv > 0 && s_c0 > 0 && s_c1 > 0 &&
+              s_b0v > 0 && s_c0v > 0,
               "every tensor must be non-zero before the gradient check");
+        CHECK(g_at_one == 0, "%d LayerNorm gains are still exactly 1: a missing "
+              "factor of g in the backward pass would not be visible", g_at_one);
+    }
+
+    /* ---- the two heads must be gradient-isolated --------------------------
+     * The whole point of giving the value head its own hidden layer is that
+     * those parameters are reached by the value loss and by nothing else.  That
+     * is a checkable claim: with dvalue = 0 every value-head tensor must come
+     * back EXACTLY zero, and with dlogits = 0 every policy tensor must.  (The
+     * trunk is shared on purpose and is excluded from both directions.) */
+    {
+        Trunk *tg = (Trunk *)malloc(sizeof(Trunk));
+        Head  *hg = (Head  *)malloc(sizeof(Head));
+        Position p;
+        uint16_t fidx[NF_MAXACTIVE];
+        Move mv[MAX_MOVES];
+        MoveKey keys[MAX_MOVES];
+        float dl[MAX_MOVES];
+        Fwd fw;
+
+        if (!tg || !hg || !pos_from_fen(&p, GRAD_FENS[1])) {
+            CHECK(0, "isolation setup");
+        } else {
+            const int nf = nn_features(&p, fidx);
+            const int nm = gen_legal(&p, mv);
+            for (int i = 0; i < nm; i++) nn_move_key(&p, mv[i], &keys[i]);
+            nn_eval(t, h, fidx, nf, &fw);
+
+            /* value loss only */
+            for (int i = 0; i < nm; i++) dl[i] = 0.0f;
+            grad_zero(tg, (int)TRUNK_NPARAM);
+            grad_zero(hg, (int)HEAD_NPARAM);
+            nn_backward(t, h, &fw, fidx, nf, keys, nm, dl, 0.7f, tg, hg);
+            int pol_nz = 0, val_nz = 0;
+            for (size_t i = 0; i < (size_t)NF_HID * NF_PDIM; i++) if (hg->Wp[i] != 0.0f) pol_nz++;
+            for (size_t i = 0; i < (size_t)64 * NF_PDIM; i++) {
+                if (hg->Efrom[i] != 0.0f) pol_nz++;
+                if (hg->Eto[i]   != 0.0f) pol_nz++;
+            }
+            for (int i = 0; i < 64 * 64; i++) if (hg->Bft[i] != 0.0f) pol_nz++;
+            for (size_t i = 0; i < (size_t)NF_VACC * NF_VHID; i++) if (hg->Wvh[i] != 0.0f) val_nz++;
+            CHECK(pol_nz == 0, "dvalue-only backward touched %d policy parameters", pol_nz);
+            CHECK(val_nz > 0, "dvalue-only backward left the value hidden layer at zero");
+
+            /* policy loss only */
+            for (int i = 0; i < nm; i++) dl[i] = 0.5f * rnd_sym();
+            grad_zero(tg, (int)TRUNK_NPARAM);
+            grad_zero(hg, (int)HEAD_NPARAM);
+            nn_backward(t, h, &fw, fidx, nf, keys, nm, dl, 0.0f, tg, hg);
+            int vnz = 0, pnz = 0;
+            for (size_t i = 0; i < (size_t)NF_VACC * NF_VHID; i++) if (hg->Wvh[i] != 0.0f) vnz++;
+            for (int k = 0; k < NF_VHID; k++) {
+                if (hg->bvh[k] != 0.0f) vnz++;
+                if (hg->gv[k]  != 0.0f) vnz++;
+                if (hg->cv[k]  != 0.0f) vnz++;
+                if (hg->Wv[k]  != 0.0f) vnz++;
+            }
+            if (hg->bv[0] != 0.0f) vnz++;
+            for (size_t i = 0; i < (size_t)NF_HID * NF_PDIM; i++) if (hg->Wp[i] != 0.0f) pnz++;
+            CHECK(vnz == 0, "dlogits-only backward touched %d value-head parameters", vnz);
+            CHECK(pnz > 0, "dlogits-only backward left Wp at zero");
+            printf("  head isolation: value-only backward touches 0 policy parameters, "
+                   "policy-only backward touches 0 of the %zu value-head parameters\n",
+                   (size_t)NF_VACC * NF_VHID + 3 * NF_VHID + NF_VHID + 1);
+        }
+        free(tg);
+        free(hg);
     }
 
     Stat a3[NTENSOR], a2[NTENSOR];
@@ -763,16 +904,114 @@ static void test_gradients(void)
         sum2 += a2[i].worst_abs;
     }
 
-    /* If the residual were a gradient bug it would be independent of h.  It is
-     * float32 finite-difference noise, so it must fall roughly as h grows. */
+    /* A real gradient error is independent of h.  The residual here is not: it
+     * is float32 ROUNDING, which falls as 1/h, plus the central difference's own
+     * TRUNCATION error (h^2/6) f''', which grows as h^2.  The normalisation
+     * layers make the loss genuinely nonlinear in every individual weight -- one
+     * weight moves the whole layer's mean and variance, and so every unit in it
+     * -- which makes the truncation term matter at h = 1e-2, so the fall is well
+     * short of the 10x that pure rounding would give.  The check is therefore
+     * that it falls; the positive control below is what gives the tolerance its
+     * teeth. */
     const double ratio = sum2 > 0.0 ? sum3 / sum2 : 0.0;
     printf("\n  worst tensor: %s %.3e at h=1e-3, %s %.3e at h=1e-2 (tolerance %.1e)\n",
            a3[worst3].name, a3[worst3].worst_rel, a2[worst2].name, a2[worst2].worst_rel, TOL);
-    printf("  residual scales as 1/h (sum of worst abs errors %.2e vs %.2e, ratio %.1fx)\n"
-           "  => the residual is float32 finite-difference noise, not a gradient error\n",
+    printf("  residual falls as h grows (sum of worst abs errors %.2e vs %.2e, ratio %.1fx)\n"
+           "  => rounding noise, not an h-independent gradient error\n",
            sum3, sum2, ratio);
-    CHECK(ratio > 3.0, "residual did not shrink with larger h (ratio %.2f); "
+    CHECK(ratio > 1.2, "residual did not shrink at all with larger h (ratio %.2f); "
           "that would indicate a real gradient error, not float noise", ratio);
+
+    /* ---- positive control ------------------------------------------------
+     * The h-scaling argument says the residual is noise.  This says the
+     * tolerance still has teeth: inject a 3%% systematic error into ONE tensor's
+     * analytic gradient and require the very same comparison to reject it.  A
+     * check that can never fail proves nothing. */
+    {
+        Trunk *tg = (Trunk *)malloc(sizeof(Trunk));
+        Head  *hg = (Head  *)malloc(sizeof(Head));
+        Position p;
+        uint16_t fidx[NF_MAXACTIVE];
+        Move mv[MAX_MOVES];
+        MoveKey keys[MAX_MOVES];
+        float dl[MAX_MOVES];
+        Fwd fw;
+        unsigned char g0[NGATE], gp[NGATE], gm[NGATE];
+
+        if (!tg || !hg || !pos_from_fen(&p, GRAD_FENS[1])) {
+            CHECK(0, "positive-control setup");
+        } else {
+            const int nf = nn_features(&p, fidx);
+            const int nm = gen_legal(&p, mv);
+            for (int i = 0; i < nm; i++) nn_move_key(&p, mv[i], &keys[i]);
+            for (int i = 0; i < nm; i++) dl[i] = 0.5f * rnd_sym();
+            const float dv = rnd_sym();
+            /* h = 1e-2 here, not 1e-3: the finite-difference noise floor is
+             * proportional to 1/h, and at 1e-3 it swamps every entry of dW1, so
+             * a 3% error in any of them is genuinely unresolvable and testing
+             * for it would test nothing. */
+            const float H = 1e-2f;
+
+            grad_zero(tg, (int)TRUNK_NPARAM);
+            grad_zero(hg, (int)HEAD_NPARAM);
+            fwd_loss(t, h, fidx, nf, keys, nm, dl, dv, &fw, g0);
+            nn_backward(t, h, &fw, fidx, nf, keys, nm, dl, dv, tg, hg);
+
+            const double Lscale = loss_scale(t, h, fidx, nf, keys, nm, dl, dv);
+            const double floor_abs = FD_KAPPA * (double)FLT_EPSILON * Lscale / (double)H;
+
+            /* Use the entries with the LARGEST analytic gradient: those are the
+             * ones a finite difference can resolve, so a 3% error in them is a
+             * fair test of the tolerance rather than a test of float noise. */
+            enum { NCTRL = 40 };
+            int top[NCTRL];
+            {
+                int n = 0;
+                for (int i = 0; i < NF_ACC * NF_HID; i++) {
+                    const float a = fabsf(tg->W1[i]);
+                    if (n < NCTRL) {
+                        top[n++] = i;
+                    } else {
+                        int worst = 0;
+                        for (int k = 1; k < NCTRL; k++)
+                            if (fabsf(tg->W1[top[k]]) < fabsf(tg->W1[top[worst]])) worst = k;
+                        if (a > fabsf(tg->W1[top[worst]])) top[worst] = i;
+                    }
+                }
+            }
+
+            int caught = 0, tried = 0;
+            for (int trial = 0; trial < NCTRL; trial++) {
+                const int idx = top[trial];
+                const double gana = (double)tg->W1[idx] * 1.03;   /* the injected 3%% */
+                if (fabs(gana) < 5.0 * floor_abs) continue;       /* unresolvable */
+
+                float *w = &t->W1[idx];
+                const float orig = *w;
+                *w = orig + H;
+                const double Lp = fwd_loss(t, h, fidx, nf, keys, nm, dl, dv, NULL, gp);
+                *w = orig - H;
+                const double Lm = fwd_loss(t, h, fidx, nf, keys, nm, dl, dv, NULL, gm);
+                *w = orig;
+                if (memcmp(gp, g0, sizeof g0) != 0 || memcmp(gm, g0, sizeof g0) != 0) continue;
+
+                const double gnum = (Lp - Lm) / (2.0 * (double)H);
+                double denom = fabs(gana) > fabs(gnum) ? fabs(gana) : fabs(gnum);
+                if (denom < floor_abs) denom = floor_abs;
+                tried++;
+                if (fabs(gnum - gana) / denom > TOL) caught++;
+            }
+            CHECK(tried >= 20, "positive control: only %d resolvable W1 entries", tried);
+            CHECK(caught * 4 >= tried * 3,
+                  "positive control: a 3%% error in dW1 was caught in only %d/%d entries -- "
+                  "the %.1e tolerance is too loose to detect a real gradient bug",
+                  caught, tried, TOL);
+            printf("  positive control: a 3%% error injected into dL/dW1 is rejected in "
+                   "%d of %d resolvable entries\n", caught, tried);
+        }
+        free(tg);
+        free(hg);
+    }
 
     free(t);
     free(h);
@@ -904,10 +1143,14 @@ static void test_accumulation(void)
         const float *a = (const float *)h1;
         for (size_t i = 0; i < HEAD_NPARAM; i++) if (a[i] != 0.0f) nzh++;
     }
-    dbl_exact("head z",  h1->z,  hg->z,  NF_ACC, &bad);
-    dbl_exact("head Wv", h1->Wv, hg->Wv, NF_HID, &bad);
-    dbl_exact("head bv", h1->bv, hg->bv, 1,      &bad);
-    dbl_exact("head Wp", h1->Wp, hg->Wp, (size_t)NF_HID * NF_PDIM, &bad);
+    dbl_exact("head z",   h1->z,   hg->z,   NF_ACC, &bad);
+    dbl_exact("head Wvh", h1->Wvh, hg->Wvh, (size_t)NF_VACC * NF_VHID, &bad);
+    dbl_exact("head bvh", h1->bvh, hg->bvh, NF_VHID, &bad);
+    dbl_exact("head gv",  h1->gv,  hg->gv,  NF_VHID, &bad);
+    dbl_exact("head cv",  h1->cv,  hg->cv,  NF_VHID, &bad);
+    dbl_exact("head Wv",  h1->Wv,  hg->Wv,  NF_VHID, &bad);
+    dbl_exact("head bv",  h1->bv,  hg->bv,  1,       &bad);
+    dbl_exact("head Wp",  h1->Wp,  hg->Wp,  (size_t)NF_HID * NF_PDIM, &bad);
     {
         uint8_t rf[MAX_MOVES], rt[MAX_MOVES], rp[MAX_MOVES], rr[MAX_MOVES], rc[MAX_MOVES];
         static double absS[64 * 64];
@@ -1266,6 +1509,31 @@ static void test_serialisation(void)
         remove(bad);
     }
 
+    /* A file that is LONGER than the layout demands must be rejected too: that
+     * is what a checkpoint from a build with a different NF_VACC / NF_VHID looks
+     * like, and neither width appears in the header. */
+    {
+        char big[512];
+        tmp_path(big, sizeof big, "long");
+        FILE *src = fopen(path, "rb");
+        FILE *dst = fopen(big, "wb");
+        CHECK(src != NULL && dst != NULL, "temp files open");
+        if (src && dst) {
+            unsigned char buf[8192];
+            size_t r;
+            while ((r = fread(buf, 1, sizeof buf, src)) > 0) fwrite(buf, 1, r, dst);
+            memset(buf, 0, sizeof buf);
+            fwrite(buf, 1, 4096, dst);          /* one extra tensor's worth */
+        }
+        if (src) fclose(src);
+        if (dst) fclose(dst);
+        int lna = NA, lgen = -1;
+        CHECK(model_load(big, t2, heads2, hy2, elo2, &lna, &lgen) == 0,
+              "an over-long file must be rejected (a different NF_VACC would look "
+              "exactly like this)");
+        remove(big);
+    }
+
     /* a bad magic must be rejected */
     {
         char bad[512];
@@ -1387,8 +1655,8 @@ int main(void)
 {
     chess_init();
 
-    printf("test_net: NF_INPUT=%d NF_ACC=%d NF_HID=%d NF_PDIM=%d\n",
-           NF_INPUT, NF_ACC, NF_HID, NF_PDIM);
+    printf("test_net: NF_INPUT=%d NF_ACC=%d NF_HID=%d NF_PDIM=%d NF_VACC=%d NF_VHID=%d\n",
+           NF_INPUT, NF_ACC, NF_HID, NF_PDIM, NF_VACC, NF_VHID);
     printf("          TRUNK_NPARAM=%zu HEAD_NPARAM=%zu\n", TRUNK_NPARAM, HEAD_NPARAM);
     seed_from_env();
 
