@@ -146,6 +146,29 @@ uint64_t perft(Position *p, int depth);
  * 518 is the classical starting array.  Every classical rule is unchanged. */
 #define CHESS960_CLASSICAL_ID 518
 
+/* ---- the full back-rank space --------------------------------------------
+ * All 5040 distinct arrangements of {R,R,N,N,B,B,Q,K}, indexed 0..5039 in
+ * lexicographic order of the piece-letter string (B<K<N<Q<R).  Chess960's 960
+ * arrays are the subset with bishops on opposite colours AND the king strictly
+ * between the rooks; dropping those constraints admits 2160 arrangements with
+ * same-coloured bishops, and 3360 where the king has rooks on only one side.
+ *
+ * Castling generalises cleanly.  A side has king-side rights only if a rook
+ * stands to the RIGHT of the king on the back rank, and the castling rook is
+ * the outermost such rook; queen-side is the mirror.  Destinations remain
+ * classical (king g1/c1, rook f1/d1).  This reduces exactly to Chess960, which
+ * reduces exactly to classical chess.  No arrangement has zero castling rights.
+ */
+#define BACKRANK_COUNT 5040
+/* Lexicographic index of the classical array RNBQKBNR. */
+#define BACKRANK_CLASSICAL_ID 4398
+
+void pos_startpos_backrank(Position *p, int id);  /* id taken modulo 5040       */
+int  pos_backrank_id(const Position *p);          /* inverse; -1 if not one     */
+int  pos_backrank_random(uint64_t *rng);
+int  pos_backrank_is_960(const Position *p);      /* also a legal 960 array?    */
+void game_start_backrank(Game *g, int id);
+
 void pos_startpos960(Position *p, int id);       /* id is taken modulo 960     */
 /* Scharnagl id of a back-rank arrangement, or -1 if it is not a legal 960 array. */
 int  pos_960_id(const Position *p);
