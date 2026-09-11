@@ -1388,6 +1388,401 @@ def run_self_ladder(args, out, quiet=False):
 
 
 # ==========================================================================
+# rating-scale conversion
+#
+# READ docs/RATING_SCALES.md BEFORE TRUSTING ANYTHING IN THIS SECTION.
+#
+# What the harness measures is a score against Stockfish running with
+# UCI_LimitStrength, turned into an Elo difference and added to that opponent's
+# UCI_Elo setting.  The result lives on Stockfish's UCI_Elo scale, which
+# Stockfish's own source says is a fit "anchored to the Stash engine", covering
+# "CCRL Blitz Elo from 1320 to 3190, approximately" (src/search.h).  CCRL Blitz
+# is an ENGINE-vs-ENGINE rating list.  It is not FIDE, and it is emphatically
+# not a chess.com Glicko rating.
+#
+# Everything below is therefore a POOL CONVERSION, not a measurement, and it
+# carries far more uncertainty than the match does.
+# ==========================================================================
+
+SCALES = ("uci", "chesscom", "fide", "lichess")
+
+SCALE_LABELS = {
+    "uci": "Stockfish UCI_Elo",
+    "chesscom": "chess.com Rapid",
+    "fide": "FIDE standard",
+    "lichess": "Lichess Rapid",
+}
+
+
+def convert_rating(uci_elo, scale):
+    """Map a UCI_Elo figure onto another rating pool.
+
+    Returns a dict.  ``in_range`` is False when the input falls outside the
+    anchors, in which case ``point`` is the value AT the nearest anchor and
+    ``bound_side`` says which side the input fell off.  The caller must not
+    present an out-of-range result as an estimate.
+    """
+    # ----------------------------------------------------------------------
+    # THE ANCHOR TABLE.  Change these numbers to change the assumptions.
+    #
+    # Built in two documented steps:
+    #
+    #   step 1 (ASSUMPTION, one number):  fide_equivalent = UCI_Elo + OFFSET,
+    #       and we set OFFSET = 0.  There is no published study that fixes it.
+    #       The two arguments that exist point in OPPOSITE directions and
+    #       bracket it at roughly -400 .. +300:
+    #         * CCRL's low-end engine ratings are widely held to UNDERSTATE
+    #           human-equivalent strength (TalkChess: an engine at CCRL 40/4
+    #           1712 plays "not that far from FIDE 2000").  That argues the
+    #           FIDE equivalent is HIGHER than the UCI_Elo number, i.e. OFFSET
+    #           around +300.
+    #         * a deliberately-handicapped strong engine blunders in a way no
+    #           human of that rating does, and play reports of Stockfish's
+    #           lowest settings put them well below their label.  That argues
+    #           the FIDE equivalent is LOWER, i.e. OFFSET around -400.
+    #       0 is the midpoint of that bracket, not a finding.  The bracket's
+    #       WIDTH is what CONV95 below is sized to cover.
+    #
+    #   step 2 (SOURCED):  FIDE <-> chess.com Rapid <-> Lichess Rapid, from the
+    #       ChessGoals rating comparison (updated July 2026, ~20,000 profiles).
+    #       Their FIDE column stops: they state there is "no accurate data for
+    #       players under about 1550 FIDE".  Rows at or above UCI_Elo 1740 sit
+    #       on their data; the two rows below it continue the lowest sourced
+    #       segment's slope and are marked "extrapolated" for that reason.
+    #
+    # Columns: UCI_Elo, chess.com Rapid, FIDE, Lichess Rapid, provenance.
+    # ----------------------------------------------------------------------
+    ANCHORS = [
+        (1320, 1020, 1320, 1440, "extrapolated"),  # Stockfish's own UCI_Elo floor
+        (1500, 1290, 1500, 1640, "extrapolated"),
+        (1740, 1655, 1740, 1905, "sourced"),       # ChessGoals: FIDE 1740 / cc blitz 1500
+        (1965, 1995, 1965, 2165, "sourced"),       # ChessGoals: FIDE 1965 / cc blitz 2000
+        (2245, 2260, 2245, 2400, "sourced"),       # ChessGoals: FIDE 2245 / cc blitz 2500
+        (2485, 2430, 2485, 2615, "sourced"),       # ChessGoals: FIDE 2485 / cc blitz 3000
+    ]
+
+    # 95% half-width of the POOL-CONVERSION error alone, in target-pool points.
+    # Sized from the +/-350ish bracket on step 1 carried through the local slope
+    # of the map, NOT from any published interval -- no such interval exists.
+    CONV95 = {"chesscom": 450, "fide": 350, "lichess": 400}
+    # Added in quadrature on the two rows that sit below the sourced FIDE data.
+    EXTRAP_EXTRA95 = 150
+
+    col = {"chesscom": 1, "fide": 2, "lichess": 3}[scale]
+    lo_anchor, hi_anchor = ANCHORS[0], ANCHORS[-1]
+
+    def interp(x):
+        """Piecewise-linear lookup; also returns the provenance of the segment."""
+        if x <= ANCHORS[0][0]:
+            return float(ANCHORS[0][col]), ANCHORS[0][4]
+        if x >= ANCHORS[-1][0]:
+            return float(ANCHORS[-1][col]), ANCHORS[-1][4]
+        for a, b in zip(ANCHORS, ANCHORS[1:]):
+            if a[0] <= x <= b[0]:
+                t = (x - a[0]) / float(b[0] - a[0])
+                prov = "extrapolated" if "extrapolated" in (a[4], b[4]) else "sourced"
+                return a[col] + t * (b[col] - a[col]), prov
+        return float(ANCHORS[-1][col]), ANCHORS[-1][4]
+
+    res = {
+        "scale": scale,
+        "label": SCALE_LABELS[scale],
+        "anchor_range": (lo_anchor[0], hi_anchor[0]),
+        "in_range": True,
+        "bound_side": None,
+        "provenance": None,
+        "conv95": None,
+        "point": None,
+    }
+
+    if uci_elo is None:
+        res["in_range"] = False
+        res["bound_side"] = "none"
+        return res
+
+    if uci_elo < lo_anchor[0]:
+        res["in_range"] = False
+        res["bound_side"] = "below"
+    elif uci_elo > hi_anchor[0]:
+        res["in_range"] = False
+        res["bound_side"] = "above"
+
+    clamped = min(max(uci_elo, lo_anchor[0]), hi_anchor[0])
+    value, prov = interp(clamped)
+    conv = CONV95[scale]
+    if prov == "extrapolated":
+        conv = math.sqrt(conv ** 2 + EXTRAP_EXTRA95 ** 2)
+
+    res["point"] = value
+    res["provenance"] = prov
+    res["conv95"] = conv
+    res["clamped_from"] = uci_elo
+    res["clamped_to"] = clamped
+    return res
+
+
+def convert_interval(point, lo, hi, scale):
+    """Convert a measured UCI_Elo point + 95% CI into a target-pool band.
+
+    The measurement CI is mapped through the (piecewise-linear, so locally
+    non-uniform) conversion first, then combined with the pool-conversion
+    uncertainty in quadrature.  Returns None when the point cannot be converted.
+    """
+    c = convert_rating(point, scale)
+    if c["point"] is None:
+        return None
+    p = c["point"]
+    m_lo = p - convert_rating(lo, scale)["point"] if lo is not None else None
+    m_hi = convert_rating(hi, scale)["point"] - p if hi is not None else None
+    # An open-ended measurement CI stays open-ended after conversion.
+    conv = c["conv95"]
+    out = dict(c)
+    out["meas95_lo"] = m_lo
+    out["meas95_hi"] = m_hi
+    out["band_lo"] = None if m_lo is None else p - math.sqrt(m_lo ** 2 + conv ** 2)
+    out["band_hi"] = None if m_hi is None else p + math.sqrt(m_hi ** 2 + conv ** 2)
+    widest_meas = max([v for v in (m_lo, m_hi) if v is not None], default=0.0)
+    out["conversion_dominates_by"] = (conv / widest_meas) if widest_meas > 0 else None
+    return out
+
+
+def round50(x):
+    return None if x is None else int(round(x / 50.0) * 50)
+
+
+# Lichess Rapid rating distribution, computed from the histogram Lichess itself
+# publishes at https://lichess.org/stat/rating/distribution/rapid
+# (477,455 active rapid players, read 2026-09-11).  This is real, primary data.
+LICHESS_RAPID_PCTL = [
+    (800, 1.9), (900, 3.9), (1000, 7.2), (1100, 11.9), (1200, 18.1),
+    (1300, 25.7), (1400, 33.9), (1500, 42.7), (1600, 51.7), (1700, 60.8),
+    (1800, 69.9), (1900, 78.0), (2000, 85.1), (2100, 90.7), (2200, 94.8),
+    (2300, 97.3), (2400, 98.8),
+]
+
+# chess.com Rapid percentiles.  chess.com does not publish a distribution, so
+# this is a COMMUNITY estimate (chess.com community blog, Aug 2026) and it
+# drifts fast -- the same pool had 1000 at the 49th percentile five years ago
+# and the low 80s today, because the beginner influx keeps moving the median.
+CHESSCOM_RAPID_PCTL = [
+    (400, 25.0), (600, 47.0), (800, 65.0), (1000, 80.0), (1200, 90.0),
+    (1400, 95.0), (1600, 97.5), (1800, 99.0),
+]
+
+PCTL_TABLES = {
+    "lichess": (LICHESS_RAPID_PCTL, "Lichess's own published rapid distribution"),
+    "chesscom": (CHESSCOM_RAPID_PCTL, "a COMMUNITY estimate, not chess.com data"),
+}
+
+
+def percentile_for(rating, scale):
+    tbl = PCTL_TABLES.get(scale)
+    if tbl is None or rating is None:
+        return None
+    rows, _ = tbl
+    if rating <= rows[0][0]:
+        return rows[0][1]
+    if rating >= rows[-1][0]:
+        return rows[-1][1]
+    for a, b in zip(rows, rows[1:]):
+        if a[0] <= rating <= b[0]:
+            t = (rating - a[0]) / float(b[0] - a[0])
+            return a[1] + t * (b[1] - a[1])
+    return None
+
+
+def collect_anchored_ratings(out):
+    """Every absolute UCI_Elo figure this run produced, with its 95% CI.
+
+    Only opponents that carry a real UCI_Elo anchor qualify.  A match against
+    ``random`` or ``material`` measures a difference against an unrated
+    opponent and yields no absolute rating at all -- that is not a gap to be
+    papered over, it is the correct answer.
+    """
+    found = []
+    lad = out.get("ladder") or {}
+    for e in lad.get("rungs", []):
+        a = e.get("absolute_elo")
+        if not a:
+            continue
+        found.append({
+            "via": e["name"], "anchor": a["anchor"], "kind": a["kind"],
+            "point": a.get("point"), "lo": a.get("lo"), "hi": a.get("hi"),
+            "score_pct": (e.get("summary") or {}).get("score_pct"),
+        })
+
+    # The single-match path: anchored only when the opponent was explicitly run
+    # with UCI_LimitStrength + UCI_Elo, which is the documented way to measure.
+    m = out.get("match")
+    opts = {k.lower(): v for k, v in (out.get("config", {}).get("opp_options") or {}).items()}
+    if m and opts.get("uci_limitstrength", "").strip().lower() in ("true", "1", "yes"):
+        try:
+            anchor = float(opts.get("uci_elo"))
+        except (TypeError, ValueError):
+            anchor = None
+        if anchor is not None:
+            el = m["elo"]
+            if el.get("point") is not None:
+                found.append({
+                    "via": "%s (match)" % m["b"]["name"], "anchor": anchor,
+                    "kind": "estimate", "point": anchor + el["point"],
+                    "lo": (anchor + el["lo"]) if el.get("lo") is not None else None,
+                    "hi": (anchor + el["hi"]) if el.get("hi") is not None else None,
+                    "score_pct": m.get("score_pct"),
+                })
+            elif el.get("bound") == "upper" and el.get("hi") is not None:
+                found.append({"via": "%s (match)" % m["b"]["name"], "anchor": anchor,
+                              "kind": "upper bound", "point": None, "lo": None,
+                              "hi": anchor + el["hi"], "score_pct": m.get("score_pct")})
+            elif el.get("bound") == "lower" and el.get("lo") is not None:
+                found.append({"via": "%s (match)" % m["b"]["name"], "anchor": anchor,
+                              "kind": "lower bound", "point": None,
+                              "lo": anchor + el["lo"], "hi": None,
+                              "score_pct": m.get("score_pct")})
+    return found
+
+
+def render_scale_section(out, scale):
+    """The converted report.  Never emitted for --scale uci."""
+    label = SCALE_LABELS[scale]
+    L = []
+    L.append("-" * 78)
+    L.append("RATING SCALE CONVERSION  ->  %s" % label)
+    L.append("-" * 78)
+    L.append("This is a conversion BETWEEN RATING POOLS, not a measurement.  The match")
+    L.append("measures strength on Stockfish's UCI_Elo scale, which Stockfish's own source")
+    L.append("anchors to CCRL Blitz -- an ENGINE-vs-engine list.  The target pool below")
+    L.append("(%s) has a different population.  docs/RATING_SCALES.md gives the" % label)
+    L.append("anchors, the sources and the size of the error; read it before quoting a")
+    L.append("number from here.")
+    L.append("")
+
+    found = collect_anchored_ratings(out)
+    if not found:
+        L.append("NO CONVERTED NUMBER: this run produced no absolute rating to convert.")
+        L.append("An absolute rating needs an opponent with a published rating.  The")
+        L.append("built-in 'random' and 'material' opponents have none, and a plain match")
+        L.append("against them measures only a difference against an unrated opponent.")
+        L.append("")
+        L.append("To get one, play a rating-anchored opponent:")
+        L.append("  python3 py/benchmark.py --ladder --opponent 'uci:/path/to/stockfish' \\")
+        L.append("      --scale %s" % scale)
+        L.append("  python3 py/benchmark.py --opponent 'uci:/path/to/stockfish' \\")
+        L.append("      --opp-option UCI_LimitStrength=true --opp-option UCI_Elo=1320 \\")
+        L.append("      --scale %s" % scale)
+        L.append("")
+        return "\n".join(L)
+
+    for f in found:
+        L.append("via %s" % f["via"])
+        L.append("  (opponent set to UCI_Elo %.0f; the champion scored %s against it)"
+                 % (f["anchor"],
+                    "%.1f%%" % f["score_pct"] if f.get("score_pct") is not None else "?"))
+
+        if f["kind"] != "estimate":
+            side = "BELOW" if f["kind"] == "upper bound" else "ABOVE"
+            b = f["hi"] if f["kind"] == "upper bound" else f["lo"]
+            L.append("  measured (Stockfish UCI_Elo) : %s %.0f (one-sided 95%% bound, the"
+                     % (side, b))
+            L.append("                                 match was a shutout)")
+            c = convert_rating(b, scale)
+            if c["point"] is None:
+                L.append("  converted (%s): NOT CONVERTED" % label)
+            else:
+                tag = "" if c["in_range"] else "  [OUTSIDE THE ANCHORS -- see the warning below]"
+                L.append("  converted (%s): %s roughly %d%s"
+                         % (label, side, round50(c["point"]), tag))
+                L.append("    A one-sided bound converts to a one-sided bound.  The +/-%d-point"
+                         % round(c["conv95"]))
+                L.append("    pool-conversion uncertainty applies to it as well, so treat it as")
+                L.append("    soft in both directions.")
+            _append_range_warning(L, f.get("hi") if f["kind"] == "upper bound" else f.get("lo"),
+                                  scale, label)
+            L.append("")
+            continue
+
+        meas = f["point"]
+        L.append("  measured (Stockfish UCI_Elo) : %.0f  [95%% CI %s - %s]"
+                 % (meas,
+                    "%.0f" % f["lo"] if f["lo"] is not None else "-inf",
+                    "%.0f" % f["hi"] if f["hi"] is not None else "+inf"))
+
+        conv = convert_interval(meas, f["lo"], f["hi"], scale)
+        if conv is None or not conv["in_range"]:
+            L.append("  converted (%s): NOT CONVERTED" % label)
+            _append_range_warning(L, meas, scale, label)
+            L.append("")
+            continue
+
+        lo50, hi50 = round50(conv["band_lo"]), round50(conv["band_hi"])
+        if lo50 is None or hi50 is None:
+            L.append("  converted (%s): NOT CONVERTED -- the measurement's own" % label)
+            L.append("    confidence interval is open-ended, so the converted band would be")
+            L.append("    open-ended too.  Play more games, or pick an anchor nearer 50%%.")
+            L.append("")
+            continue
+
+        L.append("  converted (%s): %d - %d" % (label, max(lo50, 0), hi50))
+        L.append("    (midpoint %d, rounded to the nearest 50 -- the band does not justify"
+                 % round50(conv["point"]))
+        L.append("     any more precision than that, and the midpoint is not the answer)")
+        mw = max(v for v in (conv["meas95_lo"], conv["meas95_hi"]) if v is not None)
+        L.append("    band = match error (+/-%d) and pool-conversion error (+/-%d), added in"
+                 % (round(mw), round(conv["conv95"])))
+        if conv["conversion_dominates_by"]:
+            L.append("    quadrature.  The conversion term is %.1fx the match term: playing more"
+                     % conv["conversion_dominates_by"])
+            L.append("    games will NOT meaningfully narrow this band.")
+        else:
+            L.append("    quadrature.")
+        if conv["provenance"] == "extrapolated":
+            L.append("    NOTE: this sits below the lowest FIDE data point the sources cover")
+            L.append("    (~1550 FIDE).  That segment of the anchor table is extrapolated, and")
+            L.append("    its extra uncertainty is already folded into the band above.")
+
+        p_lo, p_hi = percentile_for(max(lo50, 0), scale), percentile_for(hi50, scale)
+        if p_lo is not None and p_hi is not None:
+            _, note = PCTL_TABLES[scale]
+            L.append("    percentile: that band is stronger than roughly %.0f%% - %.0f%% of rated"
+                     % (p_lo, p_hi))
+            L.append("    %s players (source: %s)." % (label, note))
+        elif scale in PCTL_TABLES:
+            L.append("    percentile: no distribution is published for this pool.")
+        else:
+            L.append("    percentile: FIDE publishes no rating distribution, so none is given.")
+        if scale == "fide" and lo50 < 1400:
+            L.append("    NOTE: FIDE has not published a rating below 1400 since March 2024, and")
+            L.append("    every player then rated 1000-2000 was given a one-time increase.  Part")
+            L.append("    of this band is off the bottom of the FIDE list entirely.")
+        L.append("")
+
+    return "\n".join(L)
+
+
+def _append_range_warning(L, value, scale, label):
+    """Say plainly that we refused to extrapolate, and give the nearest bound."""
+    c = convert_rating(value, scale)
+    if c["in_range"] or c["point"] is None:
+        return
+    lo_a, hi_a = c["anchor_range"]
+    side = c["bound_side"]
+    L.append("    REFUSING TO EXTRAPOLATE.  %.0f is %s the anchor table, which covers"
+             % (value, "below" if side == "below" else "above"))
+    L.append("    UCI_Elo %d - %d." % (lo_a, hi_a))
+    if side == "below":
+        L.append("    %d is also Stockfish's own floor for UCI_Elo, so nothing below it has" % lo_a)
+        L.append("    even been calibrated by Stockfish, let alone mapped to a human pool.")
+    near = convert_rating(lo_a if side == "below" else hi_a, scale)
+    n_lo = round50(near["point"] - near["conv95"])
+    n_hi = round50(near["point"] + near["conv95"])
+    L.append("    Nearest bound: UCI_Elo %d converts to %s %d - %d."
+             % (lo_a if side == "below" else hi_a, label, max(n_lo, 0), n_hi))
+    L.append("    The measurement fell %s that anchor, so the only honest reading is"
+             % ("below" if side == "below" else "above"))
+    L.append("    \"somewhere %s that range\"." % ("below" if side == "below" else "above"))
+
+
+# ==========================================================================
 # rendering
 # ==========================================================================
 
@@ -1594,6 +1989,12 @@ def render_report(out):
         L.append("alpha-beta search sitting on top of it.")
         L.append("")
 
+    # --scale uci (the default) is the identity and adds nothing: the report
+    # above is already on the UCI_Elo scale, and must stay byte-identical.
+    scale = (out.get("config") or {}).get("scale", "uci")
+    if scale != "uci":
+        L.append(render_scale_section(out, scale))
+
     return "\n".join(L)
 
 
@@ -1729,10 +2130,20 @@ anchor:
    two wins, and should be given very little weight.  Prefer anchors where the
    score is near 50%.
 3. It is a *relative* rating against one engine's scale, not a FIDE rating, and
-   not a rating against humans.
+   not a rating against humans.  Stockfish's own source anchors `UCI_Elo` to
+   CCRL Blitz, an engine-versus-engine list.
 
 The right way to use it is to run several anchors and check that the estimates
 agree.  If they do not, the disagreement is the honest error bar.
+
+**Putting it on a human scale.**  `--scale {uci,chesscom,fide,lichess}` adds a
+section converting the anchored number onto another rating pool.  `uci` is the
+default and changes nothing.  Converting between rating pools is an
+approximation with an error bar roughly five times larger than the match's
+own, so the converted figure is always printed as a rounded range next to the
+measured `UCI_Elo` figure, never on its own.  Read `docs/RATING_SCALES.md`
+before quoting any converted number: it gives the anchor table, every source
+behind it, and an honest account of what could not be sourced.
 
 **The self-ladder.**  `--self-ladder` plays the champion's raw policy head
 (argmax over the policy, no search at all) against the same champion using
@@ -1930,6 +2341,12 @@ def parse_args(argv=None):
     p.add_argument("--self-games", type=int, default=40, help="games per self rung (default 40)")
     p.add_argument("--self-depths", default="1,2,4,6", help="search depths to test (default 1,2,4,6)")
 
+    p.add_argument("--scale", default="uci", choices=list(SCALES),
+                   help="rating pool to ALSO report the anchored rating on (default uci, "
+                        "which is the identity and changes nothing).  A non-uci scale adds "
+                        "a section showing the measured UCI_Elo figure AND a converted band "
+                        "that is deliberately much wider, because converting between rating "
+                        "pools is an approximation.  See docs/RATING_SCALES.md")
     p.add_argument("--json", default=None, metavar="PATH", help="write the full result as JSON")
     p.add_argument("--md", default=str(DEFAULT_MD), metavar="PATH",
                    help="append a summary here (default docs/BENCHMARK.md)")
@@ -2055,6 +2472,7 @@ def main(argv=None):
             "opp_options": args.opp_option_map,
             "resign_cp": args.resign_cp,
             "resign_plies": args.resign_plies,
+            "scale": args.scale,
         },
         "model": model_summary(args.model, args.agent),
     }

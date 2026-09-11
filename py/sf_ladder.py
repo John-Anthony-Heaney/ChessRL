@@ -14,8 +14,16 @@ Three ladders, because no single one covers the range:
 Usage:
   python3 py/sf_ladder.py [--games 60] [--threads 4] [--depth 4] [--policy-only]
                           [--groups nodes,skill,elo] [--out runs/sf_ladder.json]
+                          [--scale uci|chesscom|fide|lichess]
+
+--scale converts the best absolute anchor onto another rating pool.  That is a
+conversion between pools, not a measurement, and it is far less certain than
+the match is; see docs/RATING_SCALES.md.  The default, uci, converts nothing.
 """
 import argparse, json, os, subprocess, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchmark as B  # noqa: E402  -- the conversion lives there, in one place
 
 SF = "/opt/homebrew/bin/stockfish"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +86,9 @@ def main():
     ap.add_argument("--ply-cap", type=int, default=300)
     ap.add_argument("--groups", default="nodes,skill,elo")
     ap.add_argument("--out", default="runs/sf_ladder.json")
+    ap.add_argument("--scale", default="uci", choices=list(B.SCALES),
+                    help="also express the best absolute anchor on another rating pool "
+                         "(default uci = no conversion).  See docs/RATING_SCALES.md")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
@@ -147,9 +158,43 @@ def main():
                 and r["match"]["elo"].get("point") is not None]
     if anchored:
         best = min(anchored, key=lambda r: abs(r["match"]["score"] - 0.5))
-        est = best["rung"]["ref"] + best["match"]["elo"]["point"]
+        el = best["match"]["elo"]
+        est = best["rung"]["ref"] + el["point"]
         print(f"Best absolute anchor: {best['rung']['label']} at "
               f"{best['match']['score_pct']:.1f}%  ->  ~{est:.0f} Elo")
+        if args.scale != "uci":
+            lo = best["rung"]["ref"] + el["lo"] if el.get("lo") is not None else None
+            hi = best["rung"]["ref"] + el["hi"] if el.get("hi") is not None else None
+            label = B.SCALE_LABELS[args.scale]
+            print(f"  measured (Stockfish UCI_Elo): {est:.0f} "
+                  f"[95% CI {'-inf' if lo is None else f'{lo:.0f}'} - "
+                  f"{'+inf' if hi is None else f'{hi:.0f}'}]")
+            conv = B.convert_interval(est, lo, hi, args.scale)
+            if conv is None or not conv["in_range"]:
+                c = B.convert_rating(est, args.scale)
+                a_lo, a_hi = c["anchor_range"]
+                edge = a_lo if c["bound_side"] == "below" else a_hi
+                near = B.convert_rating(edge, args.scale)
+                print(f"  converted ({label}): NOT CONVERTED -- {est:.0f} is "
+                      f"{c['bound_side']} the anchor table (UCI_Elo {a_lo}-{a_hi}).")
+                print(f"    Refusing to extrapolate.  Nearest bound: UCI_Elo {edge} is "
+                      f"{label} "
+                      f"{max(B.round50(near['point'] - near['conv95']), 0)}-"
+                      f"{B.round50(near['point'] + near['conv95'])}; "
+                      f"the champion is {c['bound_side']} that.")
+            elif conv["band_lo"] is None or conv["band_hi"] is None:
+                print(f"  converted ({label}): NOT CONVERTED -- the measurement's own "
+                      f"CI is open-ended.")
+            else:
+                print(f"  converted ({label}): "
+                      f"{max(B.round50(conv['band_lo']), 0)} - {B.round50(conv['band_hi'])} "
+                      f"(nearest 50; midpoint {B.round50(conv['point'])} is not the answer)")
+                mw = max(v for v in (conv["meas95_lo"], conv["meas95_hi"]) if v is not None)
+                print(f"    match error +/-{mw:.0f} and pool-conversion error "
+                      f"+/-{conv['conv95']:.0f}, in quadrature.  Pool conversion is the "
+                      f"dominant term.")
+            print("    This is a conversion between rating pools, not a measurement. "
+                  "See docs/RATING_SCALES.md")
 
 
 if __name__ == "__main__":
