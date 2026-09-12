@@ -20,6 +20,7 @@
  *   5. AdamW: convergence, grad buffer zeroing, global-norm clipping
  *   6. model_save / model_load round-trip, header probe, capacity truncation
  *   7. micro-benchmark
+ *   8. nn_eval_batch against nn_eval, row by row, at fifteen batch sizes
  *
  * Build:
  *   cc -O1 -std=c11 -D_DARWIN_C_SOURCE -Isrc src/chess.c src/net.c \
@@ -1573,6 +1574,221 @@ static void test_serialisation(void)
 
 /* ======================================================== 7. BENCHMARK */
 
+/* =============================================== 8. the batched forward pass */
+/*
+ * nn_eval_batch() exists to turn the matrix-VECTOR products of a single
+ * evaluation into matrix-MATRIX products, and the only thing that makes that
+ * safe is this test: every row of every batch must be what nn_eval() would have
+ * produced for that row on its own.
+ *
+ * WHAT "THE SAME" MEANS HERE, AND WHY IT DEPENDS ON THE BUILD
+ * ----------------------------------------------------------
+ * Without Accelerate the batched kernels accumulate each output in the same
+ * four lanes in the same order as the unbatched one -- batching changes which
+ * rows are in flight, never how any one output is summed -- so the requirement
+ * is BIT-IDENTICAL, at every batch size, and that is what is asserted.  Not
+ * "close": memcmp over the whole Fwd struct, all 678 floats of it, plus the
+ * logits.
+ *
+ * Built with -DUSE_ACCELERATE the two trunk matrices go through cblas_sgemm,
+ * which blocks the K loop its own way and uses FMA: each dot product is then a
+ * differently-ORDERED sum of the same 128 products, so the last bits differ.
+ * Summation order cannot be legislated across a BLAS, so the requirement
+ * becomes a bound instead -- and the bound is set from what a regrouped float32
+ * sum of 128 terms can drift by, ~128 * 2^-24 relative in the worst case and
+ * far less in practice.  1e-5 absolute on v (which is a tanh output in [-1,1])
+ * and 1e-4 absolute on a logit leave two orders of magnitude of headroom over
+ * the largest deviation actually observed, so this fails on a broken kernel and
+ * not on a re-blocked one.  nn_batch_is_exact() says which rule applies.
+ *
+ * Both head layouts are exercised, because they take different code paths:
+ * GROUPED (every row the same agent, what a leaf-parallel search inside one
+ * game produces) uses the batched per-head layers, while MIXED (a different
+ * agent every row) falls back to per-row ones.  Sizes either side of the
+ * internal tile boundary are included on purpose.
+ */
+
+#define TB_POS   320     /* positions in the batch-test corpus */
+#define TB_HEADS 4
+#define TB_MAX   128     /* largest batch size tested */
+
+typedef struct {
+    uint16_t fidx[NF_MAXACTIVE];
+    int      nf;
+    int      nmoves;
+    MoveKey  keys[MAX_MOVES];
+} TbPos;
+
+static int tb_build(TbPos *pos, int want)
+{
+    Position p;
+    Move mv[MAX_MOVES];
+    int n = 0, plies = 0;
+
+    pos_startpos(&p);
+    while (n < want) {
+        const int nm = gen_legal(&p, mv);
+        if (nm == 0 || plies >= 140) { pos_startpos(&p); plies = 0; continue; }
+        TbPos *c = &pos[n++];
+        c->nf     = nn_features(&p, c->fidx);
+        c->nmoves = nm;
+        for (int i = 0; i < nm; i++) nn_move_key(&p, mv[i], &c->keys[i]);
+        Undo u;
+        make_move(&p, mv[rnd_int(nm)], &u);
+        plies++;
+    }
+    return n;
+}
+
+static void test_batch(void)
+{
+    section("8. batched forward pass (nn_eval_batch)");
+
+    printf("  backend \"%s\", internal tile %d, batched path is %s\n",
+           nn_backend(), nn_batch_tile(),
+           nn_batch_is_exact(nn_batch_tile()) ? "bit-exact against nn_eval at every size"
+                                              : "sgemm-based above 16 rows (equal to a tolerance)");
+
+    Trunk *t  = (Trunk *)malloc(sizeof(Trunk));
+    Head  *hs = (Head  *)malloc(sizeof(Head) * TB_HEADS);
+    TbPos *pos = (TbPos *)malloc(sizeof(TbPos) * TB_POS);
+    Fwd   *out = (Fwd *)  malloc(sizeof(Fwd) * TB_MAX);
+    if (!t || !hs || !pos || !out) { printf("  FAIL: OOM\n"); g_fail++; return; }
+
+    nn_init(t, &hs[0], 0x5EED0001ULL);
+    for (int i = 1; i < TB_HEADS; i++) nn_init(NULL, &hs[i], 0x5EED0001ULL + (uint64_t)i * 7919ULL);
+    /* Untrained weights are small and near-identical across heads; perturb so
+     * the test runs on a network whose activations have real spread and whose
+     * heads genuinely differ, as a trained population's do.  perturb_weights
+     * touches a trunk and a head together, so the extra heads are perturbed
+     * against a scratch trunk that is then thrown away. */
+    perturb_weights(t, &hs[0]);
+    {
+        Trunk *scratch = (Trunk *)malloc(sizeof(Trunk));
+        if (!scratch) { printf("  FAIL: OOM\n"); g_fail++; return; }
+        for (int i = 1; i < TB_HEADS; i++) {
+            nn_init(scratch, NULL, 0xC0FFEEULL + (uint64_t)i);
+            perturb_weights(scratch, &hs[i]);
+        }
+        free(scratch);
+    }
+
+    const int npos = tb_build(pos, TB_POS);
+    CHECK(npos == TB_POS, "batch corpus built (%d positions)", npos);
+
+    const int SIZES[] = {1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 31, 32, 33, 64, 128};
+    const int NSIZE = (int)(sizeof SIZES / sizeof SIZES[0]);
+
+    const Head    *bh[TB_MAX];
+    const uint16_t *bf[TB_MAX];
+    int             bn[TB_MAX];
+
+    double worst_v = 0.0, worst_l = 0.0, worst_fwd = 0.0;
+    long   nrows = 0, nexact = 0, nlogits = 0;
+    int    first_bad_size = 0;
+
+    for (int si = 0; si < NSIZE; si++) {
+        const int nb = SIZES[si];
+        for (int grouped = 0; grouped < 2; grouped++) {
+            for (int start = 0; start + nb <= npos; start += nb) {
+                for (int b = 0; b < nb; b++) {
+                    const TbPos *c = &pos[start + b];
+                    bf[b] = c->fidx;
+                    bn[b] = c->nf;
+                    bh[b] = grouped ? &hs[start % TB_HEADS] : &hs[(start + b) % TB_HEADS];
+                }
+
+                nn_eval_batch(t, bh, nb, bf, bn, out);
+
+                for (int b = 0; b < nb; b++) {
+                    const TbPos *c = &pos[start + b];
+                    Fwd one;
+                    nn_eval(t, bh[b], bf[b], bn[b], &one);
+
+                    nrows++;
+                    if (memcmp(&one, &out[b], sizeof(Fwd)) == 0) nexact++;
+                    else if (!first_bad_size) first_bad_size = nb;
+
+                    const float *a = (const float *)&one, *e = (const float *)&out[b];
+                    for (size_t k = 0; k < sizeof(Fwd) / sizeof(float); k++) {
+                        const double d = fabs((double)a[k] - (double)e[k]);
+                        if (d > worst_fwd) worst_fwd = d;
+                    }
+                    const double dv = fabs((double)one.v - (double)out[b].v);
+                    if (dv > worst_v) worst_v = dv;
+
+                    /* the logits the search actually consumes, from both Fwds */
+                    float l1[MAX_MOVES], l2[MAX_MOVES];
+                    nn_logits(bh[b], &one,     c->keys, c->nmoves, l1);
+                    nn_logits(bh[b], &out[b],  c->keys, c->nmoves, l2);
+                    for (int m = 0; m < c->nmoves; m++) {
+                        nlogits++;
+                        const double d = fabs((double)l1[m] - (double)l2[m]);
+                        if (d > worst_l) worst_l = d;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  %ld rows over %d batch sizes x {grouped, mixed heads}, %ld logits\n",
+           nrows, NSIZE, nlogits);
+
+    if (nn_batch_is_exact(TB_MAX)) {
+        CHECK(nexact == nrows,
+              "every batched row is BIT-IDENTICAL to nn_eval (%ld of %ld were; "
+              "first failure at batch size %d, worst |d| over Fwd %.3g)",
+              nexact, nrows, first_bad_size, worst_fwd);
+        CHECK(worst_l == 0.0, "batched logits are bit-identical (worst |d| %.3g)", worst_l);
+    } else {
+        printf("  bit-identical rows: %ld of %ld (sgemm regroups the sums)\n", nexact, nrows);
+        CHECK(worst_v < 1e-5,
+              "batched value within 1e-5 of nn_eval (worst %.3g)", worst_v);
+        CHECK(worst_l < 1e-4,
+              "batched logits within 1e-4 of nn_eval (worst %.3g)", worst_l);
+        CHECK(worst_fwd < 1e-3,
+              "every batched activation within 1e-3 of nn_eval (worst %.3g)", worst_fwd);
+    }
+    printf("  worst deviation from nn_eval: v %.3g, logit %.3g, any Fwd field %.3g\n",
+           worst_v, worst_l, worst_fwd);
+
+    /* A batch of one is the contract's easiest case and the one a caller is
+     * most likely to hit at the end of a search; it must be exact even with
+     * Accelerate, because nothing is batched at nbatch == 1. */
+    {
+        int bad1 = 0;
+        for (int i = 0; i < npos; i++) {
+            const Head *h1 = &hs[i % TB_HEADS];
+            const uint16_t *f1 = pos[i].fidx;
+            const int n1 = pos[i].nf;
+            Fwd single, batch1;
+            nn_eval(t, h1, f1, n1, &single);
+            nn_eval_batch(t, &h1, 1, &f1, &n1, &batch1);
+            if (memcmp(&single, &batch1, sizeof(Fwd)) != 0) bad1++;
+        }
+        CHECK(bad1 == 0, "nn_eval_batch at nbatch=1 is bit-identical to nn_eval "
+                         "(%d of %d rows differ)", bad1, npos);
+    }
+
+    /* Degenerate and boundary inputs must not walk off anything. */
+    {
+        const Head *h1 = &hs[0];
+        const uint16_t *f1 = pos[0].fidx;
+        const int n1 = pos[0].nf;
+        Fwd guard[2];
+        memset(guard, 0x5A, sizeof guard);
+        nn_eval_batch(t, &h1, 0, &f1, &n1, guard);      /* nbatch 0: a no-op */
+        const unsigned char *g = (const unsigned char *)guard;
+        int touched = 0;
+        for (size_t i = 0; i < sizeof guard; i++) if (g[i] != 0x5A) touched++;
+        CHECK(touched == 0, "nn_eval_batch(nbatch=0) writes nothing (%d bytes touched)", touched);
+    }
+
+    free(t); free(hs); free(pos); free(out);
+}
+
+/* =============================================================== */
+
 static void test_bench(void)
 {
     section("7. micro-benchmark (single core)");
@@ -1667,6 +1883,7 @@ int main(void)
     test_adam();
     test_serialisation();
     test_bench();
+    test_batch();
 
     printf("\n%s: %d checks, %d failures\n", g_fail ? "FAILED" : "PASSED", g_checks, g_fail);
     return g_fail ? 1 : 0;

@@ -154,6 +154,8 @@ static int cmd_az(int argc, char **argv)
     c.generations      = (int)opt_int(argc, argv, "--gens",            c.generations);
     c.games_per_agent  = (int)opt_int(argc, argv, "--games-per-agent", c.games_per_agent);
     c.threads          = (int)opt_int(argc, argv, "--threads",         c.threads);
+    c.games_in_flight  = (int)opt_int(argc, argv, "--games-in-flight",
+                                      c.games_in_flight);
     c.sims             = (int)opt_int(argc, argv, "--sims",            c.sims);
     c.max_plies        = (int)opt_int(argc, argv, "--max-plies",       c.max_plies);
     c.opening_plies    = (int)opt_int(argc, argv, "--opening-plies",   c.opening_plies);
@@ -253,6 +255,8 @@ static int cmd_lrfind(int argc, char **argv)
     c->n_agents        = (int)opt_int(argc, argv, "--agents",          c->n_agents);
     c->games_per_agent = (int)opt_int(argc, argv, "--games-per-agent", c->games_per_agent);
     c->threads         = (int)opt_int(argc, argv, "--threads",         c->threads);
+    c->games_in_flight = (int)opt_int(argc, argv, "--games-in-flight",
+                                      c->games_in_flight);
     c->sims            = (int)opt_int(argc, argv, "--sims",            c->sims);
     c->max_plies       = (int)opt_int(argc, argv, "--max-plies",       c->max_plies);
     c->opening_plies   = (int)opt_int(argc, argv, "--opening-plies",   c->opening_plies);
@@ -785,6 +789,11 @@ static int usage(void)
 "    --sims N              MCTS simulations per move       (default 64)\n"
 "    --games-per-agent N   games each agent plays per gen  (default 4)\n"
 "    --threads N           worker threads                  (default %d here)\n"
+"    --games-in-flight N   games each thread plays AT ONCE, whose pending\n"
+"                          MCTS leaves are evaluated in one batched network\n"
+"                          call.  The games are independent, so this changes\n"
+"                          throughput and nothing else; 1 is the old\n"
+"                          one-game-at-a-time loop, bit for bit  (default 8)\n"
 "    --batch N             minibatch positions             (default 256)\n"
 "    --steps N             optimiser steps per generation  (default 200)\n"
 "    --lr X --lr-final X --wd X --clip X --clip-head X --value-coef X\n"

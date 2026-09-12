@@ -260,6 +260,10 @@ void nn_move_key(const Position *p, Move m, MoveKey *k)
  * the norm does not remove.
  */
 
+/* Every width norm_stats is called with must fit the scratch buffer inside it. */
+_Static_assert(NF_HID <= NF_ACC && NF_VACC <= NF_ACC && NF_VHID <= NF_ACC,
+               "norm_stats' scratch is sized by NF_ACC");
+
 /* Returns 1/sigma and writes the mean through mu_out.
  *
  * BOTH reductions are single serial chains and must stay that way: summing them
@@ -269,12 +273,35 @@ void nn_move_key(const Position *p, Move m, MoveKey *k)
  * ROWS of the batch in the four lanes instead -- each lane is still the same
  * serial chain -- which is the whole trick in nn_norm4_stats() below.
  *
- * contract(off) on the variance loop is deliberate: with contraction left to
- * the compiler, `ss += d * d` became an fmaf at one call site and a mul+add at
- * another purely because of how the surrounding function had been inlined, and
- * the two differ in the last ULP.  Pinning it makes the result a property of
- * this source rather than of the inliner's mood, and it costs nothing measurable
- * (the multiply is off the critical path; the add's latency is the chain). */
+ * The explicit fmaf() in the variance loop is not decoration, and neither is
+ * the fact that it is ONE loop.
+ *
+ * Written the obvious way, `ss += d * d` under -ffp-contract=fast, clang fused
+ * the multiply-add at one call site and not at another, purely because of how
+ * the surrounding function had been inlined, and the two differ in the last
+ * ULP.  That alone made nn_eval_batch disagree with nn_eval on 3 rows in 64, by
+ * up to 1.9e-9 on v, because the batched and unbatched paths reach this
+ * function through different inlining.  Spelling the fusion out removes the
+ * choice, and every kernel below uses FMA for the same reason: what this file
+ * computes should be a property of this source, not of the inliner's mood.
+ *
+ * The obvious speed objection is real and was measured.  This loop is a SERIAL
+ * CHAIN -- its cost is n times the latency of one accumulate and nothing else --
+ * and an FMA is 4 cycles where an add is 3, so pinning the fusion costs ~34 ns
+ * per 128-wide LayerNorm, about 4% of an evaluation.  Splitting it into two
+ * loops (squares into a buffer, then a sum of the buffer) has no multiply-add
+ * left to fuse and measured 1.034x on one thread and 1.058x batched -- and was
+ * REJECTED, because clang fuses the two loops back together and contracts the
+ * result anyway: with that shape the batched path diverged from the unbatched
+ * one again (14 rows of 128, 4.8e-7 on the value trunk's normalisation) and the
+ * NEON and portable builds stopped agreeing.  A 4% gain is not worth an
+ * exactness guarantee that depends on the compiler declining to fuse two loops.
+ *
+ * BOTH reductions stay serial on purpose.  Summing either four lanes wide would
+ * reassociate it and change the last bit -- exactly what the batched path must
+ * not do.  The way to get width here is to put FOUR ROWS of a batch in the four
+ * lanes, each lane still its own serial chain; see the note above
+ * nn_eval_batch for what that would be worth. */
 static inline float norm_stats(const float *restrict x, int n, float *mu_out)
 {
     float s = 0.0f;
@@ -282,10 +309,7 @@ static inline float norm_stats(const float *restrict x, int n, float *mu_out)
     const float mu = s / (float)n;
 
     float ss = 0.0f;
-    {
-#pragma clang fp contract(off)
-        for (int i = 0; i < n; i++) { const float d = x[i] - mu; ss += d * d; }
-    }
+    for (int i = 0; i < n; i++) { const float d = x[i] - mu; ss = fmaf(d, d, ss); }
 
     *mu_out = mu;
     return 1.0f / sqrtf(ss / (float)n + NN_EPS);
@@ -393,27 +417,36 @@ void nn_init(Trunk *t, Head *h, uint64_t seed)
  * ---------------------------------------------------
  * The plain-C matvec that used to be here relied on four accumulators and a
  * comment claiming clang's SLP vectoriser would fold them into one NEON
- * accumulator.  It does not.  What clang actually emitted for
- * `s0 += w[i]*x[i]` x4 was an ld4 de-interleaving load feeding separate
- * fmul.4s/fadd.4s pairs -- vector instructions, but with the de-interleave on
- * the critical path and no fused multiply-add at all.  Measured on this M3 at
- * the 128x128 shape it ran at 2.2-2.6 GFLOP/s against 14.9 for a hand-written
- * vfmaq_f32 kernel with four output rows in flight.  Intrinsics also remove the
- * compiler's freedom to regroup the sum, which is what makes the batched and
- * unbatched paths agree bit for bit instead of nearly.
+ * accumulator.  It does not.  What clang emitted for `s0 += w[i]*x[i]` x4 was
+ * an ld4 de-interleaving load feeding separate fmul.4s/fadd.4s pairs -- vector
+ * instructions, but with the de-interleave on the critical path and no fused
+ * multiply-add at all (20 fmla.4s in the whole of nn_eval, against 60 fmul.4s
+ * and 274 scalar fadd).  Measured at the 128x128 shape on this M3: 2.2-2.6
+ * GFLOP/s for that loop, 10.9 for a hand-written vfmaq_f32 kernel one row at a
+ * time, 14.9 with four output rows in flight, 24.3 with four rows and four
+ * positions.  The stage it dominates went from 3397 ns to 609 ns.  Intrinsics
+ * also remove the compiler's freedom to regroup the sum, which is what lets the
+ * batched and unbatched paths agree bit for bit instead of nearly.
  *
  * EXACTNESS, PRECISELY
  * --------------------
  * Each output element is accumulated in ONE four-lane vector: lane k holds the
- * sum over i == k (mod 4), and vaddvq_f32 reduces it as ((s0+s1)+(s2+s3)).
- * That is the same grouping the old scalar source described, so the arithmetic
- * this file performs is unchanged -- but the old BINARY had been auto-vectorised
- * into sixteen partial sums and did not use FMA, so its last bit differs from
- * this one's.  Measured over the 512-position profile corpus the difference is
- * at most 1.2e-6 relative on the value and 2.4e-6 absolute on a logit: a float
- * rounding change, not a change to what is computed.  The gradient check in
- * tests/test_net.c (analytic against central differences) and the MCTS
- * determinism tests are what say so.
+ * sum over i == k (mod 4), and vaddvq_f32 reduces it as ((s0+s1)+(s2+s3)) --
+ * the same four groups, combined the same way, that the old scalar source
+ * described.  The arithmetic this file specifies is therefore unchanged.  What
+ * changed is that it is now SPECIFIED: the old source left the fusion of
+ * `s0 += w[i]*x[i]` to the compiler, which took it one way here and another way
+ * there, and an intrinsic does not give it that choice.  Against the
+ * pre-optimisation binary, over the 512-position corpus in tools/profile.c:
+ *
+ *     value v   4 of 512 positions differ, by at most 1.9e-9 absolute
+ *     logits    11980 of 14767 differ, by at most 6.0e-7 absolute
+ *
+ * A float rounding change, not a change to what is computed -- and the gradient
+ * check in tests/test_net.c (analytic against central differences) and the MCTS
+ * determinism tests are what say so.  In the other direction the guarantees got
+ * stronger: the NEON build, the portable build and the batched path now agree
+ * bit for bit with each other, which was not true before.
  */
 
 #if defined(__ARM_NEON) && !defined(NN_NO_NEON)
@@ -475,9 +508,13 @@ NN_INLINE void nn_gather(const float *restrict Wm, const float *restrict b,
 
     for (int f = 0; f < nf; f++) {
         const float *restrict w = Wm + (size_t)fidx[f] * (size_t)n;
-        /* one row ahead: the next row's address is already known and the rows
-         * are ~35 scattered 512-byte lines, which no stride prefetcher finds */
+#ifndef NN_NO_PREFETCH
+        /* One row ahead.  The next row's address is already known and the rows
+         * are ~35 scattered 512-byte spans that no stride prefetcher can guess.
+         * Measured worth on this M3: see the report -- it is small, and the
+         * switch exists so the claim can be re-measured rather than believed. */
         if (f + 1 < nf) __builtin_prefetch(Wm + (size_t)fidx[f + 1] * (size_t)n, 0, 3);
+#endif
         for (int i = 0; i < n; i += 4)
             vst1q_f32(acc + i, vaddq_f32(vld1q_f32(acc + i), vld1q_f32(w + i)));
     }
@@ -517,7 +554,7 @@ NN_INLINE float nn_norm_relu_gen(const float *restrict x, const float *restrict 
     for (int i = 0; i < n; i++) {
         const float xh = (x[i] - mu) * r;
         xhat[i] = xh;
-        const float a = g[i] * xh + c[i];
+        const float a = fmaf(g[i], xh, c[i]);
         y[i] = skip ? (a > 0.0f ? a : 0.0f) + skip[i] : (a > 0.0f ? a : 0.0f);
     }
 #endif
@@ -586,14 +623,18 @@ NN_INLINE void nn_matvec(const float *restrict Wm, const float *restrict bias,
         y[j] = bias ? s + bias[j] : s;
     }
 #else
+    /* Four accumulators reduced as ((s0+s1)+(s2+s3)) and an explicit fmaf: the
+     * same four lanes, in the same order, with the same fusion the NEON kernel
+     * above uses -- so a build without NEON produces bit-identical results to
+     * one with it, and tests/test_net.c can hold both to the same numbers. */
     for (int j = 0; j < nout; j++) {
         const float *restrict w = Wm + (size_t)j * (size_t)nin;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         for (int i = 0; i < nin; i += 4) {
-            s0 += w[i + 0] * x[i + 0];
-            s1 += w[i + 1] * x[i + 1];
-            s2 += w[i + 2] * x[i + 2];
-            s3 += w[i + 3] * x[i + 3];
+            s0 = fmaf(w[i + 0], x[i + 0], s0);
+            s1 = fmaf(w[i + 1], x[i + 1], s1);
+            s2 = fmaf(w[i + 2], x[i + 2], s2);
+            s3 = fmaf(w[i + 3], x[i + 3], s3);
         }
         const float s = (s0 + s1) + (s2 + s3);
         y[j] = bias ? s + bias[j] : s;
@@ -729,7 +770,8 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
  *     nn_eval_batch(t, &h, 1, &fidx, &nf, &fw)   ==   nn_eval(t, h, fidx, nf, &fw)
  *
  * bit for bit, and so does every row of every larger batch: tests/test_net.c
- * asserts exactly that over hundreds of positions at nine batch sizes.  WITH
+ * asserts exactly that over 9354 rows at fifteen batch sizes, with the heads
+ * grouped and mixed.  WITH
  * -DUSE_ACCELERATE the two trunk GEMMs go to cblas_sgemm, whose blocking and
  * use of FMA regroup each sum, and the results are then equal only to about
  * 1e-6 relative -- the test asserts that bound instead.  A caller that needs
@@ -738,7 +780,32 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
  * summation order is a function of the batch size.
  */
 
-#define NN_BATCH_TILE 32
+/* Below this many rows the hand-written NEON kernel beats cblas_sgemm and is
+ * bit-exact against nn_eval, so small batches go through it even in an
+ * Accelerate build.  Measured against unbatched nn_eval, 1 thread: sgemm 0.97x
+ * at 1 row, 1.00x at 2, 1.18x at 4, 1.34x at 8, 1.52x at 16, 1.71x at 32; the
+ * NEON kernel 0.99x / 1.02x / 1.20x / 1.36x / 1.32x / 1.36x.  They cross at 16.
+ * A BLAS call has a fixed cost that 128 x 128 x M cannot amortise until M is
+ * big, which is also why routing a ONE-row batch through sgemm was slower than
+ * not batching at all (0.76x when it was measured that way).  The threshold is
+ * also what makes nbatch == 1 bit-identical to nn_eval in EVERY build, as the
+ * contract in net.h promises. */
+#define NN_GEMM_MIN 16
+
+/* Rows per internal tile: nn_eval_batch takes any nbatch and chops it into
+ * these, so no caller has to think about a maximum.  The tile bounds the stack
+ * scratch (acc + z2 + av + zv: 40 KB at 32 rows, against the 512 KB default
+ * pthread stack on macOS) and it is what sgemm's M dimension ends up being.
+ *
+ * Swept at batch 128 on this M3, one thread: tile 4 -> 795k evals/sec,
+ * 8 -> 812k, 16 -> 809k, 32 -> 809k, 64 -> 816k.  For the NEON kernel the tile
+ * does not matter -- it blocks 4 rows x 4 outputs internally and nothing above
+ * that is load-bearing.  cblas_sgemm does care: it does not beat the NEON
+ * kernel until 16 rows and has saturated by 32.  So 32, for the one path that
+ * has an opinion. */
+#ifndef NN_BATCH_TILE
+#  define NN_BATCH_TILE 32
+#endif
 
 static void nn_eval_tile(const Trunk *t, const Head *const *heads, int nb,
                          const uint16_t *const *fidx, const int *nf, Fwd *out)
@@ -759,13 +826,16 @@ static void nn_eval_tile(const Trunk *t, const Head *const *heads, int nb,
     /* 2. the residual block's matrix, shared by the whole batch: the one place
      *    where this is a matrix-MATRIX product for every caller. */
 #if NN_ACCELERATE
-    for (int b = 0; b < nb; b++) memcpy(z2 + b * NF_HID, t->b1, sizeof t->b1);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nb, NF_HID, NF_ACC,
-                1.0f, out[0].h1, NN_FWD_STRIDE, t->W1, NF_ACC, 1.0f, z2, NF_HID);
-#else
-    nn_matvec_batch(t->W1, t->b1, out[0].h1, NN_FWD_STRIDE, nb,
-                    NF_HID, NF_ACC, z2, NF_HID);
+    if (nb >= NN_GEMM_MIN) {
+        for (int b = 0; b < nb; b++) memcpy(z2 + b * NF_HID, t->b1, sizeof t->b1);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nb, NF_HID, NF_ACC,
+                    1.0f, out[0].h1, NN_FWD_STRIDE, t->W1, NF_ACC, 1.0f, z2, NF_HID);
+    } else
 #endif
+    {
+        nn_matvec_batch(t->W1, t->b1, out[0].h1, NN_FWD_STRIDE, nb,
+                        NF_HID, NF_ACC, z2, NF_HID);
+    }
 
     /* 3. LayerNorm 2 + the skip connection, per position. */
     for (int b = 0; b < nb; b++)
@@ -777,18 +847,21 @@ static void nn_eval_tile(const Trunk *t, const Head *const *heads, int nb,
         int b1 = b0 + 1;
         while (b1 < nb && heads[b1] == heads[b0]) b1++;
         const int run = b1 - b0;
-        if (run > 1) {
 #if NN_ACCELERATE
+        if (run >= NN_GEMM_MIN) {
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, run, NF_PDIM, NF_HID,
                         1.0f, out[b0].h2, NN_FWD_STRIDE, heads[b0]->Wp, NF_HID,
                         0.0f, out[b0].q, NN_FWD_STRIDE);
-#else
+        } else
+#endif
+        if (run > 1) {
             nn_matvec_batch(heads[b0]->Wp, NULL, out[b0].h2, NN_FWD_STRIDE, run,
                             NF_PDIM, NF_HID, out[b0].q, NN_FWD_STRIDE);
-#endif
         } else {
             nn_matvec(heads[b0]->Wp, NULL, out[b0].h2, NF_PDIM, NF_HID, out[b0].q);
         }
+        /* (the #if above falls through to these two when Accelerate is off, or
+         *  when the run is too short for a BLAS call to pay for itself) */
         b0 = b1;
     }
 
@@ -833,6 +906,30 @@ void nn_eval_batch(const Trunk *t, const Head *const *heads, int nbatch,
     }
 }
 
+const char *nn_backend(void)
+{
+#if NN_ACCELERATE
+    return "neon+accelerate";
+#elif NN_NEON
+    return "neon";
+#else
+    return "scalar";
+#endif
+}
+
+int nn_batch_tile(void) { return NN_BATCH_TILE; }
+
+int nn_batch_is_exact(int nbatch)
+{
+#if NN_ACCELERATE
+    /* every tile smaller than the sgemm threshold takes the exact kernel */
+    return nbatch < NN_GEMM_MIN;
+#else
+    (void)nbatch;
+    return 1;
+#endif
+}
+
 /* The per-move logits.  NF_PDIM is 32, so each move is five 32-float embedding
  * rows summed and dotted with q -- 192 flops against ~1.4 KB of scattered
  * embedding rows, which makes this stage load-bound rather than FLOP-bound.
@@ -870,10 +967,10 @@ void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *
 #else
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         for (int i = 0; i < NF_PDIM; i += 4) {
-            s0 += q[i + 0] * (ef[i + 0] + et[i + 0] + ec[i + 0] + er[i + 0] + ex[i + 0]);
-            s1 += q[i + 1] * (ef[i + 1] + et[i + 1] + ec[i + 1] + er[i + 1] + ex[i + 1]);
-            s2 += q[i + 2] * (ef[i + 2] + et[i + 2] + ec[i + 2] + er[i + 2] + ex[i + 2]);
-            s3 += q[i + 3] * (ef[i + 3] + et[i + 3] + ec[i + 3] + er[i + 3] + ex[i + 3]);
+            s0 = fmaf(q[i + 0], ef[i + 0] + et[i + 0] + ec[i + 0] + er[i + 0] + ex[i + 0], s0);
+            s1 = fmaf(q[i + 1], ef[i + 1] + et[i + 1] + ec[i + 1] + er[i + 1] + ex[i + 1], s1);
+            s2 = fmaf(q[i + 2], ef[i + 2] + et[i + 2] + ec[i + 2] + er[i + 2] + ex[i + 2], s2);
+            s3 = fmaf(q[i + 3], ef[i + 3] + et[i + 3] + ec[i + 3] + er[i + 3] + ex[i + 3], s3);
         }
         logits[m] = ((s0 + s1) + (s2 + s3)) + Bft[(size_t)k.from * 64 + k.to];
 #endif

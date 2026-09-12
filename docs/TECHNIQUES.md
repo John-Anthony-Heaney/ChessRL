@@ -368,7 +368,7 @@ Split the question honestly:
 | Technique | Applies here? | Expected benefit | Cost | Contract |
 |---|---|---|---|---|
 | **Per-loss gradient scaling** | **Yes** | Large | ~20 lines | Legal |
-| LR range test ("lr_finder") | Marginal | Small | Medium | Legal |
+| LR range test ("lr_finder") | **Yes, as a one-off** | Confirmatory | 5 s per run | Legal (`SHIPPED`) |
 | LR warmup | Yes, small | Small | ~5 lines | Legal (`LANDING`) |
 | Cosine vs step decay | Already cosine | Zero | — | — |
 | SGD+momentum instead of AdamW | No | Negative | — | Legal |
@@ -390,13 +390,56 @@ killed the hidden layer.
 
 **LR range test.** [Smith, Cyclical Learning Rates](https://arxiv.org/abs/1506.01186):
 ramp the learning rate exponentially over one short run and read the maximum
-stable value off the loss curve. Honest assessment for this system: it is a tool
-for when you do not know the right order of magnitude, and `2e-3` for AdamW on a
-154k-parameter net is already in the right place. More importantly, the loss
-here is non-stationary — the data distribution changes as the agents improve —
-so a range test at generation 1 tells you little about generation 200. **Low
-priority**, and a full 250-generation run at 52 minutes is a *better* experiment
-than an LR finder.
+stable value off the loss curve. **Implemented as `chessrl lrfind`, and the
+objection this table used to make against it has been tested and does not hold.
+See `docs/LR_FINDER.md` for the full measurement.**
+
+This entry previously read: *"the loss here is non-stationary — the data
+distribution changes as the agents improve — so a range test at generation 1
+tells you little about generation 200"*, and costed the technique as "Medium"
+against a 52-minute training run. Both claims were wrong.
+
+**Cost.** One complete range test — 512 real self-play games to fill the buffer,
+then 300 optimiser steps with the learning rate ramped from 1e-6 to 1.0 — takes
+about **5 seconds** at `--threads 3` on an idle laptop, not the better part of an
+hour.
+
+**Non-stationarity.** Measured over 24 sweeps at eight training stages spanning
+generation 0 to generation 200, across two configurations, 2–3 seeds each. The
+recommended peak learning rate (`lr(min)/10`) landed between **6.2e-4 and
+7.9e-3** — a factor of 12.7, or 1.10 decades, geometric mean **2.63e-3**. Within
+one 200-generation run the endpoints were 3.5e-3 at generation 0 and 2.4e-3 at
+generation 200, against a seed-to-seed spread of 1.15–1.66× at a fixed stage.
+
+So the recommendation *does* move with training stage by more than seed noise —
+the objection is directionally real — but it moves **inside a single decade**,
+it is not monotone (one run went 3.5 → 6.1 → 0.75 → 1.8 → 1.9 → 2.4 e-3 over
+generations 0/5/50/100/150/200), and every stage brackets the value already
+configured. A range test is a tool for the order of magnitude, and the order of
+magnitude transferred perfectly from generation 0 to generation 200. There is
+also no *trend* to re-tune against: a mid-run re-tune would be chasing an
+excursion. **Run it once, take the order of magnitude, do not run it again.**
+
+**What it says about `2e-3`.** It is right. `2e-3` divided by the per-stage
+recommendation is 0.25×–3.22× over all 24 sweeps, geometric mean 0.76×; it is
+within half a decade of the measurement at 22 of 24 points. No change to `--lr`.
+
+**What it says about the decay.** At generation 200 the cosine has taken the
+rate to `2e-4`, while the range test at that same checkpoint puts the loss
+minimum at `lr ≈ 0.024` and recommends a peak of `2.4e-3` — so the floor is 12×
+below the recommendation and ~110× below the rate at which the loss stops
+improving, at a point where the measured tolerance for a large step is *no lower
+than it was at generation 0*. The schedule assumes a sensitivity that does not
+develop. `--lr-final 1e-3` is a one-flag ablation worth running.
+
+**What it is really measuring.** 87–100% of the descent in the total loss is the
+value term, at every stage. With `value_coef = 4.0` the value loss falls by
+0.3–0.47 across the sweep while the policy cross-entropy moves by 0.00–0.13 nats
+— at or below its own noise. This is an independent confirmation of §1.3's 50:1
+gradient imbalance from a completely different direction, and it means the
+headline number is the *value head's* learning rate. Re-run the range test after
+per-loss gradient scaling lands; that is the change that should make the policy
+term's curve readable at all.
 
 **Warmup.** [Goyal et al.](https://arxiv.org/abs/1706.02677). Adam's second
 moment is badly estimated for the first few dozen steps, so the first updates
@@ -779,7 +822,7 @@ sweeping `c_puct`, which has never been tuned against this network.
 | **Label smoothing** | The policy target is a visit distribution with 2.30 nats of entropy. It is already smooth; smoothing adds bias and nothing else. |
 | **Mixed precision** | No CPU tensor cores. The hot path is a sparse 35-row gather, and halving memory traffic on one layer is at most ~1.3x for real complexity and a dependency on `__fp16`. Subtree reuse gives more, for free, and is already landing. |
 | **Prioritised replay by value error** | With Monte-Carlo labels, large `\|v−z\|` means "this game ended surprisingly", not "this position is informative". It would preferentially resample the most mislabelled data. |
-| **An LR range test** | A tool for when the order of magnitude is unknown; 2e-3 for AdamW on 154k parameters is not. The objective is non-stationary, so a generation-1 result does not describe generation 200, and a full run costs 52 minutes anyway. |
+| ~~**An LR range test**~~ | **Moved out of this table — it was wrong.** It is implemented (`chessrl lrfind`), costs 5 seconds, and was used to *confirm* that 2e-3 is right rather than to discover it. The non-stationarity argument was tested over generations 0–200 and the recommendation moves by 1.1 decades in total, i.e. the order of magnitude transfers. See §3.2 and `docs/LR_FINDER.md`. |
 | **c_puct's log schedule** | At N=160 the log term adds 0.008 to c_puct. It is a constant at our simulation count. Sweep the constant instead. |
 | **Gumbel AlphaZero** | Fixes the case where simulations < root actions. We run 160 simulations over 23.6 legal moves, so nearly every root action is visited. Revisit if playout cap randomisation pushes the fast budget below ~25. |
 | **Left-right mirror augmentation** | Valid (75.1% of positions have no castling rights, and Chess960 arrays are closed under reflection if the K/Q bits swap). But it buys effective *data*, and the measured bottleneck is representation, not data — 12.8M sample-updates already went in and the model still underfits. |

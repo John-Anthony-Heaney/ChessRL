@@ -483,18 +483,60 @@ enum { JOB_IDLE = 0, JOB_SELFPLAY, JOB_LEARN, JOB_EXIT };
 
 typedef struct AZShared AZShared;
 
+/* ------------------------------------------------- one game in flight
+ *
+ * A worker no longer plays one game at a time.  It plays G of them at once and
+ * evaluates their pending leaves together, so this struct holds everything a
+ * game owns PRIVATELY: its own node pool and standing tree (Mcts), its own
+ * board and repetition history (Game), its own recorder, its own rng stream,
+ * and its own place in the game's script.  Nothing here is shared between
+ * slots; the only shared thing is the evaluation cache, which is a pure
+ * function of (network input, trunk, head, weights) and therefore cannot make
+ * one game see another's evaluation (see mcts.c, mc_tag). */
+enum { SL_IDLE = 0, SL_NEWGAME, SL_MOVE, SL_SEARCH, SL_ENDGAME };
+
+typedef struct {
+    Mcts       m;
+    Game       g;
+    AZRec      rec;
+    uint64_t   own_rng[4];
+    uint64_t  *rng;            /* own_rng, or the worker's when G == 1        */
+    int32_t    visits[MAX_MOVES];
+    float      target[MAX_MOVES];
+    Move       list[MAX_MOVES];
+
+    int        state;          /* SL_*                                        */
+    int        idx;            /* pairing being played                        */
+    AZPair     pr;
+    const Head *hw, *hb;
+    const Head *h;             /* the head of the side to move, this search   */
+    int        side;
+    int32_t    id;
+    int        full;           /* this move gets the full budget + root noise */
+    int        resign_on, check_game, resign_live;
+    int        consec[2];
+    int        would_resign, resigned;
+} AZSlot;
+
+/* The batch-size histogram.  Index 0 is unused; index k counts the rounds that
+ * sent exactly k rows to the network.  Games in terminal nodes, games serving a
+ * leaf from the cache and games between searches do not contribute a row, so
+ * the achieved batch is smaller than G and this is how much. */
+#define AZ_BATCH_HIST  65
+
 typedef struct {
     AZShared *sh;
     int       tid;
     uint64_t  rng[4];
 
-    /* self-play */
-    Mcts      m;
-    Game      g;
-    AZRec     rec;
-    int32_t   visits[MAX_MOVES];
-    float     target[MAX_MOVES];
-    Move      list[MAX_MOVES];
+    /* self-play: G concurrent games, one batched evaluation per round */
+    AZSlot           *slots;
+    int               nslots;
+    MctsBatch        *batch;
+    struct MctsCache *ecache;        /* one per WORKER, shared by its slots   */
+    uint64_t          batch_rounds, batch_rows;
+    uint64_t          batch_hist[AZ_BATCH_HIST];
+    uint64_t          cache_hits, cache_misses;
     AZStats   st;
     uint64_t  evals;
     double    rootv_sum;
@@ -595,7 +637,7 @@ static void resolve_side(const AZShared *sh, int32_t id, const Head **h)
  *                                SELF-PLAY
  * ========================================================================== */
 
-static double target_entropy(const float *p, int n)
+static double target_entropy_(const float *p, int n)
 {
     double h = 0.0;
     for (int i = 0; i < n; i++)
@@ -603,135 +645,215 @@ static double target_entropy(const float *p, int n)
     return h;
 }
 
-/* Plays one pairing to completion, records every ply made by a LIVE agent, and
- * splices the labelled positions into the replay buffer. */
-static void az_play_one(AZWorker *w, int idx)
+/* ==========================================================================
+ *                  SELF-PLAY: G CONCURRENT GAMES PER THREAD
+ * ==========================================================================
+ *
+ * THE PROBLEM.  MCTS is strictly sequential: a simulation cannot choose its
+ * next path until the previous leaf has been evaluated.  A worker playing one
+ * game at a time therefore hands the network exactly one position per call, and
+ * a batch of one turns the trunk's 128x128 and 128x32 matrices into matrix-
+ * VECTOR products that cannot use the machine's width.
+ *
+ * THE FIX.  Run G games per thread and evaluate their pending leaves together.
+ * The games are completely independent -- separate node pools, separate trees,
+ * separate repetition histories, separate rng streams -- so this needs NO
+ * virtual loss and introduces NO approximation whatsoever.  Each game performs
+ * exactly the simulations it would have performed alone, in the same order, off
+ * the same values.  That is the whole advantage over leaf-parallelising ONE
+ * search, which has to invent a penalty to stop every thread walking the same
+ * path and changes the answer as a result.
+ *
+ * Each game is a state machine (SL_*) that az_slot_pump() advances until it
+ * needs the network or runs out of work.  One round of the driver pumps every
+ * slot, collects one pending leaf from each, and sends them through in a single
+ * nn_eval_batch().  A game that finishes is refilled from the shared pairing
+ * index in the same round, so threads never idle waiting for the slowest game.
+ *
+ * RNG.  At G == 1 the slot draws straight from the worker's stream, so the
+ * sequence of random numbers -- start position, resign-check coin, playout-cap
+ * coin, Dirichlet noise, move sampling -- is byte for byte what the one-game-at-
+ * a-time loop drew, and a G == 1 run is bit-identical to the old trainer.  At
+ * G > 1 interleaving would scramble a single shared stream, so each GAME gets
+ * its own stream seeded from (run seed, generation, pairing index).  That is
+ * strictly more reproducible than before: a pairing now plays the same game
+ * whatever slot, thread or scheduling order picks it up.
+ */
+
+/* Claims the next pairing and sets up a fresh game in this slot. */
+static void az_slot_newgame(AZWorker *w, AZSlot *s)
 {
     AZShared *sh = w->sh;
     const AZCfg *c = sh->cfg;
-    const AZPair pr = sh->pairs[idx];
-    const Head *hw, *hb;
 
-    resolve_side(sh, pr.white, &hw);
-    resolve_side(sh, pr.black, &hb);
+    const int i = atomic_fetch_add_explicit(&sh->next, 1, memory_order_relaxed);
+    if (i >= sh->npairs) { s->state = SL_IDLE; return; }
 
-    Game *g = &w->g;
-    AZRec *r = &w->rec;
+    s->idx = i;
+    s->pr  = sh->pairs[i];
+    resolve_side(sh, s->pr.white, &s->hw);
+    resolve_side(sh, s->pr.black, &s->hb);
+
+    /* A per-GAME stream when games are interleaved; the worker's own stream
+     * when there is only one, which is what makes G == 1 reproduce the old
+     * loop exactly. */
+    if (s->rng != w->rng)
+        az_seed(s->rng, c->seed
+                + 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1)
+                + 0xBF58476D1CE4E5B9ull * (uint64_t)sh->generation
+                + 0xD6E8FEB86659FD93ull);
+
+    Game *g = &s->g;
     /* Pick the starting array.  AZ_START_MIXED plays classical one game in ten
      * so the classical opening stays represented in the replay buffer while the
      * other 959 arrays supply the generalisation pressure. */
     if (c->start_mode == AZ_START_960) {
-        game_start960(g, pos_960_random(w->rng));
+        game_start960(g, pos_960_random(s->rng));
     } else if (c->start_mode == AZ_START_MIXED) {
-        if (az_u01(w->rng) < 0.10f) game_start(g);
-        else                       game_start960(g, pos_960_random(w->rng));
+        if (az_u01(s->rng) < 0.10f) game_start(g);
+        else                        game_start960(g, pos_960_random(s->rng));
     } else {
         game_start(g);
     }
-    r->n = 0;
-    r->nk = 0;
+    s->rec.n  = 0;
+    s->rec.nk = 0;
 
     /* Resignation bookkeeping.  A resign_check game turns resignation OFF and
      * plays on, so the threshold can be scored against the true result. */
-    const int resign_on = (c->resign_threshold > -1.0f);
-    const int check_game = resign_on && (az_u01(w->rng) < c->resign_check_frac);
-    const int resign_live = resign_on && !check_game;
-    int consec[2] = { 0, 0 };
-    int would_resign = -1;        /* first colour that hit the threshold      */
-    int resigned = -1;
+    s->resign_on   = (c->resign_threshold > -1.0f);
+    s->check_game  = s->resign_on && (az_u01(s->rng) < c->resign_check_frac);
+    s->resign_live = s->resign_on && !s->check_game;
+    s->consec[0] = s->consec[1] = 0;
+    s->would_resign = -1;
+    s->resigned     = -1;
 
-    int result, reason;
+    s->state = SL_MOVE;
+}
 
-    for (;;) {
-        if (g->result != GR_ONGOING) break;
-        if (g->ply >= c->max_plies) {
-            g->result = GR_DRAW;
-            g->reason = TR_MAX_PLIES;
-            break;
-        }
+/* Decides this move's budget and opens the search.  Does not evaluate. */
+static void az_slot_begin_move(AZWorker *w, AZSlot *s)
+{
+    AZShared *sh = w->sh;
+    const AZCfg *c = sh->cfg;
+    Game *g = &s->g;
 
-        const int side = (int)g->pos.side;
-        const int32_t id = (side == WHITE) ? pr.white : pr.black;
-        const Head *h = (side == WHITE) ? hw : hb;
-
-        /* PLAYOUT CAP RANDOMISATION (KataGo).  A "full" move gets the whole
-         * simulation budget, root noise and a slot in the replay buffer; a
-         * "fast" move gets cap_sims, no root noise, and is played but never
-         * learned from.  Nothing here is chess-specific: it is a statement
-         * about where simulation budget buys training signal, and it applies
-         * unchanged to any game. */
-        const int full  = !(c->cap_frac < 1.0f) || (az_u01(w->rng) < c->cap_frac);
-        const int nsims = full ? c->sims : sh->cap_sims;
-
-        float rootv = 0.0f;
-        const int n = mcts_search(&w->m, sh->trunk, h, g, nsims, full,
-                                  w->rng, w->visits, &rootv);
-        if (n <= 0) break;                        /* the search saw game over */
-        w->all_moves++;
-        if (full) w->full_moves++;
-
-        const int nl = gen_legal(&g->pos, w->list);
-        if (nl != n) break;                       /* cannot happen            */
-
-        mcts_target(w->visits, n, w->target);
-
-        w->rootv_sum += (double)rootv;
-        w->rootv_n++;
-        w->tgt_ent_sum += target_entropy(w->target, n);
-        w->tgt_ent_n++;
-
-        /* ---- record: features, the visit-count policy target, the mover --- */
-        if (full && !IS_HOF(id) && r->n < r->npos_cap &&
-            r->nk + (uint64_t)n <= r->nk_cap && n <= REC_MAX_MOVES) {
-            AZPos *p = &r->pos[r->n];
-            p->nf     = (uint8_t)nn_features(&g->pos, p->fidx);
-            p->koff   = r->nk;                    /* local; made monotonic on commit */
-            p->nmoves = (uint16_t)n;
-            p->mover  = (uint8_t)side;
-            p->agent  = (int16_t)id;
-            p->z      = 0.0f;
-            p->q      = rootv;      /* the search's own estimate HERE */
-            for (int i = 0; i < n; i++) {
-                nn_move_key(&g->pos, w->list[i], &r->keys[r->nk + (uint64_t)i]);
-                r->pol[r->nk + (uint64_t)i] = w->target[i];
-            }
-            r->nk += (uint64_t)n;
-            r->n++;
-        }
-
-        /* ---- resignation -------------------------------------------------- */
-        if (resign_on) {
-            if (rootv < c->resign_threshold) {
-                if (++consec[side] >= RESIGN_CONSEC && would_resign < 0)
-                    would_resign = side;
-            } else {
-                consec[side] = 0;
-            }
-            if (resign_live && would_resign == side) { resigned = side; break; }
-        }
-
-        /* ---- pick and play ------------------------------------------------ */
-        const float temp = (g->ply < c->opening_plies) ? c->temp_start : c->temp_end;
-        const int pick = mcts_pick(w->visits, n, temp, w->rng);
-        const Move mv = w->list[pick < 0 ? 0 : pick];
-
-        {   /* move statistics: pure counting, no evaluation */
-            const int fl = MV_FLAG(mv);
-            if (MV_IS_CAPTURE(mv))   w->st.captures++;
-            if (fl == MF_EP)         w->st.ep_captures++;
-            if (MV_IS_PROMO(mv))     w->st.promotions++;
-            if (fl == MF_KCASTLE || fl == MF_QCASTLE) w->st.castles++;
-            if (g->ply == 0 && side == WHITE)
-                w->st.first_move[MV_FROM(mv) * 64 + MV_TO(mv)]++;
-        }
-
-        game_push(g, mv);
-        if (in_check(&g->pos, g->pos.side)) w->st.checks++;
+    if (g->result != GR_ONGOING) { s->state = SL_ENDGAME; return; }
+    if (g->ply >= c->max_plies) {
+        g->result = GR_DRAW;
+        g->reason = TR_MAX_PLIES;
+        s->state  = SL_ENDGAME;
+        return;
     }
 
-    /* ---- the result.  The ONLY reward. --------------------------------- */
-    if (resigned >= 0) {
-        result = (resigned == WHITE) ? GR_BLACK_WIN : GR_WHITE_WIN;
+    s->side = (int)g->pos.side;
+    s->id   = (s->side == WHITE) ? s->pr.white : s->pr.black;
+    s->h    = (s->side == WHITE) ? s->hw : s->hb;
+
+    /* PLAYOUT CAP RANDOMISATION (KataGo).  A "full" move gets the whole
+     * simulation budget, root noise and a slot in the replay buffer; a "fast"
+     * move gets cap_sims, no root noise, and is played but never learned from.
+     * Nothing here is chess-specific: it is a statement about where simulation
+     * budget buys training signal, and it applies unchanged to any game. */
+    s->full = !(c->cap_frac < 1.0f) || (az_u01(s->rng) < c->cap_frac);
+    const int nsims = s->full ? c->sims : sh->cap_sims;
+
+    if (!mcts_begin(&s->m, sh->trunk, s->h, g, nsims, s->full, s->rng)) {
+        s->state = SL_ENDGAME;                    /* the search saw game over */
+        return;
+    }
+    s->state = SL_SEARCH;
+}
+
+/* The search has spent its budget: record, sample, play. */
+static void az_slot_after_search(AZWorker *w, AZSlot *s)
+{
+    AZShared *sh = w->sh;
+    const AZCfg *c = sh->cfg;
+    Game  *g = &s->g;
+    AZRec *r = &s->rec;
+
+    float rootv = 0.0f;
+    const int n = mcts_end(&s->m, s->visits, &rootv);
+    if (n <= 0) { s->state = SL_ENDGAME; return; }   /* the search saw game over */
+
+    w->all_moves++;
+    if (s->full) w->full_moves++;
+
+    const int nl = gen_legal(&g->pos, s->list);
+    if (nl != n) { s->state = SL_ENDGAME; return; }  /* cannot happen */
+
+    mcts_target(s->visits, n, s->target);
+
+    w->rootv_sum += (double)rootv;
+    w->rootv_n++;
+    w->tgt_ent_sum += target_entropy_(s->target, n);
+    w->tgt_ent_n++;
+
+    /* ---- record: features, the visit-count policy target, the mover ------ */
+    if (s->full && !IS_HOF(s->id) && r->n < r->npos_cap &&
+        r->nk + (uint64_t)n <= r->nk_cap && n <= REC_MAX_MOVES) {
+        AZPos *p = &r->pos[r->n];
+        p->nf     = (uint8_t)nn_features(&g->pos, p->fidx);
+        p->koff   = r->nk;                    /* local; made monotonic on commit */
+        p->nmoves = (uint16_t)n;
+        p->mover  = (uint8_t)s->side;
+        p->agent  = (int16_t)s->id;
+        p->z      = 0.0f;
+        p->q      = rootv;      /* the search's own estimate HERE */
+        for (int i = 0; i < n; i++) {
+            nn_move_key(&g->pos, s->list[i], &r->keys[r->nk + (uint64_t)i]);
+            r->pol[r->nk + (uint64_t)i] = s->target[i];
+        }
+        r->nk += (uint64_t)n;
+        r->n++;
+    }
+
+    /* ---- resignation ---------------------------------------------------- */
+    if (s->resign_on) {
+        if (rootv < c->resign_threshold) {
+            if (++s->consec[s->side] >= RESIGN_CONSEC && s->would_resign < 0)
+                s->would_resign = s->side;
+        } else {
+            s->consec[s->side] = 0;
+        }
+        if (s->resign_live && s->would_resign == s->side) {
+            s->resigned = s->side;
+            s->state    = SL_ENDGAME;
+            return;
+        }
+    }
+
+    /* ---- pick and play --------------------------------------------------- */
+    const float temp = (g->ply < c->opening_plies) ? c->temp_start : c->temp_end;
+    const int pick = mcts_pick(s->visits, n, temp, s->rng);
+    const Move mv = s->list[pick < 0 ? 0 : pick];
+
+    {   /* move statistics: pure counting, no evaluation */
+        const int fl = MV_FLAG(mv);
+        if (MV_IS_CAPTURE(mv))   w->st.captures++;
+        if (fl == MF_EP)         w->st.ep_captures++;
+        if (MV_IS_PROMO(mv))     w->st.promotions++;
+        if (fl == MF_KCASTLE || fl == MF_QCASTLE) w->st.castles++;
+        if (g->ply == 0 && s->side == WHITE)
+            w->st.first_move[MV_FROM(mv) * 64 + MV_TO(mv)]++;
+    }
+
+    game_push(g, mv);
+    if (in_check(&g->pos, g->pos.side)) w->st.checks++;
+
+    s->state = SL_MOVE;
+}
+
+/* Labels the game by its result -- the ONLY reward -- and commits it. */
+static void az_slot_endgame(AZWorker *w, AZSlot *s)
+{
+    AZShared *sh = w->sh;
+    Game  *g = &s->g;
+    AZRec *r = &s->rec;
+    int result, reason;
+
+    if (s->resigned >= 0) {
+        result = (s->resigned == WHITE) ? GR_BLACK_WIN : GR_WHITE_WIN;
         reason = TR_RESIGN;
     } else {
         result = g->result;
@@ -741,11 +863,11 @@ static void az_play_one(AZWorker *w, int idx)
 
     /* Resign-threshold validation: would the latched resignation have thrown
      * away a game the resigner did not actually lose? */
-    if (check_game) {
+    if (s->check_game) {
         w->resign_checked++;
-        if (would_resign >= 0) {
-            const int lost = (would_resign == WHITE) ? (result == GR_BLACK_WIN)
-                                                     : (result == GR_WHITE_WIN);
+        if (s->would_resign >= 0) {
+            const int lost = (s->would_resign == WHITE) ? (result == GR_BLACK_WIN)
+                                                        : (result == GR_WHITE_WIN);
             w->resign_would++;
             if (!lost) w->resign_wrong++;
         }
@@ -779,20 +901,142 @@ static void az_play_one(AZWorker *w, int idx)
         default:              w->st.maxplies++;     break;
     }
 
-    sh->results[idx].result = (int16_t)result;
-    sh->results[idx].reason = (int16_t)reason;
+    sh->results[s->idx].result = (int16_t)result;
+    sh->results[s->idx].reason = (int16_t)reason;
+
+    s->state = SL_NEWGAME;
+}
+
+/* Advances one slot until its search is waiting for the network, or until the
+ * slot has no work left.  Returns 1 when a leaf is pending. */
+static int az_slot_pump(AZWorker *w, AZSlot *s)
+{
+    for (;;) {
+        switch (s->state) {
+        case SL_IDLE:
+            return 0;
+        case SL_NEWGAME:
+            az_slot_newgame(w, s);
+            break;
+        case SL_MOVE:
+            az_slot_begin_move(w, s);
+            break;
+        case SL_SEARCH:
+            if (mcts_step(&s->m)) return 1;      /* a leaf wants the network */
+            az_slot_after_search(w, s);
+            break;
+        case SL_ENDGAME:
+            az_slot_endgame(w, s);
+            break;
+        default:
+            s->state = SL_IDLE;
+            return 0;
+        }
+    }
+}
+
+
+/* ------------------------------------------------- worker slot allocation */
+/* G concurrent games need G node pools, G games, G recorders -- and exactly ONE
+ * evaluation cache and one batch buffer per thread.  The cache is shared rather
+ * than replicated because its tag names (input, trunk, head, weights): a hit is
+ * bit-for-bit what THAT game's network would have returned, so sharing cannot
+ * couple two games.  Replicating it would have cost G times the memory for a
+ * table that would then be G times colder. */
+static int az_worker_slots_init(AZWorker *w, const AZCfg *c, int nslots)
+{
+    if (nslots < 1) nslots = 1;
+    w->nslots = nslots;
+    w->slots  = (AZSlot *)calloc((size_t)nslots, sizeof(AZSlot));
+    w->batch  = mcts_batch_create(nslots);
+    if (!w->slots || !w->batch) return 0;
+
+    const int pool = MAX_MOVES + 1 + c->sims * NODES_PER_SIM;
+
+    /* One shared table, sized as if it were the G private ones put together:
+     * mcts_init()'s own rule for a single search, times G.  A ceiling of 2^16
+     * entries (9 MB per thread) stops a large G from spending more on the cache
+     * than on the node pools it serves. */
+    {
+        int bits = 0;
+        while ((1 << (bits + 1)) <= pool) bits++;       /* mcts_init's rule */
+        bits -= 2;
+        for (int k = 1; k < nslots; k <<= 1) bits++;    /* ... times G      */
+        if (bits < 10) bits = 10;
+        if (bits > 16) bits = 16;
+        w->ecache = mcts_cache_create(bits);
+        if (!w->ecache) return 0;
+    }
+
+    for (int i = 0; i < nslots; i++) {
+        AZSlot *s = &w->slots[i];
+        mcts_init(&s->m, pool);
+        s->m.c_puct          = c->c_puct;
+        s->m.dirichlet_alpha = c->dirichlet_alpha;
+        s->m.dirichlet_eps   = c->dirichlet_eps;
+        if (!s->m.pool) return 0;
+        mcts_cache_attach(&s->m, w->ecache);
+        /* At G == 1 the game draws from the worker's own stream, which is what
+         * makes a one-game-in-flight run bit-identical to the old trainer. */
+        s->rng   = (nslots == 1) ? w->rng : s->own_rng;
+        s->state = SL_IDLE;
+        if (!rec_init(&s->rec, c->max_plies)) return 0;
+    }
+    return 1;
+}
+
+static void az_worker_slots_free(AZWorker *w)
+{
+    if (w->slots) {
+        for (int i = 0; i < w->nslots; i++) {
+            mcts_cache_attach(&w->slots[i].m, NULL);   /* it does not own it */
+            mcts_free(&w->slots[i].m);
+            rec_free(&w->slots[i].rec);
+        }
+        free(w->slots);
+        w->slots = NULL;
+    }
+    mcts_batch_free(w->batch);
+    w->batch = NULL;
+    mcts_cache_destroy(w->ecache);
+    w->ecache = NULL;
+    w->nslots = 0;
 }
 
 static void az_selfplay_job(AZWorker *w)
 {
     AZShared *sh = w->sh;
-    w->m.evals = 0;
-    for (;;) {
-        const int i = atomic_fetch_add_explicit(&sh->next, 1, memory_order_relaxed);
-        if (i >= sh->npairs) break;
-        az_play_one(w, i);
+    const int G = w->nslots;
+
+    for (int i = 0; i < G; i++) {
+        w->slots[i].m.evals = 0;
+        w->slots[i].state   = SL_NEWGAME;
     }
-    w->evals += w->m.evals;
+
+    for (;;) {
+        int pending = 0;
+        for (int i = 0; i < G; i++) {
+            AZSlot *s = &w->slots[i];
+            if (az_slot_pump(w, s)) {
+                mcts_batch_add(w->batch, &s->m, s->h);
+                pending++;
+            }
+        }
+        if (pending == 0) break;        /* every slot is out of pairings */
+
+        w->batch_rounds++;
+        w->batch_rows += (uint64_t)pending;
+        w->batch_hist[pending < AZ_BATCH_HIST ? pending : AZ_BATCH_HIST - 1]++;
+
+        mcts_batch_run(w->batch, sh->trunk);
+    }
+
+    for (int i = 0; i < G; i++) {
+        w->evals        += w->slots[i].m.evals;
+        w->cache_hits   += w->slots[i].m.cache_hits;
+        w->cache_misses += w->slots[i].m.cache_misses;
+        w->slots[i].m.cache_hits = w->slots[i].m.cache_misses = 0;
+    }
 }
 
 /* ==========================================================================
@@ -1094,7 +1338,7 @@ static void az_dispatch(AZShared *sh, int job)
 /* Polyak-averaged weights are usually, but not always, stronger than the
  * weights they average.  Rather than assume it, play the two against each
  * other before deciding which set best.crl gets.  Called between generations,
- * with every worker parked on the barrier, so worker 0's search scratch is
+ * with every worker parked on the barrier, so worker 0's FIRST GAME SLOT is
  * free to borrow.  Returns the EMA's score in [0,1], or -1 if not measured. */
 static double az_ema_h2h(AZShared *sh, AZWorker *w, int best_i, int games,
                          uint64_t *rng)
@@ -1107,7 +1351,8 @@ static double az_ema_h2h(AZShared *sh, AZWorker *w, int best_i, int games,
 
     for (int gi = 0; gi < games; gi++) {
         const int ema_white = (gi & 1);
-        Game *g = &w->g;
+        AZSlot *s0 = &w->slots[0];
+        Game *g = &s0->g;
 
         if (c->start_mode == AZ_START_960) {
             game_start960(g, pos_960_random(rng));
@@ -1132,18 +1377,18 @@ static double az_ema_h2h(AZShared *sh, AZWorker *w, int best_i, int games,
                 const Head  *h = use_ema ? &sh->ema_heads[best_i]
                                          : &sh->heads[best_i];
                 float rv = 0.0f;
-                const int n = mcts_search(&w->m, t, h, g, c->sims, 0,
-                                          rng, w->visits, &rv);
+                const int n = mcts_search(&s0->m, t, h, g, c->sims, 0,
+                                          rng, s0->visits, &rv);
                 int nl, pick;
                 float temp;
                 if (n <= 0) break;
-                nl = gen_legal(&g->pos, w->list);
+                nl = gen_legal(&g->pos, s0->list);
                 if (nl != n) break;
                 /* Sampled through the opening so the games differ, greedy
                  * afterwards so the comparison measures strength. */
                 temp = (g->ply < c->opening_plies) ? c->temp_start : 0.0f;
-                pick = mcts_pick(w->visits, n, temp, rng);
-                game_push(g, w->list[pick < 0 ? 0 : pick]);
+                pick = mcts_pick(s0->visits, n, temp, rng);
+                game_push(g, s0->list[pick < 0 ? 0 : pick]);
             }
         }
         {
@@ -1263,6 +1508,14 @@ static void apply_elo(AZShared *sh)
 
 typedef struct {
     double sec, selfplay_sec, learn_sec;
+    /* CONCURRENCY.  batch_mean is the achieved batch size -- the mean number of
+     * pending MCTS leaves that actually went into one nn_eval_batch() call.  It
+     * is below games_in_flight because a game sitting on a terminal node, or
+     * one whose leaf was served from the evaluation cache, contributes no row,
+     * and because games finish their searches at different moments. */
+    double batch_mean, batch_full_frac, cache_hit_rate;
+    uint64_t batch_rounds;
+    uint64_t batch_hist[AZ_BATCH_HIST];
     double elo_best, elo_mean, elo_p10;
     int    best_i;
     uint64_t evals;
@@ -1367,6 +1620,19 @@ static void write_telemetry(FILE *f, const AZShared *sh, const AZStats *st,
     fprintf(f, ",\"sims_per_move\":%d", c->sims);
     fprintf(f, ",\"evals_per_move\":");  jnum(f, gs->evals_per_move);
     fprintf(f, ",\"evals\":%llu", (unsigned long long)gs->evals);
+    fprintf(f, ",\"mcts_batch_mean\":");   jnum(f, gs->batch_mean);
+    fprintf(f, ",\"mcts_batch_full_frac\":"); jnum(f, gs->batch_full_frac);
+    fprintf(f, ",\"mcts_batch_rounds\":%llu", (unsigned long long)gs->batch_rounds);
+    fprintf(f, ",\"mcts_cache_hit_rate\":");  jnum(f, gs->cache_hit_rate);
+    fprintf(f, ",\"mcts_batch_hist\":[");
+    {
+        int last = 0;
+        for (int k = 1; k < AZ_BATCH_HIST; k++) if (gs->batch_hist[k]) last = k;
+        for (int k = 1; k <= last; k++)
+            fprintf(f, "%s%llu", k > 1 ? "," : "",
+                    (unsigned long long)gs->batch_hist[k]);
+    }
+    fprintf(f, "]");
     fprintf(f, ",\"evals_per_sec\":");
     jnum(f, (double)gs->evals / (gs->selfplay_sec > 0.0 ? gs->selfplay_sec : 1.0));
     fprintf(f, ",\"buffer_fill\":");     jnum(f, gs->buffer_fill);
@@ -1487,6 +1753,15 @@ void az_default_cfg(AZCfg *c)
     c->generations      = 200;
     c->games_per_agent  = 4;
     c->threads          = cpu_count();
+    /* MEASURED on an M3 (4P+4E), 8 threads, 160 sims, cap-frac 0.25, self-play
+     * only, interleaved A/B passes: games/sec rises from G = 1 to a plateau at
+     * G = 4..8 and then FALLS, because a thread juggling G trees loses cache
+     * locality faster than the wider batch wins it back.  The achieved batch
+     * size also stops tracking G there -- games in terminal nodes, games served
+     * from the evaluation cache and games between searches contribute no row.
+     * 8 is the top of the measured curve; every game in flight costs a node
+     * pool, a Game and a recorder, so there is no reason to go past it.       */
+    c->games_in_flight  = 8;
 
     c->sims             = 64;
     c->max_plies        = 200;
@@ -1565,6 +1840,10 @@ static void az_sanitise(AZCfg *c)
     if (c->games_per_agent < 2)   c->games_per_agent = 2;
     c->games_per_agent &= ~1;                         /* half as White exactly */
     if (c->threads < 1)           c->threads = cpu_count();
+    /* The batch-size histogram indexes rounds by their row count, and one
+     * round can send at most one row per slot. */
+    if (c->games_in_flight < 1)   c->games_in_flight = 1;
+    if (c->games_in_flight > AZ_BATCH_HIST - 1) c->games_in_flight = AZ_BATCH_HIST - 1;
     if (c->sims < 2)              c->sims = 2;
     if (c->max_plies < 4)         c->max_plies = 200;
     if (c->max_plies > MAX_GAME_PLIES) c->max_plies = MAX_GAME_PLIES;
@@ -1753,16 +2032,12 @@ int az_run(AZCfg *c)
         AZWorker *w = &workers[nworkers_init];
         w->sh  = &sh;
         w->tid = nworkers_init;
-        mcts_init(&w->m, MAX_MOVES + 1 + c->sims * NODES_PER_SIM);
-        w->m.c_puct          = c->c_puct;
-        w->m.dirichlet_alpha = c->dirichlet_alpha;
-        w->m.dirichlet_eps   = c->dirichlet_eps;
         w->tg       = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->tg_pol   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->tg_val   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->hg_probe = (HeadGrad *) calloc(1, sizeof(HeadGrad));
-        if (!w->m.pool || !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe ||
-            !rec_init(&w->rec, c->max_plies)) {
+        if (!az_worker_slots_init(w, c, c->games_in_flight) ||
+            !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe) {
             fprintf(stderr, "az: out of memory (worker %d)\n", nworkers_init);
             nworkers_init++;
             goto done;
@@ -1787,8 +2062,8 @@ int az_run(AZCfg *c)
 
     if (!c->quiet) {
         printf("chessrl az: %d agents, %d generations, %d games/agent "
-               "(%d games/gen), %d threads\n",
-               n, c->generations, gpa, npairs, nthreads);
+               "(%d games/gen), %d threads x %d games in flight\n",
+               n, c->generations, gpa, npairs, nthreads, c->games_in_flight);
         printf("            mcts %d sims, c_puct %.2f, dirichlet %.2f/%.2f, "
                "temp %.2f->%.2f after %d plies, max %d plies\n",
                c->sims, (double)c->c_puct, (double)c->dirichlet_alpha,
@@ -1875,6 +2150,9 @@ int az_run(AZCfg *c)
                     + 0xBF58476D1CE4E5B9ull * (uint64_t)gen);
             st_zero(&w->st);
             w->evals = 0;
+            w->batch_rounds = w->batch_rows = 0;
+            w->cache_hits = w->cache_misses = 0;
+            memset(w->batch_hist, 0, sizeof w->batch_hist);
             w->rootv_sum = 0.0; w->rootv_n = 0;
             w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
             w->resign_checked = w->resign_would = w->resign_wrong = 0;
@@ -1886,7 +2164,9 @@ int az_run(AZCfg *c)
         {
             double rv = 0.0, te = 0.0;
             uint64_t rvn = 0, ten = 0, rchk = 0, rwld = 0, rwrong = 0;
-            uint64_t fm = 0, am = 0;
+            uint64_t fm = 0, am = 0, brows = 0, chit = 0, cmiss = 0;
+            gs.batch_rounds = 0;
+            memset(gs.batch_hist, 0, sizeof gs.batch_hist);
             for (int t = 0; t < nthreads; t++) {
                 st_merge(&st, &workers[t].st);
                 gs.evals += workers[t].evals;
@@ -1897,7 +2177,20 @@ int az_run(AZCfg *c)
                 rwrong += workers[t].resign_wrong;
                 fm += workers[t].full_moves;
                 am += workers[t].all_moves;
+                gs.batch_rounds += workers[t].batch_rounds;
+                brows           += workers[t].batch_rows;
+                chit            += workers[t].cache_hits;
+                cmiss           += workers[t].cache_misses;
+                for (int k = 0; k < AZ_BATCH_HIST; k++)
+                    gs.batch_hist[k] += workers[t].batch_hist[k];
             }
+            gs.batch_mean = gs.batch_rounds
+                          ? (double)brows / (double)gs.batch_rounds : 0.0;
+            gs.batch_full_frac = gs.batch_rounds
+                          ? (double)gs.batch_hist[c->games_in_flight] /
+                            (double)gs.batch_rounds : 0.0;
+            gs.cache_hit_rate = (chit + cmiss)
+                          ? (double)chit / (double)(chit + cmiss) : 0.0;
             gs.full_search_frac  = am ? (double)fm / (double)am : 0.0;
             gs.recorded_per_game = st.games ? (double)fm / (double)st.games : 0.0;
             gs.rootv_mean     = rvn ? rv / (double)rvn : 0.0;
@@ -2136,13 +2429,13 @@ int az_run(AZCfg *c)
             char eta[32];
             ema_gen = (gen == 1) ? gs.sec : (0.7 * ema_gen + 0.3 * gs.sec);
             fmt_dur(ema_gen * (double)(c->generations - gen), eta, sizeof eta);
-            printf("gen %4d/%d  %5.1f g/s  %6.0f ev/s  elo %7.1f/%7.1f  "
+            printf("gen %4d/%d  %5.1f g/s  %6.0f ev/s  b%4.1f  elo %7.1f/%7.1f  "
                    "W%3.0f%% D%3.0f%% L%3.0f%%  len %5.1f  "
                    "kl %5.3f  top1 %4.0f%%  v %5.3f/%5.3f %4.2fx  "
                    "|g| %5.2f %3.0f%%clip  buf %4.1f%%  %5.2fs  eta %s\n",
                    gen, c->generations, (double)st.games / (gs.sec > 0.0 ? gs.sec : 1.0),
                    (double)gs.evals / (gs.selfplay_sec > 0.0 ? gs.selfplay_sec : 1.0),
-                   gs.elo_best, gs.elo_mean,
+                   gs.batch_mean, gs.elo_best, gs.elo_mean,
                    100.0 * (double)st.white_wins / gd,
                    100.0 * (double)st.draws / gd,
                    100.0 * (double)st.black_wins / gd,
@@ -2244,8 +2537,7 @@ done:
     if (tel) fclose(tel);
     if (workers) {
         for (int t = 0; t < nworkers_init; t++) {
-            mcts_free(&workers[t].m);
-            rec_free(&workers[t].rec);
+            az_worker_slots_free(&workers[t]);
             free(workers[t].tg);
             free(workers[t].tg_pol);
             free(workers[t].tg_val);
@@ -2684,16 +2976,12 @@ int az_lrfind(AZLrFindCfg *lc)
         AZWorker *w = &workers[nworkers_init];
         w->sh  = &sh;
         w->tid = nworkers_init;
-        mcts_init(&w->m, MAX_MOVES + 1 + c->sims * NODES_PER_SIM);
-        w->m.c_puct          = c->c_puct;
-        w->m.dirichlet_alpha = c->dirichlet_alpha;
-        w->m.dirichlet_eps   = c->dirichlet_eps;
         w->tg       = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->tg_pol   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->tg_val   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
         w->hg_probe = (HeadGrad *) calloc(1, sizeof(HeadGrad));
-        if (!w->m.pool || !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe ||
-            !rec_init(&w->rec, c->max_plies)) {
+        if (!az_worker_slots_init(w, c, c->games_in_flight) ||
+            !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe) {
             fprintf(stderr, "lrfind: out of memory (worker %d)\n", nworkers_init);
             nworkers_init++;
             goto done;
@@ -2972,20 +3260,32 @@ int az_lrfind(AZLrFindCfg *lc)
          * coefficient b reduces variance by (1-b)/(1+b), so 3 * sd_smoothed is
          * the bar the descent has to clear. */
         {
+            /* Measured over the DESCENDING REGION (step 0 to the minimum) only.
+             * Past the minimum the loss is exploding by construction, and its
+             * residual about the smoothed curve is then a measurement of the
+             * divergence rather than of minibatch noise -- including that tail
+             * inflates the noise estimate by an order of magnitude and makes a
+             * perfectly clean descent look insignificant. */
             double rss = 0.0;
-            int rn = 0;
-            for (int i = 0; i < n_rows; i++) {
-                if (!row[i].finite || !isfinite(row[i].s_tot)) continue;
-                const double d = row[i].loss - row[i].s_tot;
-                rss += d * d;
-                rn++;
+            int rn = 0, hi = (i_min >= 0) ? i_min : n_rows - 1;
+            for (int pass = 0; pass < 2 && rn < 8; pass++) {
+                rss = 0.0; rn = 0;
+                if (pass) hi = n_rows - 1;               /* fallback: all rows */
+                for (int i = 0; i <= hi; i++) {
+                    if (!row[i].finite || !isfinite(row[i].s_tot)) continue;
+                    const double d = row[i].loss - row[i].s_tot;
+                    rss += d * d;
+                    rn++;
+                }
             }
             resid_sd = (rn > 1) ? sqrt(rss / (double)(rn - 1)) : 0.0;
             sd_s  = resid_sd * sqrt((1.0 - lc->smooth) / (1.0 + lc->smooth));
             depth = (i_min >= 0) ? s0 - row[i_min].s_tot : 0.0;
             significant = (depth > 3.0 * sd_s);
             printf("  noise floor          minibatch sd %.4f about the smoothed "
-                   "curve -> sd(smoothed) %.4f\n", resid_sd, sd_s);
+                   "curve over the %d\n"
+                   "                       descending steps -> sd(smoothed) "
+                   "%.4f\n", resid_sd, rn, sd_s);
             printf("  descent depth        %.4f  (%.1f x sd(smoothed))%s\n",
                    depth, sd_s > 0.0 ? depth / sd_s : 0.0,
                    significant ? "" : "   NOT SIGNIFICANT");
@@ -3172,8 +3472,7 @@ done:
     }
     if (workers) {
         for (int t = 0; t < nworkers_init; t++) {
-            mcts_free(&workers[t].m);
-            rec_free(&workers[t].rec);
+            az_worker_slots_free(&workers[t]);
             free(workers[t].tg);
             free(workers[t].tg_pol);
             free(workers[t].tg_val);

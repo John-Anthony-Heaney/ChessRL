@@ -29,12 +29,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #ifndef NN_PROFILE_SRC
 #define NN_PROFILE_SRC "../src/net.c"
 #endif
 #include NN_PROFILE_SRC
+
+/* a reference net.c built for comparison may predate these */
+#ifndef NN_ACCELERATE
+#define NN_ACCELERATE 0
+#endif
+#ifndef NN_BATCH_TILE
+#define NN_BATCH_TILE 0
+#endif
 
 /* ------------------------------------------------------------------ timing */
 
@@ -180,6 +189,28 @@ static void report_stages(void)
               NF_VACC, av);
     nn_matvec(g_heads[0].Wvh, g_heads[0].bvh, fw.hv0, NF_VHID, NF_VACC, zv);
 
+/* A stage whose inputs never change is loop-invariant, and the compiler simply
+ * hoists it out of the timing loop: the first cut of this profiler reported
+ * 0.1 ns for a 32-wide LayerNorm, which is not a fast LayerNorm but an absent
+ * one.  So every buffer a stage might read is touched with a value derived from
+ * the iteration counter before the stage runs, which makes all of them
+ * loop-variant -- and the cost of doing that is measured on its own with an
+ * empty body and subtracted.  The cross-check at the bottom (stages against the
+ * whole evaluation) is what says the result is sound. */
+#define STAGE_TICK                                                         \
+    do {                                                                   \
+        const float tick = (float)(it & 1) * 1e-30f;                       \
+        acc[it & (NF_ACC - 1)]   += tick;                                  \
+        z2 [it & (NF_HID - 1)]   += tick;                                  \
+        av [it & (NF_VACC - 1)]  += tick;                                  \
+        zv [it & (NF_VHID - 1)]  += tick;                                  \
+        fw.h1 [it & (NF_ACC - 1)]  += tick;                                \
+        fw.h2 [it & (NF_HID - 1)]  += tick;                                \
+        fw.hv0[it & (NF_VACC - 1)] += tick;                                \
+        fw.hv [it & (NF_VHID - 1)] += tick;                                \
+        fw.q  [it & (NF_PDIM - 1)] += tick;                                \
+    } while (0)
+
 #define TIME_STAGE(NAME, BODY)                                             \
     do {                                                                   \
         const double t0 = now_sec();                                       \
@@ -187,17 +218,31 @@ static void report_stages(void)
             const CPos *c = &g_corpus[it % g_ncorpus];                     \
             const Head *hd = &g_heads[(it / HEAD_PERIOD) % NHEADS];        \
             (void)c; (void)hd;                                             \
+            STAGE_TICK;                                                    \
             BODY;                                                          \
         }                                                                  \
         const double dt = now_sec() - t0;                                  \
         st[ns].name = (NAME);                                              \
-        st[ns].ns = 1e9 * dt / (double)STAGE_ITERS;                        \
+        st[ns].ns = 1e9 * dt / (double)STAGE_ITERS - overhead;             \
         ns++;                                                              \
         g_sink_f += fw.v + fw.h1[0] + fw.h2[0] + fw.hv0[1] + fw.hv[0] +   \
                     fw.x1[0] + fw.x2[0] + fw.xv0[1] + fw.xv[0] + fw.q[0] +\
                     fw.r1 + fw.r2 + fw.rv0 + fw.rv +                      \
                     acc[0] + z2[0] + av[0] + zv[0] + logits[0];            \
     } while (0)
+
+    double overhead = 0.0;
+    {   /* the cost of the loop and the anti-hoisting writes, on their own */
+        double best = 1e30;
+        for (int r = 0; r < 3; r++) {
+            const double t0 = now_sec();
+            for (int it = 0; it < STAGE_ITERS; it++) { STAGE_TICK; }
+            const double d = 1e9 * (now_sec() - t0) / (double)STAGE_ITERS;
+            if (d < best) best = d;
+        }
+        overhead = best;
+        g_sink_f += acc[0] + z2[0] + av[0] + zv[0];
+    }
 
     TIME_STAGE("W0 gather (sparse, 128 wide)",
                nn_gather(g_trunk->W0, g_trunk->b0, hd->z, c->fidx, c->nf, NF_ACC, acc));
@@ -256,6 +301,7 @@ static void report_stages(void)
 
     printf("\n--- where one evaluation goes (single thread, %d positions x %d heads)\n",
            g_ncorpus, NHEADS);
+    printf("    [loop + anti-hoisting overhead of %.1f ns already subtracted from each]\n", overhead);
     printf("    stage                              ns/eval   %% of eval+logits\n");
     for (int i = 0; i < ns; i++)
         printf("    %-34s %7.1f   %5.1f%%\n", st[i].name, st[i].ns, 100.0 * st[i].ns / sum);
@@ -299,6 +345,7 @@ typedef struct {
 } Task;
 
 static Fwd *g_shared_fwd;
+static double g_last_rate[32];
 static int  g_pack_fwd = 0;
 
 /* macOS has no pthread_barrier; a condvar gate is enough to start together. */
@@ -361,7 +408,7 @@ static double bench_threads(int nthread, int iters, uint64_t *sink)
     for (int i = 0; i < nthread; i++) pthread_create(&th[i], NULL, thread_body, &task[i]);
     for (int i = 0; i < nthread; i++) pthread_join(th[i], NULL);
     const double dt = now_sec() - t0;
-    for (int i = 0; i < nthread; i++) *sink += task[i].sink;
+    for (int i = 0; i < nthread; i++) { *sink += task[i].sink; g_last_rate[i] = task[i].rate; }
     return (double)(iters * nthread) / dt;
 }
 
@@ -383,8 +430,11 @@ static void report_threads(uint64_t *sink)
             const double v = bench_threads(n, 100000, sink);
             if (v > best) best = v;
         }
-        printf("  %d thread%s              %10.0f evals/sec   %5.2fx   %3.0f%% efficiency\n",
+        printf("  %d thread%s              %10.0f evals/sec   %5.2fx   %3.0f%% efficiency",
                n, n == 1 ? " " : "s", best, best / one, 100.0 * best / (one * n));
+        printf("   [per-thread last rep:");
+        for (int q = 0; q < n; q++) printf(" %.0f", g_last_rate[q]);
+        printf("]\n");
     }
 
     /* false sharing: every thread's Fwd adjacent in one array instead of on its
@@ -407,6 +457,161 @@ static void report_threads(uint64_t *sink)
     free(g_shared_fwd);
 }
 
+#if NN_BATCH_TILE
+/* -------------------------------------------------------------- the batch */
+/*
+ * evals/sec against batch size.  Two orderings are measured because the batched
+ * per-head layers only fire on adjacent rows that share a head:
+ *   grouped  -- every row in the batch belongs to one agent, which is what a
+ *               leaf-parallel search inside ONE game produces;
+ *   mixed    -- consecutive rows belong to different agents, which is what
+ *               naively interleaving games produces.
+ * The difference between the two is what a caller buys by sorting its batch.
+ */
+
+#define BMAX 128
+
+typedef struct {
+    Fwd             *out;
+    const Head     **heads;
+    const uint16_t **fidx;
+    int             *nf;
+} BatchBuf;
+
+static void batch_alloc(BatchBuf *bb)
+{
+    bb->out   = (Fwd *)            malloc(sizeof(Fwd) * BMAX);
+    bb->heads = (const Head **)    malloc(sizeof(Head *) * BMAX);
+    bb->fidx  = (const uint16_t **)malloc(sizeof(uint16_t *) * BMAX);
+    bb->nf    = (int *)            malloc(sizeof(int) * BMAX);
+    if (!bb->out || !bb->heads || !bb->fidx || !bb->nf) { fprintf(stderr, "OOM\n"); exit(1); }
+}
+
+static void batch_fill(BatchBuf *bb, int nb, int start, int tid, int grouped)
+{
+    for (int b = 0; b < nb; b++) {
+        const CPos *c = &g_corpus[(start + b) % g_ncorpus];
+        bb->fidx[b]  = c->fidx;
+        bb->nf[b]    = c->nf;
+        bb->heads[b] = grouped ? &g_heads[(start / HEAD_PERIOD + tid) % NHEADS]
+                               : &g_heads[(start + b + tid) % NHEADS];
+    }
+}
+
+static double bench_batch_once(int nb, int iters, int grouped, int tid, uint64_t *sink)
+{
+    BatchBuf bb;
+    batch_alloc(&bb);
+    batch_fill(&bb, nb, 0, tid, grouped);
+    nn_eval_batch(g_trunk, bb.heads, nb, bb.fidx, bb.nf, bb.out);   /* warm */
+
+    const double t0 = now_sec();
+    for (int it = 0; it < iters; it++) {
+        batch_fill(&bb, nb, it * nb, tid, grouped);
+        nn_eval_batch(g_trunk, bb.heads, nb, bb.fidx, bb.nf, bb.out);
+        *sink += (uint64_t)(int64_t)(bb.out[0].v * 1e6f);
+    }
+    const double dt = now_sec() - t0;
+    free(bb.out); free((void *)bb.heads); free((void *)bb.fidx); free(bb.nf);
+    return (double)iters * nb / dt;
+}
+
+typedef struct {
+    int nb, iters, grouped, tid;
+    uint64_t sink;
+    double rate;
+    char pad[64];
+} BTask;
+
+static void *batch_thread(void *arg)
+{
+    BTask *t = (BTask *)arg;
+    BatchBuf bb;
+    batch_alloc(&bb);
+    batch_fill(&bb, t->nb, 0, t->tid, t->grouped);
+    nn_eval_batch(g_trunk, bb.heads, t->nb, bb.fidx, bb.nf, bb.out);
+
+    gate_wait(&g_gate);
+    const double t0 = now_sec();
+    for (int it = 0; it < t->iters; it++) {
+        batch_fill(&bb, t->nb, it * t->nb + t->tid * 13, t->tid, t->grouped);
+        nn_eval_batch(g_trunk, bb.heads, t->nb, bb.fidx, bb.nf, bb.out);
+        t->sink += (uint64_t)(int64_t)(bb.out[0].v * 1e6f);
+    }
+    t->rate = (double)t->iters * t->nb / (now_sec() - t0);
+    free(bb.out); free((void *)bb.heads); free((void *)bb.fidx); free(bb.nf);
+    return NULL;
+}
+
+static double bench_batch_threads(int nthread, int nb, int iters, int grouped, uint64_t *sink)
+{
+    pthread_t th[32];
+    BTask task[32];
+    gate_init(&g_gate, nthread);
+    for (int i = 0; i < nthread; i++) {
+        memset(&task[i], 0, sizeof task[i]);
+        task[i].nb = nb; task[i].iters = iters; task[i].grouped = grouped; task[i].tid = i;
+    }
+    const double t0 = now_sec();
+    for (int i = 0; i < nthread; i++) pthread_create(&th[i], NULL, batch_thread, &task[i]);
+    for (int i = 0; i < nthread; i++) pthread_join(th[i], NULL);
+    const double dt = now_sec() - t0;
+    for (int i = 0; i < nthread; i++) { *sink += task[i].sink; g_last_rate[i] = task[i].rate; }
+    return (double)iters * nb * nthread / dt;
+}
+
+/* batch results must equal the unbatched ones -- checked properly in
+ * tests/test_net.c, checked here so the benchmark cannot report a rate for a
+ * kernel that is broken */
+static void batch_check(void)
+{
+    BatchBuf bb;
+    batch_alloc(&bb);
+    Fwd single;
+    double maxv = 0.0;
+    int exact_v = 1;
+    const int NB = 64;
+    batch_fill(&bb, NB, 7, 0, 0);
+    nn_eval_batch(g_trunk, bb.heads, NB, bb.fidx, bb.nf, bb.out);
+    for (int b = 0; b < NB; b++) {
+        nn_eval(g_trunk, bb.heads[b], bb.fidx[b], bb.nf[b], &single);
+        if (memcmp(&single, &bb.out[b], sizeof(Fwd)) != 0) exact_v = 0;
+        const double d = fabs((double)single.v - (double)bb.out[b].v);
+        if (d > maxv) maxv = d;
+    }
+    printf("  batch vs single over %d mixed-head rows: %s, max |dv| %.3g\n",
+           NB, exact_v ? "bit-identical" : "NOT bit-identical", maxv);
+    free(bb.out); free((void *)bb.heads); free((void *)bb.fidx); free(bb.nf);
+}
+
+static void report_batch(uint64_t *sink)
+{
+    const int SIZES[] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const int NS = (int)(sizeof SIZES / sizeof SIZES[0]);
+
+    printf("\n--- batch scaling (nn_eval only, no logits) ---\n");
+    printf("  built %s Accelerate\n", NN_ACCELERATE ? "WITH" : "WITHOUT");
+    batch_check();
+    printf("\n  batch |  1 thread grouped |  1 thread mixed   |  8 threads grouped | 8 thr grouped/1 thr\n");
+    for (int i = 0; i < NS; i++) {
+        const int nb = SIZES[i];
+        const int iters = 60000 / nb + 4;
+        double g1 = 0.0, m1 = 0.0, g8 = 0.0;
+        for (int r = 0; r < 2; r++) {
+            double v = bench_batch_once(nb, iters, 1, 0, sink); if (v > g1) g1 = v;
+            v = bench_batch_once(nb, iters, 0, 0, sink);        if (v > m1) m1 = v;
+        }
+        for (int r = 0; r < 2; r++) {
+            const double v = bench_batch_threads(8, nb, iters / 2 + 2, 1, sink);
+            if (v > g8) g8 = v;
+        }
+        printf("  %5d | %10.0f evals/s | %10.0f evals/s | %10.0f evals/s | %5.2fx\n",
+               nb, g1, m1, g8, g8 / g1);
+    }
+}
+
+#endif /* NN_BATCH_TILE */
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "all";
@@ -425,6 +630,9 @@ int main(int argc, char **argv)
     if (!strcmp(mode, "stages") || !strcmp(mode, "all")) { fingerprint(1); report_stages(); }
 #endif
     if (!strcmp(mode, "threads") || !strcmp(mode, "all")) report_threads(&sink);
+#if NN_BATCH_TILE
+    if (!strcmp(mode, "batch") || !strcmp(mode, "all")) report_batch(&sink);
+#endif
 
     if (sink == 0x123456789ULL) printf("(impossible)\n");
     return 0;

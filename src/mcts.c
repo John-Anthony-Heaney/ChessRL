@@ -110,8 +110,27 @@
  * key: that covers the pieces, the castling mask, the en-passant file and the
  * side, but the network's input also has a halfmove-clock bucket, and in
  * Chess960 the legal move list depends on the rook origin files.  Both are
- * folded in.  Invalidation is a generation counter, so a flush is O(1) and
- * happens on any change of trunk, head or weights.
+ * folded in -- and so is the WEIGHT STAMP, so an entry names (input, trunk,
+ * head, weights) rather than a position.  That is what lets several concurrent
+ * searches share one table while playing different agents: an entry made under
+ * other weights has a different tag and simply cannot be hit, which is a
+ * stronger guarantee than the flush it replaces and costs no bookkeeping at
+ * all.  mcts_cache_clear() remains for a caller who mutates weights by a route
+ * the stamp cannot see; it is a generation bump, so it is still O(1).
+ *
+ * ------------------------------------------------- many searches at once
+ *
+ * MCTS is strictly sequential -- a simulation cannot choose its next path until
+ * the previous leaf has been evaluated -- so a lone search hands the network
+ * one position at a time and every evaluation is a batch of one.  The search is
+ * therefore written as a resumable state machine (mcts_begin / mcts_step /
+ * mcts_deliver / mcts_end) that STOPS at a leaf instead of blocking on it, so a
+ * driver can collect one pending leaf from each of many INDEPENDENT searches
+ * and evaluate them all in one nn_eval_batch().  Independent searches share no
+ * tree and no pool, so this needs no virtual loss and introduces no
+ * approximation: each performs exactly the simulations it would have performed
+ * alone.  mcts_search() is that machine driven one leaf at a time, so there is
+ * only one implementation of the search and the two paths cannot drift.
  */
 
 #include "mcts.h"
@@ -276,6 +295,63 @@ struct MctsCache {
     uint32_t gen;
 };
 
+/* ------------------------------------------------- the stepped search's state
+ *
+ * Everything mcts_search() used to hold in locals and in its two nested loops.
+ * It is here, and not on the stack, because the search must be able to STOP at
+ * a leaf, hand the leaf out to be evaluated in a batch with other searches, and
+ * resume exactly where it was.  `phase` is the program counter; `resume` is
+ * where a delivery lands.
+ *
+ * One per Mcts, allocated once in mcts_init(): the hot path still never calls
+ * malloc, and a concurrent search still copies exactly one Position. */
+enum {
+    MC_PH_ROOT = 0,    /* expand the root                                     */
+    MC_PH_ROOT_EVAL,   /* ... resuming, the root's evaluation has arrived     */
+    MC_PH_ROOT_DONE,   /* the root is expanded: check it, seed N and W        */
+    MC_PH_PREP,        /* root noise, the budget, the repetition base         */
+    MC_PH_SIM,         /* start one simulation                                */
+    MC_PH_DESCEND,     /* select down to a leaf                               */
+    MC_PH_LEAF_EVAL,   /* ... resuming, the leaf's evaluation has arrived     */
+    MC_PH_BACKUP,      /* back the value up and unwind the position           */
+    MC_PH_DONE
+};
+
+struct MctsRun {
+    const Trunk *t;
+    const Head  *h;
+    const Game  *g;
+    uint64_t    *rng;
+    int          sims, root_noise;
+    int          phase, resume;
+    int          started;          /* between mcts_begin() and mcts_end()     */
+
+    /* the ONE Position copy of the whole search, maintained incrementally */
+    Position     pos;
+    /* [ game history tail | selection path ], keys[nkeys-1] == current key */
+    uint64_t     keys[MCTS_HIST_KEEP + MCTS_MAX_DEPTH + 2];
+    int          nkeys, base_keys;
+
+    int          path[MCTS_MAX_DEPTH + 1];
+    Undo         undo[MCTS_MAX_DEPTH + 1];
+    int          depth;
+
+    int          todo, s;          /* simulation budget and counter           */
+    int          nroot;            /* legal moves at the root, 0 = no search  */
+    float        value;            /* the value being backed up               */
+    float        rootv0;           /* the root's own evaluation               */
+
+    /* the leaf being expanded, held across a suspension */
+    int          node;             /* its pool index                          */
+    Move         list[MAX_MOVES];  /* its legal moves, from gen_legal()       */
+    int          nlist;
+    McEntry     *slot;             /* cache slot to fill on delivery, or NULL */
+    uint64_t     tag;
+    uint16_t     fidx[NF_MAXACTIVE];
+    int          nf;
+    Fwd          fw;               /* only q and v are ever meaningful        */
+};
+
 /* The cache key is the whole network input, not just the zobrist key.  See the
  * file header: the halfmove-clock bucket is a network feature the zobrist key
  * does not carry, and the Chess960 rook files change the legal move list. */
@@ -294,6 +370,52 @@ static uint64_t mc_pos_key(const Position *p)
     return mc_mix64(p->key ^ mc_mix64(x));
 }
 
+/* The tag folds the WEIGHT STAMP in beside the network input, so an entry names
+ * (input, trunk, head, weights) rather than merely the position.  Two
+ * consequences, and the second is the whole point:
+ *
+ *   - a search never has to flush the table when the agent or the weights
+ *     change.  An entry written under other weights simply has a different tag
+ *     and can never be hit again.  That is a STRICTLY STRONGER guarantee than
+ *     the flush it replaces, which relied on noticing the change in time.
+ *   - several searches can therefore SHARE one table even while they play
+ *     different agents.  Before this the stamp was compared against a per-search
+ *     scalar and any disagreement wiped the whole table, so two concurrent games
+ *     on different heads would have spent their lives flushing each other.
+ *     Sharing is what makes G concurrent games per thread affordable: one table
+ *     per thread instead of G of them.
+ *
+ * A hit is still bit-for-bit what nn_eval() would have returned for THAT
+ * search, which is the only property anything downstream depends on.
+ * tests/test_mcts.c checks it by running whole searches with the cache on and
+ * with it off and comparing visit counts exactly. */
+/* The tag carries the stamp; the INDEX does not.  A slot is chosen from the
+ * position alone, so which slot a lookup lands in is a function of the game and
+ * of nothing else.  That matters because the stamp contains the trunk and head
+ * POINTERS -- that is how a change of agent is detected -- and those move with
+ * ASLR: indexing by the tag would make the hit/miss pattern differ between two
+ * runs of the same seed, and with G games in flight the number of evaluations a
+ * game needs decides the round it finishes in, which decides the order finished
+ * games enter the replay buffer.  The VALUES would still be right (a hit needs
+ * a full tag match), but the run would stop being reproducible.  Indexing on
+ * the position costs only that two heads evaluating the SAME position now share
+ * one slot instead of two. */
+typedef struct { uint64_t tag; uint32_t idx; } McKey;
+
+static inline McKey mc_key(const Mcts *m, const Position *p)
+{
+    const uint64_t pk = mc_pos_key(p);
+    McKey k;
+    k.tag = mc_mix64(pk ^ m->wstamp);
+    k.idx = (uint32_t)pk;
+    return k;
+}
+
+/* Invalidate the standing tree only.  The tree is statistics ABOUT particular
+ * weights and cannot be re-tagged, so unlike the cache it really must be
+ * dropped when they change. */
+static void mc_tree_drop(Mcts *m) { m->tree_valid = 0; }
+
 void mcts_cache_clear(Mcts *m)
 {
     if (!m) return;
@@ -306,44 +428,45 @@ void mcts_cache_clear(Mcts *m)
     }
 }
 
-/* Fills fw->q and fw->v, from the cache when the position has been seen under
- * these weights and from the network otherwise.
- *
- * ONLY q and v are written.  nn_logits() reads fw->q and nothing else, and the
- * search uses fw->v; the rest of Fwd (acc, h1, z2, h2, raw_v) is the training
- * path's business and is left alone here.  A cached result is therefore
- * bit-for-bit what nn_eval() would have produced for everything this file
- * goes on to compute. */
-static void mc_evaluate(Mcts *m, const Trunk *t, const Head *h,
-                        const Position *pos, Fwd *fw)
+/* ------------------------------------------------------------ shared cache */
+
+static int mc_clamp_bits(int bits)
 {
-    struct MctsCache *ca = m->cache ? m->ecache : NULL;
-    uint64_t  tag  = 0;
-    McEntry  *slot = NULL;
+    if (bits < 8)  bits = 8;
+    if (bits > 20) bits = 20;
+    return bits;
+}
 
-    if (ca) {
-        tag  = mc_pos_key(pos);
-        slot = &ca->e[(uint32_t)tag & ca->mask];
-        if (slot->gen == ca->gen && slot->tag == tag) {
-            memcpy(fw->q, slot->q, sizeof slot->q);
-            fw->v = slot->v;
-            m->cache_hits++;
-            return;
-        }
-        m->cache_misses++;
-    }
+struct MctsCache *mcts_cache_create(int bits)
+{
+    bits = mc_clamp_bits(bits);
+    struct MctsCache *c = (struct MctsCache *)malloc(sizeof *c);
+    if (!c) return NULL;
+    c->e = (McEntry *)calloc((size_t)1 << bits, sizeof(McEntry));
+    if (!c->e) { free(c); return NULL; }
+    c->mask = (uint32_t)(((size_t)1 << bits) - 1);
+    c->gen  = 1;
+    return c;
+}
 
-    uint16_t fidx[NF_MAXACTIVE];
-    const int nf = nn_features(pos, fidx);
-    nn_eval(t, h, fidx, nf, fw);
-    m->evals++;
+void mcts_cache_destroy(struct MctsCache *c)
+{
+    if (!c) return;
+    free(c->e);
+    free(c);
+}
 
-    if (slot) {                       /* direct-mapped: the newest wins */
-        slot->tag = tag;
-        slot->gen = ca->gen;
-        slot->v   = fw->v;
-        memcpy(slot->q, fw->q, sizeof slot->q);
-    }
+void mcts_cache_attach(Mcts *m, struct MctsCache *c)
+{
+    if (!m) return;
+    if (m->owns_cache && m->ecache) mcts_cache_destroy(m->ecache);
+    m->ecache     = c;
+    m->owns_cache = 0;
+    m->tree_valid = 0;
+    if (!c) { m->cache_bits = 0; return; }
+    int bits = 0;
+    while (((uint32_t)1 << bits) <= c->mask) bits++;
+    m->cache_bits = bits;
 }
 
 /* ------------------------------------------------------------- node pool */
@@ -399,16 +522,17 @@ void mcts_init(Mcts *m, int max_nodes)
     m->cap  = max_nodes;
     m->used = 0;
 
+    /* The stepped search's resumable state.  Allocated once, here, so that the
+     * hot path still never calls malloc even though the search can now suspend
+     * itself in the middle of a simulation. */
+    m->run = (struct MctsRun *)calloc(1, sizeof(struct MctsRun));
+    if (!m->run) { free(m->pool); free(m->remap); m->pool = NULL; m->remap = NULL; return; }
+
     m->cache_bits = mc_cache_bits_for(max_nodes);
     {
-        const size_t n = (size_t)1 << m->cache_bits;
-        struct MctsCache *ca = (struct MctsCache *)malloc(sizeof *ca);
-        if (ca) {
-            ca->e = (McEntry *)calloc(n, sizeof(McEntry));
-            if (!ca->e) { free(ca); ca = NULL; }
-            else { ca->mask = (uint32_t)(n - 1); ca->gen = 1; }
-        }
-        m->ecache = ca;                /* NULL simply means "no cache" */
+        struct MctsCache *ca = mcts_cache_create(m->cache_bits);
+        m->ecache     = ca;            /* NULL simply means "no cache" */
+        m->owns_cache = (ca != NULL);
         if (!ca) m->cache_bits = 0;
     }
     /* m->evals and m->max_depth_seen accumulate across searches (a running
@@ -421,10 +545,13 @@ void mcts_free(Mcts *m)
     if (!m) return;
     free(m->pool);
     free(m->remap);
-    if (m->ecache) { free(m->ecache->e); free(m->ecache); }
+    free(m->run);
+    if (m->owns_cache) mcts_cache_destroy(m->ecache);
     m->pool       = NULL;
     m->remap      = NULL;
+    m->run        = NULL;
     m->ecache     = NULL;
+    m->owns_cache = 0;
     m->cap        = 0;
     m->used       = 0;
     m->tree_valid = 0;
@@ -495,21 +622,44 @@ static int mcts_select(const Mcts *m, const MctsNode *nd)
     return best;
 }
 
-/* Evaluates a leaf and, unless it is terminal, expands it.
+/* ---------------------------------------------------------------- expansion
  *
- * Returns the node's value from ITS OWN side-to-move point of view:
- *   - terminal: +/-1 for a decided result, 0 for any draw, cached in tval so
- *     later visits cost nothing and never touch the network;
- *   - otherwise: the value head's v.
- */
-static float mcts_expand(Mcts *m, const Trunk *t, const Head *h, int ni,
-                         const Position *pos, const uint64_t *keys, int nkeys,
-                         int depth)
+ * mcts_expand() used to be one function: generate the moves, test the terminal
+ * conditions, evaluate the network, expand.  It is now two, split exactly where
+ * the network call was, because that call is the only thing a search ever has
+ * to wait for.
+ *
+ *   mc_expand_begin  does everything up to and including the CACHE LOOKUP and
+ *                    returns what happened.  On a miss it leaves the active
+ *                    features in r->fidx/r->nf for the caller to evaluate,
+ *                    which it may do in a batch with other searches' leaves.
+ *   mc_expand_end    consumes r->fw (q and v, from the cache or from the
+ *                    network) and expands the node.
+ *
+ * The order of operations is unchanged, including the two that are observable:
+ * the evaluation still happens BEFORE the pool-capacity test, so an exhausted
+ * pool still costs an evaluation and still returns v without expanding; and the
+ * terminal tests still happen before the evaluation, so a terminal leaf still
+ * never touches the network.
+ *
+ * ONLY q and v are ever read out of a cached entry.  nn_logits() reads fw->q
+ * and nothing else, and the backup uses fw->v; the rest of Fwd is the training
+ * path's business.  A cached result is therefore bit-for-bit what nn_eval()
+ * would have produced for everything this file goes on to compute. */
+enum { MC_EX_TERMINAL = 0,   /* nd->tval is the value; no network needed      */
+       MC_EX_READY,          /* r->fw is filled from the cache                */
+       MC_EX_NEEDEVAL };     /* r->fidx/r->nf need the network                */
+
+static int mc_expand_begin(Mcts *m, int ni, const Position *pos,
+                           const uint64_t *keys, int nkeys, int depth)
 {
+    struct MctsRun *restrict r = m->run;
     MctsNode *nd = &m->pool[ni];
 
-    Move list[MAX_MOVES];
-    const int n = gen_legal(pos, list);          /* once per expanded node */
+    r->node  = ni;
+    r->slot  = NULL;
+    r->nlist = gen_legal(pos, r->list);          /* once per expanded node */
+    const int n = r->nlist;
 
     /* ---- terminal states.  Rules of chess, never the network. ---------- */
     if (n == 0) {
@@ -520,16 +670,16 @@ static float mcts_expand(Mcts *m, const Trunk *t, const Head *h, int ni,
             nd->terminal = (int8_t)TR_STALEMATE;
             nd->tval     = 0.0f;                 /* a draw, NOT a win        */
         }
-        return nd->tval;
+        return MC_EX_TERMINAL;
     }
     if (insufficient_material(pos)) {
-        nd->terminal = (int8_t)TR_INSUFFICIENT; nd->tval = 0.0f; return 0.0f;
+        nd->terminal = (int8_t)TR_INSUFFICIENT; nd->tval = 0.0f; return MC_EX_TERMINAL;
     }
     if (pos->halfmove >= 100) {
-        nd->terminal = (int8_t)TR_FIFTY;        nd->tval = 0.0f; return 0.0f;
+        nd->terminal = (int8_t)TR_FIFTY;        nd->tval = 0.0f; return MC_EX_TERMINAL;
     }
     if (mcts_rep_count(keys, nkeys, pos->key, (int)pos->halfmove) >= 3) {
-        nd->terminal = (int8_t)TR_REPETITION;   nd->tval = 0.0f; return 0.0f;
+        nd->terminal = (int8_t)TR_REPETITION;   nd->tval = 0.0f; return MC_EX_TERMINAL;
     }
     if (depth >= MCTS_MAX_DEPTH) {
         /* The ply cap is measured from the ROOT, so this adjudication would not
@@ -539,12 +689,35 @@ static float mcts_expand(Mcts *m, const Trunk *t, const Head *h, int ni,
          * "an inherited tree is exactly a fresh one" true without exception. */
         nd->terminal = (int8_t)TR_MAX_PLIES;    nd->tval = 0.0f;
         m->tree_capped = 1;
-        return 0.0f;
+        return MC_EX_TERMINAL;
     }
 
     /* ---- the network: the only evaluation in this file ----------------- */
-    Fwd fw;
-    mc_evaluate(m, t, h, pos, &fw);              /* q and v, cached */
+    struct MctsCache *ca = m->cache ? m->ecache : NULL;
+    if (ca) {
+        const McKey k = mc_key(m, pos);
+        McEntry *slot = &ca->e[k.idx & ca->mask];
+        if (slot->gen == ca->gen && slot->tag == k.tag) {
+            memcpy(r->fw.q, slot->q, sizeof slot->q);
+            r->fw.v = slot->v;
+            m->cache_hits++;
+            return MC_EX_READY;
+        }
+        m->cache_misses++;
+        r->slot = slot;
+        r->tag  = k.tag;
+    }
+    r->nf = nn_features(pos, r->fidx);
+    return MC_EX_NEEDEVAL;
+}
+
+/* Expands the node mc_expand_begin() left pending and returns its value from
+ * its OWN side-to-move point of view. */
+static float mc_expand_end(Mcts *m, const Head *h, const Position *pos)
+{
+    struct MctsRun *restrict r = m->run;
+    MctsNode *nd = &m->pool[r->node];
+    const int n = r->nlist;
 
     /* Out of nodes: degrade gracefully.  Keep evaluating, stop growing.  The
      * node stays unexpanded, so it is re-evaluated on every later visit and the
@@ -552,15 +725,15 @@ static float mcts_expand(Mcts *m, const Trunk *t, const Head *h, int ni,
      * corrupts the tree. */
     if (m->used + n > m->cap) {
         m->pool_exhausted++;
-        return fw.v;
+        return r->fw.v;
     }
 
     MoveKey mk[MAX_MOVES];
     float   logits[MAX_MOVES];
     float   pri[MAX_MOVES];
 
-    for (int i = 0; i < n; i++) nn_move_key(pos, list[i], &mk[i]);
-    nn_logits(h, &fw, mk, n, logits);
+    for (int i = 0; i < n; i++) nn_move_key(pos, r->list[i], &mk[i]);
+    nn_logits(h, &r->fw, mk, n, logits);
     softmax_t(logits, n, 1.0f, pri);             /* priors over the LEGAL moves */
 
     const int base = m->used;
@@ -577,9 +750,9 @@ static float mcts_expand(Mcts *m, const Trunk *t, const Head *h, int ni,
         c->nchild   = 0;
         c->terminal = 0;
         c->tval     = 0.0f;
-        c->move     = list[i];
+        c->move     = r->list[i];
     }
-    return fw.v;
+    return r->fw.v;
 }
 
 /* P <- (1-eps) * P + eps * Dir(alpha), the AlphaZero root exploration noise.
@@ -762,48 +935,76 @@ static int mcts_try_reuse(Mcts *m, const Game *g, const uint64_t *keys, int nkey
 }
 
 /* ------------------------------------------------------------------ search */
+/*
+ * The search is written as a RESUMABLE STATE MACHINE rather than as two nested
+ * loops, because MCTS is strictly sequential and that is exactly the problem.
+ * A simulation cannot pick its next path until the previous leaf's value is
+ * known, so a lone search can never present the network with more than one
+ * position at a time -- a 128x128 matrix-VECTOR product, which cannot use the
+ * machine's width.
+ *
+ * So the search stops at the leaf instead of blocking on it.  mcts_step() runs
+ * until a leaf needs the network and hands it out; the caller batches that leaf
+ * with the pending leaves of OTHER, INDEPENDENT searches, evaluates them all in
+ * one nn_eval_batch(), and gives each value back with mcts_deliver().
+ *
+ * Nothing about the search changes.  Independent searches share no tree, no
+ * node pool and no repetition window, so each one performs exactly the
+ * simulations it would have performed alone, in exactly the same order, off
+ * exactly the same values -- there is no virtual loss here and no approximation
+ * of any kind.  That is the advantage over leaf-parallelising ONE search, which
+ * has to invent a penalty to stop every thread walking the same path.
+ *
+ * mcts_search() is this machine driven with a batch size of one, so the
+ * sequential and the concurrent paths cannot drift apart: there is only one
+ * implementation.
+ */
 
-int mcts_search(Mcts *m, const Trunk *t, const Head *h, const Game *g,
-                int sims, int root_noise, uint64_t *rng,
-                int32_t *visits, float *root_value)
+int mcts_begin(Mcts *m, const Trunk *t, const Head *h, const Game *g,
+               int sims, int root_noise, uint64_t *rng)
 {
-    if (root_value) *root_value = 0.0f;
-    if (!m || !m->pool || m->cap <= 0 || !t || !h || !g) return 0;
+    if (!m || !m->pool || !m->run || m->cap <= 0 || !t || !h || !g) return 0;
+
+    struct MctsRun *r = m->run;
+    r->started = 0;                              /* nothing to end if we bail */
     if (g->result != GR_ONGOING) return 0;       /* the game is already over */
 
-    /* A tree and a cached evaluation are only valid for the weights that made
-     * them.  Drop both the moment the agent or the weights change. */
+    r->t = t; r->h = h; r->g = g; r->rng = rng;
+    r->sims = sims; r->root_noise = root_noise;
+    r->nroot = 0; r->base_keys = 0; r->slot = NULL;
+
+    /* A standing TREE is only valid for the weights that made it, so drop it
+     * the moment the agent or the weights change.  The evaluation cache needs
+     * no such thing: the stamp is part of every cache tag (see mc_tag). */
     {
         const uint64_t st = mc_weight_stamp(t, h);
-        if (st != m->wstamp) { mcts_cache_clear(m); m->wstamp = st; }
+        if (st != m->wstamp) { mc_tree_drop(m); m->wstamp = st; }
     }
 
     /* The ONE Position copy of the whole search.  From here on the position is
      * maintained incrementally by make_move / unmake_move. */
-    Position pos = g->pos;
+    r->pos = g->pos;
 
     /* [ game history tail | selection path ], keys[nkeys-1] == current key. */
-    uint64_t keys[MCTS_HIST_KEEP + MCTS_MAX_DEPTH + 2];
-    int nkeys = 0;
+    r->nkeys = 0;
     if (g->hist_len > 0) {
         int keep = g->hist_len;
-        if (keep > (int)pos.halfmove + 1) keep = (int)pos.halfmove + 1;
-        if (keep > MCTS_HIST_KEEP)        keep = MCTS_HIST_KEEP;
-        if (keep < 1)                     keep = 1;
-        for (int i = g->hist_len - keep; i < g->hist_len; i++) keys[nkeys++] = g->hist[i];
+        if (keep > (int)r->pos.halfmove + 1) keep = (int)r->pos.halfmove + 1;
+        if (keep > MCTS_HIST_KEEP)           keep = MCTS_HIST_KEEP;
+        if (keep < 1)                        keep = 1;
+        for (int i = g->hist_len - keep; i < g->hist_len; i++) r->keys[r->nkeys++] = g->hist[i];
     }
-    if (nkeys == 0 || keys[nkeys - 1] != pos.key) {   /* Game never pushed */
-        nkeys = 0;
-        keys[nkeys++] = pos.key;
+    if (r->nkeys == 0 || r->keys[r->nkeys - 1] != r->pos.key) {  /* Game never pushed */
+        r->nkeys = 0;
+        r->keys[r->nkeys++] = r->pos.key;
     }
 
     /* Inherit the subtree under the moves that were played, if there provably
      * is one; otherwise a fresh tree, exactly as before. */
-    const int reused = mcts_try_reuse(m, g, keys, nkeys, sims, root_noise);
+    const int reused = mcts_try_reuse(m, g, r->keys, r->nkeys, sims, root_noise);
     if (!reused && m->tree_valid) m->reuse_misses++;
 
     MctsNode *root = &m->pool[0];
-
     if (!reused) {
         m->used = 1;
         m->tree_capped = 0;
@@ -815,18 +1016,7 @@ int mcts_search(Mcts *m, const Trunk *t, const Head *h, const Game *g,
         root->terminal = 0;
         root->tval     = 0.0f;
         root->move     = MV_NONE;
-
-        const float v0 = mcts_expand(m, t, h, 0, &pos, keys, nkeys, 0);
-        if (root->terminal) {                    /* checkmate/stalemate/draw */
-            m->tree_valid = 0;
-            return 0;
-        }
-        if (root->nchild <= 0 || root->first < 0) {   /* pool too small       */
-            m->tree_valid = 0;
-            return 0;
-        }
-        root->N = 1;
-        root->W = v0;
+        r->phase = MC_PH_ROOT;
     } else {
         /* pool[0] is a former child, and its EDGE fields -- the prior for the
          * move into it, and the move itself -- belong to a parent that is no
@@ -834,85 +1024,371 @@ int mcts_search(Mcts *m, const Trunk *t, const Head *h, const Game *g,
          * like a root for anyone who walks the pool. */
         root->P    = 1.0f;
         root->move = MV_NONE;
+        r->phase = MC_PH_PREP;
     }
 
-    const int nroot = root->nchild;
+    r->started = 1;
+    return 1;
+}
 
-    int noised = 0;
-    if (root_noise && rng && m->dirichlet_eps > 0.0f && m->dirichlet_alpha > 0.0f) {
-        mcts_root_noise(m, root, rng);
-        noised = 1;
-    }
-    /* Whether the STANDING tree's root priors carry noise.  A reused root is a
-     * former child or grandchild, whose own children the noise never reached,
-     * so this is simply what was just applied. */
-    m->tree_noised = (int8_t)noised;
+/* Selects down from the root to a leaf.  Returns 1 when that leaf needs the
+ * network (r->fidx / r->nf are filled), 0 when r->value is already the leaf's
+ * value and the simulation can be backed up. */
+static int mc_descend(Mcts *m)
+{
+    struct MctsRun *restrict r = m->run;
+    /* depth and nkeys are stepped once per ply, so they are kept in registers
+     * and written back at the ends -- they live in the run state only because
+     * the descent has to survive a suspension, not because the loop wants them
+     * there. */
+    int depth = r->depth;
+    int nkeys = r->nkeys;
 
-    int  path[MCTS_MAX_DEPTH + 1];
-    Undo undo[MCTS_MAX_DEPTH + 1];
-    const int base_keys = nkeys;
+    for (;;) {
+        const int ni = r->path[depth];
+        MctsNode *nd = &m->pool[ni];
 
-    /* `sims` is the TOTAL budget, so an inherited subtree is topped up rather
-     * than added to: sum(child visits) == sims and root.N == sims + 1 either
-     * way, and nothing downstream can tell that reuse happened. */
-    int todo = sims + 1 - root->N;
-    if (todo < 0) todo = 0;
-
-    for (int s = 0; s < todo; s++) {
-        int   depth = 0;
-        float value;
-        path[0] = 0;
-
-        /* ---- SELECT, then EXPAND + EVALUATE at the leaf ---------------- */
-        for (;;) {
-            MctsNode *nd = &m->pool[path[depth]];
-
-            if (nd->terminal) {                  /* cached: no network, no rules */
-                value = nd->tval;
-                break;
-            }
-            if (nd->first < 0) {                 /* unexpanded leaf */
-                value = mcts_expand(m, t, h, path[depth], &pos, keys, nkeys, depth);
-                break;
-            }
-
-            const int ci = nd->first + mcts_select(m, nd);
-            make_move(&pos, m->pool[ci].move, &undo[depth]);
-            keys[nkeys++] = pos.key;
-            path[++depth] = ci;
+        if (nd->terminal) {                  /* cached: no network, no rules */
+            r->value = nd->tval;
+            r->depth = depth; r->nkeys = nkeys;
+            return 0;
+        }
+        if (nd->first < 0) {                 /* unexpanded leaf */
+            r->depth = depth; r->nkeys = nkeys;
+            const int rc = mc_expand_begin(m, ni, &r->pos, r->keys, nkeys, depth);
+            if (rc == MC_EX_NEEDEVAL) return 1;
+            r->value = (rc == MC_EX_TERMINAL) ? m->pool[ni].tval
+                                              : mc_expand_end(m, r->h, &r->pos);
+            return 0;
         }
 
-        if (depth > m->max_depth_seen) m->max_depth_seen = depth;
+        const int ci = nd->first + mcts_select(m, nd);
+        make_move(&r->pos, m->pool[ci].move, &r->undo[depth]);
+        r->keys[nkeys++] = r->pos.key;
+        r->path[++depth] = ci;
+    }
+}
 
-        /* ---- BACKUP: negate at every ply, the players alternate -------- */
-        for (int d = depth; d >= 0; d--) {
-            MctsNode *nd = &m->pool[path[d]];
-            nd->N += 1;
-            nd->W += value;
-            value  = -value;
+int mcts_step(Mcts *m)
+{
+    if (!m || !m->run || !m->run->started) return 0;
+    struct MctsRun *restrict r = m->run;
+
+    for (;;) {
+        switch (r->phase) {
+
+        case MC_PH_ROOT: {
+            const int rc = mc_expand_begin(m, 0, &r->pos, r->keys, r->nkeys, 0);
+            if (rc == MC_EX_NEEDEVAL) { r->resume = MC_PH_ROOT_EVAL; return 1; }
+            r->rootv0 = (rc == MC_EX_TERMINAL) ? m->pool[0].tval
+                                               : mc_expand_end(m, r->h, &r->pos);
+            r->phase = MC_PH_ROOT_DONE;
+            continue;
         }
 
-        /* ---- unwind the position back to the root ---------------------- */
-        for (int d = depth; d >= 1; d--)
-            unmake_move(&pos, m->pool[path[d]].move, &undo[d - 1]);
-        nkeys = base_keys;
-    }
+        case MC_PH_ROOT_EVAL:
+            r->rootv0 = mc_expand_end(m, r->h, &r->pos);
+            r->phase  = MC_PH_ROOT_DONE;
+            continue;
 
+        case MC_PH_ROOT_DONE: {
+            MctsNode *root = &m->pool[0];
+            /* checkmate/stalemate/draw at the root, or a pool too small to hold
+             * even one move list: either way there is nothing to search. */
+            if (root->terminal || root->nchild <= 0 || root->first < 0) {
+                m->tree_valid = 0;
+                r->nroot = 0;
+                r->phase = MC_PH_DONE;
+                return 0;
+            }
+            root->N = 1;
+            root->W = r->rootv0;
+            r->phase = MC_PH_PREP;
+            continue;
+        }
+
+        case MC_PH_PREP: {
+            MctsNode *root = &m->pool[0];
+            r->nroot = root->nchild;
+
+            int noised = 0;
+            if (r->root_noise && r->rng &&
+                m->dirichlet_eps > 0.0f && m->dirichlet_alpha > 0.0f) {
+                mcts_root_noise(m, root, r->rng);
+                noised = 1;
+            }
+            /* Whether the STANDING tree's root priors carry noise.  A reused
+             * root is a former child or grandchild, whose own children the
+             * noise never reached, so this is simply what was just applied. */
+            m->tree_noised = (int8_t)noised;
+
+            r->base_keys = r->nkeys;
+            /* `sims` is the TOTAL budget, so an inherited subtree is topped up
+             * rather than added to: sum(child visits) == sims and
+             * root.N == sims + 1 either way. */
+            r->todo = r->sims + 1 - root->N;
+            if (r->todo < 0) r->todo = 0;
+            r->s = 0;
+            r->phase = MC_PH_SIM;
+            continue;
+        }
+
+        case MC_PH_SIM:
+            if (r->s >= r->todo) { r->phase = MC_PH_DONE; return 0; }
+            r->depth   = 0;
+            r->path[0] = 0;
+            r->phase   = MC_PH_DESCEND;
+            continue;
+
+        case MC_PH_DESCEND:
+            if (mc_descend(m)) { r->resume = MC_PH_LEAF_EVAL; return 1; }
+            r->phase = MC_PH_BACKUP;
+            continue;
+
+        case MC_PH_LEAF_EVAL:
+            r->value = mc_expand_end(m, r->h, &r->pos);
+            r->phase = MC_PH_BACKUP;
+            continue;
+
+        case MC_PH_BACKUP: {
+            const int depth = r->depth;
+            if (depth > m->max_depth_seen) m->max_depth_seen = depth;
+
+            /* ---- BACKUP: negate at every ply, the players alternate ----- */
+            float value = r->value;
+            for (int d = depth; d >= 0; d--) {
+                MctsNode *nd = &m->pool[r->path[d]];
+                nd->N += 1;
+                nd->W += value;
+                value  = -value;
+            }
+
+            /* ---- unwind the position back to the root ------------------- */
+            for (int d = depth; d >= 1; d--)
+                unmake_move(&r->pos, m->pool[r->path[d]].move, &r->undo[d - 1]);
+            r->nkeys = r->base_keys;
+
+            /* The next simulation starts here rather than through MC_PH_SIM:
+             * this is the hot loop, and it is the same two assignments. */
+            if (++r->s >= r->todo) { r->phase = MC_PH_DONE; return 0; }
+            r->depth   = 0;
+            r->path[0] = 0;
+            r->phase   = MC_PH_DESCEND;
+            continue;
+        }
+
+        case MC_PH_DONE:
+        default:
+            return 0;
+        }
+    }
+}
+
+const uint16_t *mcts_pending(const Mcts *m, int *nf)
+{
+    if (nf) *nf = 0;
+    if (!m || !m->run) return NULL;
+    if (nf) *nf = m->run->nf;
+    return m->run->fidx;
+}
+
+/* r->fw now holds the pending leaf's evaluation: count it, cache it, resume. */
+static void mc_commit(Mcts *m)
+{
+    struct MctsRun *restrict r = m->run;
+
+    m->evals++;
+    if (r->slot) {                       /* direct-mapped: the newest wins */
+        r->slot->tag = r->tag;
+        r->slot->gen = m->ecache->gen;
+        r->slot->v   = r->fw.v;
+        memcpy(r->slot->q, r->fw.q, sizeof r->slot->q);
+        r->slot = NULL;
+    }
+    r->phase = r->resume;
+}
+
+void mcts_deliver(Mcts *m, const Fwd *fw)
+{
+    if (!m || !m->run || !fw) return;
+    struct MctsRun *restrict r = m->run;
+
+    /* Only q and v are read out of an evaluation, so only q and v are copied --
+     * 33 floats, not a whole Fwd.  A batched caller owns the Fwd rows (they are
+     * nn_eval_batch's working storage as well as its output) and cannot lend
+     * them to the search, so this copy is what a batch costs; the one-at-a-time
+     * path below skips it by evaluating straight into r->fw. */
+    memcpy(r->fw.q, fw->q, sizeof r->fw.q);
+    r->fw.v = fw->v;
+    mc_commit(m);
+}
+
+int mcts_end(Mcts *m, int32_t *visits, float *root_value)
+{
+    if (root_value) *root_value = 0.0f;
+    if (!m || !m->run || !m->run->started) return 0;
+
+    struct MctsRun *r = m->run;
+    r->started = 0;
+    if (r->nroot <= 0) return 0;         /* terminal root, or pool too small */
+
+    const MctsNode *root = &m->pool[0];
     if (visits) {
         const MctsNode *ch = m->pool + root->first;
-        for (int i = 0; i < nroot; i++) visits[i] = ch[i].N;
+        for (int i = 0; i < r->nroot; i++) visits[i] = ch[i].N;
     }
     if (root_value) *root_value = (root->N > 0) ? (root->W / (float)root->N) : 0.0f;
 
     /* Hand this tree to the next search, together with everything it needs to
      * prove the tree belongs to the position it is then given. */
-    m->rpos   = g->pos;
-    m->nrkeys = base_keys;
-    memcpy(m->rkeys, keys, (size_t)base_keys * sizeof keys[0]);
-    m->rply       = g->ply;
+    m->rpos   = r->g->pos;
+    m->nrkeys = r->base_keys;
+    memcpy(m->rkeys, r->keys, (size_t)r->base_keys * sizeof r->keys[0]);
+    m->rply       = r->g->ply;
     m->tree_valid = 1;
 
-    return nroot;
+    return r->nroot;
+}
+
+/* The sequential search: the same machine, driven one leaf at a time.  There is
+ * no second implementation to keep in step -- this IS the batched search with a
+ * batch size of one. */
+int mcts_search(Mcts *m, const Trunk *t, const Head *h, const Game *g,
+                int sims, int root_noise, uint64_t *rng,
+                int32_t *visits, float *root_value)
+{
+    if (root_value) *root_value = 0.0f;
+    if (!mcts_begin(m, t, h, g, sims, root_noise, rng)) return 0;
+
+    struct MctsRun *restrict r = m->run;
+    while (mcts_step(m)) {
+        nn_eval(t, h, r->fidx, r->nf, &r->fw);   /* straight into place */
+        mc_commit(m);
+    }
+    return mcts_end(m, visits, root_value);
+}
+
+/* ------------------------------------------------------- the batch driver */
+
+typedef struct {
+    Mcts           *m;
+    const Head     *h;
+    const uint16_t *f;
+    int             nf;
+} McQueued;
+
+struct MctsBatch {
+    int              cap, n;
+    McQueued        *q;
+    const Head     **heads;
+    const uint16_t **fidx;
+    int             *nf;
+    Fwd             *out;
+};
+
+MctsBatch *mcts_batch_create(int cap)
+{
+    if (cap < 1) cap = 1;
+    MctsBatch *b = (MctsBatch *)calloc(1, sizeof *b);
+    if (!b) return NULL;
+    b->cap   = cap;
+    b->q     = (McQueued *)       calloc((size_t)cap, sizeof(McQueued));
+    b->heads = (const Head **)    calloc((size_t)cap, sizeof(const Head *));
+    b->fidx  = (const uint16_t **)calloc((size_t)cap, sizeof(const uint16_t *));
+    b->nf    = (int *)            calloc((size_t)cap, sizeof(int));
+    b->out   = (Fwd *)            calloc((size_t)cap, sizeof(Fwd));
+    if (!b->q || !b->heads || !b->fidx || !b->nf || !b->out) { mcts_batch_free(b); return NULL; }
+    return b;
+}
+
+void mcts_batch_free(MctsBatch *b)
+{
+    if (!b) return;
+    free(b->q); free(b->heads); free(b->fidx); free(b->nf); free(b->out);
+    free(b);
+}
+
+int mcts_batch_cap(const MctsBatch *b)   { return b ? b->cap : 0; }
+int mcts_batch_count(const MctsBatch *b) { return b ? b->n   : 0; }
+
+void mcts_batch_add(MctsBatch *b, Mcts *m, const Head *h)
+{
+    if (!b || !m || b->n >= b->cap) return;
+    McQueued *e = &b->q[b->n++];
+    e->m  = m;
+    e->h  = h;
+    e->f  = mcts_pending(m, &e->nf);
+}
+
+int mcts_batch_run(MctsBatch *b, const Trunk *t)
+{
+    if (!b) return 0;
+    const int n = b->n;
+    if (n <= 0 || !t) { b->n = 0; return 0; }
+
+    /* Group rows that share a head.  nn_eval_batch() fuses the per-agent matrix
+     * of ADJACENT rows that name the same head, so this is worth real time when
+     * concurrent games are played by different agents -- which in self-play they
+     * almost always are.  It cannot change a row's result: every row is an
+     * independent position and is evaluated against its own head either way.
+     * Insertion sort: n is the games-in-flight count, tens at most. */
+    for (int i = 1; i < n; i++) {
+        const McQueued key = b->q[i];
+        int j = i - 1;
+        while (j >= 0 && (uintptr_t)b->q[j].h > (uintptr_t)key.h) { b->q[j + 1] = b->q[j]; j--; }
+        b->q[j + 1] = key;
+    }
+
+    for (int i = 0; i < n; i++) {
+        b->heads[i] = b->q[i].h;
+        b->fidx[i]  = b->q[i].f;
+        b->nf[i]    = b->q[i].nf;
+    }
+
+    nn_eval_batch(t, b->heads, n, b->fidx, b->nf, b->out);
+
+    for (int i = 0; i < n; i++) mcts_deliver(b->q[i].m, &b->out[i]);
+
+    b->n = 0;
+    return n;
+}
+
+void mcts_search_many(int n, Mcts *const *ms, const Trunk *t,
+                      const Head *const *hs, const Game *const *gs,
+                      const int *sims, const int *noise, uint64_t *const *rng,
+                      int32_t *const *visits, float *root_value, int *nout,
+                      MctsBatch *b)
+{
+    if (n <= 0 || !ms || !t || !hs || !gs || !sims || !b) return;
+    const int cap = b->cap;
+
+    for (int lo = 0; lo < n; lo += cap) {
+        int hi = lo + cap;
+        if (hi > n) hi = n;
+
+        for (int i = lo; i < hi; i++) {
+            const int ok = mcts_begin(ms[i], t, hs[i], gs[i], sims[i],
+                                      noise ? noise[i] : 0, rng ? rng[i] : NULL);
+            if (!ok && nout) nout[i] = 0;
+        }
+
+        for (;;) {
+            for (int i = lo; i < hi; i++) {
+                Mcts *m = ms[i];
+                if (!m->run || !m->run->started) continue;
+                if (m->run->phase == MC_PH_DONE) continue;
+                if (mcts_step(m)) mcts_batch_add(b, m, hs[i]);
+            }
+            if (mcts_batch_count(b) == 0) break;
+            mcts_batch_run(b, t);
+        }
+
+        for (int i = lo; i < hi; i++) {
+            const int nr = mcts_end(ms[i], visits ? visits[i] : NULL,
+                                    root_value ? &root_value[i] : NULL);
+            if (nout) nout[i] = nr;
+        }
+    }
 }
 
 /* --------------------------------------------------------------- picking */

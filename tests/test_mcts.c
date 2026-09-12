@@ -964,11 +964,21 @@ static void t_reuse_refuses_stale(void)
     }
 
     /* A changed network invalidates everything.  In self-play the two sides are
-     * different agents, so this fires on every ply. */
+     * different agents, so this fires on every ply.
+     *
+     * The TREE is dropped, because tree statistics are about particular weights
+     * and cannot be re-labelled.  The evaluation CACHE is not flushed any more
+     * and does not need to be: the weight stamp is part of every cache tag, so
+     * an entry made under the old weights simply cannot be hit under the new
+     * ones.  That is the stronger guarantee, so it is what is tested -- not the
+     * flush counter, which only ever said that an attempt had been made.
+     *
+     * The control is a THIRD search with no cache at all and no standing tree,
+     * so nothing about the mechanism under test is assumed. */
     {
         uint64_t r[4]; seed_rng(r, 2u);
         mcts_search(&m, &g_trunk, &g_head, &a, 400, 0, r, v, &rv);
-        const uint64_t before = m.reuse_hits, flush0 = m.cache_flushes;
+        const uint64_t before = m.reuse_hits, hits0 = m.cache_hits;
 
         Game a2 = a;
         Move al[MAX_MOVES];
@@ -976,12 +986,26 @@ static void t_reuse_refuses_stale(void)
         game_push(&a2, al[0]);
 
         net_seed(0xFEEDu);                       /* the weights move */
-        mcts_search(&m, &g_trunk, &g_head, &a2, 400, 0, r, v, &rv);
-        printf("  the weights changed: inherited %s, cache flushed: %s\n",
+        uint64_t r2[4]; seed_rng(r2, 2u);
+        const int n1 = mcts_search(&m, &g_trunk, &g_head, &a2, 400, 0, r, v, &rv);
+
+        Mcts ctl;
+        mcts_init(&ctl, 64000);
+        mcts_defaults(&ctl);
+        ctl.cache = 0;
+        ctl.reuse = 0;
+        int32_t vctl[MAX_MOVES]; float rvctl = 0.0f;
+        const int n2 = mcts_search(&ctl, &g_trunk, &g_head, &a2, 400, 0, r2, vctl, &rvctl);
+        mcts_free(&ctl);
+
+        printf("  the weights changed: inherited %s, %llu lookups served from the "
+               "old weights: %s\n",
                (m.reuse_hits == before) ? "nothing" : "SOMETHING",
-               (m.cache_flushes > flush0) ? "yes" : "NO");
+               (unsigned long long)(m.cache_hits - hits0),
+               (n1 == n2 && same_visits(v, vctl, n1)) ? "none" : "SOME");
         CHECK(m.reuse_hits == before, "a subtree survived a change of weights");
-        CHECK(m.cache_flushes > flush0, "the cache survived a change of weights");
+        CHECK(n1 == n2 && same_visits(v, vctl, n1),
+              "an evaluation made under the old weights survived the change");
         net_seed(12345u);                        /* restore the shared net */
     }
 
@@ -1283,6 +1307,259 @@ static void t_bench(void)
 
 /* ------------------------------------------------------------ main */
 
+
+/* ======================= 19. concurrent searches, one batched evaluation ==
+ *
+ * The claim being tested is the strong one: G INDEPENDENT searches driven
+ * together, with their pending leaves evaluated in a single batched network
+ * call, produce EXACTLY what each of them produces alone.  Not approximately --
+ * every visit count and every root value bit-for-bit.  That is what makes this
+ * different from leaf-parallelising a single search, which needs virtual loss
+ * and changes the answer.
+ *
+ * The comparison is run at several G, over positions of different character,
+ * across several plies of real play (so subtree reuse, the repetition window
+ * and terminal nodes are all in the mix), with different agents on different
+ * boards (so the batch is genuinely ragged: different move counts, different
+ * heads, searches finishing at different moments). */
+
+#define CC_NPOS 12
+static const char *const CC_FENS[CC_NPOS] = {
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 4",
+    "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+    "r6k/8/8/8/8/8/5PPP/6K1 b - - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+    "8/8/8/8/8/6k1/6p1/6K1 w - - 0 1",              /* black is stalemated soon */
+    "2kr3r/pp1q1ppp/5n2/1Nb5/2Pp1B2/7Q/P4PPP/1R3RK1 w - - 0 1",
+    "8/k7/3p4/p2P1p2/P2P1P2/8/8/K7 w - - 0 1",       /* a locked position: draws */
+    "5k2/8/8/8/8/8/6PP/6K1 b - - 0 1",
+    "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+};
+
+/* One concurrent slot: everything a game in flight owns privately. */
+typedef struct {
+    Mcts     m;
+    Game     g;
+    uint64_t rng[4];
+    int32_t  vis[MAX_MOVES];
+    float    rv;
+    int      n;
+    int      sims;
+    int      live;
+} CcSlot;
+
+static int cc_same(const int32_t *a, const int32_t *b, int n)
+{
+    for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+static int cc_bitsame(float a, float b)
+{
+    uint32_t x, y;
+    memcpy(&x, &a, 4); memcpy(&y, &b, 4);
+    return x == y;
+}
+
+/* Runs `ng` games for `plies` plies, once with every search driven ALONE and
+ * once with all `ng` driven TOGETHER, and compares.  `share` attaches one
+ * evaluation cache to every concurrent slot instead of giving each its own.
+ * Returns the number of disagreements; fills *batches / *rows for reporting. */
+static int cc_compare(int ng, int plies, int share, const Head *const *heads,
+                      long *rounds, long *rows, long *maxb)
+{
+    CcSlot *ref = (CcSlot *)calloc((size_t)ng, sizeof(CcSlot));
+    CcSlot *cur = (CcSlot *)calloc((size_t)ng, sizeof(CcSlot));
+    if (!ref || !cur) { free(ref); free(cur); return 1; }
+
+    MctsBatch *b = mcts_batch_create(ng);
+    struct MctsCache *shared = share ? mcts_cache_create(14) : NULL;
+
+    Mcts       *msv[64];
+    const Head *hsv[64];
+    const Game *gsv[64];
+    int         simv[64], noisev[64], nout[64];
+    uint64_t   *rngv[64];
+    int32_t    *visv[64];
+    float       rvv[64];
+
+    for (int i = 0; i < ng; i++) {
+        CcSlot *R = &ref[i], *C = &cur[i];
+        mcts_init(&R->m, MAX_MOVES + 1 + 200 * 72);  mcts_defaults(&R->m);
+        mcts_init(&C->m, MAX_MOVES + 1 + 200 * 72);  mcts_defaults(&C->m);
+        if (shared) mcts_cache_attach(&C->m, shared);
+        load(&R->g, CC_FENS[i % CC_NPOS]);
+        load(&C->g, CC_FENS[i % CC_NPOS]);
+        seed_rng(R->rng, (uint64_t)(i + 1) * 7919u);
+        seed_rng(C->rng, (uint64_t)(i + 1) * 7919u);
+        /* Ragged on purpose: different budgets finish at different moments, so
+         * the batch is not a neat rectangle. */
+        R->sims = C->sims = 24 + 17 * (i % 5);
+        R->live = C->live = 1;
+    }
+
+    int bad = 0;
+    for (int ply = 0; ply < plies; ply++) {
+        /* ---- the reference: each search alone, one leaf at a time -------- */
+        for (int i = 0; i < ng; i++) {
+            CcSlot *R = &ref[i];
+            R->n = R->live ? mcts_search(&R->m, &g_trunk, heads[i % 4], &R->g,
+                                         R->sims, 0, R->rng, R->vis, &R->rv) : 0;
+        }
+        /* ---- the same searches, driven together -------------------------- */
+        int nlive = 0;
+        for (int i = 0; i < ng; i++) {
+            if (!cur[i].live) { cur[i].n = 0; continue; }
+            msv[nlive]   = &cur[i].m;
+            hsv[nlive]   = heads[i % 4];
+            gsv[nlive]   = &cur[i].g;
+            simv[nlive]  = cur[i].sims;
+            noisev[nlive]= 0;
+            rngv[nlive]  = cur[i].rng;
+            visv[nlive]  = cur[i].vis;
+            nlive++;
+        }
+        if (nlive > 0) {
+            mcts_search_many(nlive, msv, &g_trunk, hsv, gsv, simv, noisev, rngv,
+                             visv, rvv, nout, b);
+            int k = 0;
+            for (int i = 0; i < ng; i++) {
+                if (!cur[i].live) continue;
+                cur[i].n  = nout[k];
+                cur[i].rv = rvv[k];
+                k++;
+            }
+            if (rounds) (*rounds)++;
+        }
+
+        for (int i = 0; i < ng; i++) {
+            if (ref[i].n != cur[i].n) { bad++; continue; }
+            if (ref[i].n <= 0) { ref[i].live = cur[i].live = 0; continue; }
+            if (!cc_same(ref[i].vis, cur[i].vis, ref[i].n)) bad++;
+            if (!cc_bitsame(ref[i].rv, cur[i].rv))          bad++;
+
+            Move l[MAX_MOVES];
+            const int nl = gen_legal(&ref[i].g.pos, l);
+            if (nl != ref[i].n) { bad++; continue; }
+            const int pick = mcts_pick(ref[i].vis, ref[i].n, 0.8f, ref[i].rng);
+            (void)mcts_pick(cur[i].vis, cur[i].n, 0.8f, cur[i].rng);
+            game_push(&ref[i].g, l[pick < 0 ? 0 : pick]);
+            game_push(&cur[i].g, l[pick < 0 ? 0 : pick]);
+            if (ref[i].g.result != GR_ONGOING) { ref[i].live = cur[i].live = 0; }
+        }
+    }
+
+    /* How wide the batches actually were.  A game sitting on a terminal node or
+     * serving its leaf from the cache does not contribute a row, so this is the
+     * real distribution, not the nominal G. */
+    for (int i = 0; i < ng; i++) {
+        if (rows) *rows += (long)cur[i].m.evals;
+        mcts_free(&ref[i].m);
+        mcts_free(&cur[i].m);
+    }
+    if (maxb) *maxb = ng;
+    mcts_batch_free(b);
+    mcts_cache_destroy(shared);
+    free(ref); free(cur);
+    return bad;
+}
+
+static void t_concurrent(void)
+{
+    Head *heads = (Head *)malloc(4 * sizeof(Head));
+    if (!heads) { CHECK(0, "out of memory"); return; }
+    for (int i = 0; i < 4; i++) nn_init(&g_trunk, &heads[i], 1000u + 37u * (uint64_t)i);
+    net_seed(12345u);                         /* nn_init rewrote the trunk */
+    for (int i = 0; i < 4; i++) nn_init(&g_trunk, &heads[i], 1000u + 37u * (uint64_t)i);
+    const Head *hp[4] = { &heads[0], &heads[1], &heads[2], &heads[3] };
+
+    static const int GS[] = { 1, 2, 3, 5, 8, 16, 32 };
+    for (int k = 0; k < (int)(sizeof GS / sizeof GS[0]); k++) {
+        long rounds = 0, rows = 0, mx = 0;
+        const int bad = cc_compare(GS[k], 6, 0, hp, &rounds, &rows, &mx);
+        printf("  G=%-2d  private caches   disagreements: %d\n", GS[k], bad);
+        CHECK(bad == 0, "G=%d with a private cache did not match a lone search", GS[k]);
+    }
+
+    for (int k = 0; k < (int)(sizeof GS / sizeof GS[0]); k++) {
+        long rounds = 0, rows = 0, mx = 0;
+        const int bad = cc_compare(GS[k], 6, 1, hp, &rounds, &rows, &mx);
+        printf("  G=%-2d  ONE shared cache disagreements: %d\n", GS[k], bad);
+        CHECK(bad == 0, "G=%d sharing one cache did not match a lone search", GS[k]);
+    }
+
+    /* What the agreement above is WORTH depends on the build.  Without
+     * Accelerate nn_eval_batch is bit-identical to nn_eval at every batch size,
+     * so "0 disagreements" is exact by construction and would stay 0 over any
+     * number of positions.  With Accelerate the batched trunk goes through
+     * cblas_sgemm, which regroups the sums: rows then agree with nn_eval to
+     * ~1e-6 and a search COULD in principle order two nearly-equal PUCT scores
+     * differently.  It does not here -- but that is an observation, not a
+     * guarantee, and saying so is the point. */
+    printf("  backend %s, batch tile %d -- the agreement above is %s\n",
+           nn_backend(), nn_batch_tile(),
+           nn_batch_is_exact(32)
+             ? "EXACT BY CONSTRUCTION (batched == nn_eval bit for bit)"
+             : "EMPIRICAL: sgemm regroups the sums, rows differ by ~1e-6");
+
+    /* Determinism: the same G, twice, must agree with itself as well. */
+    {
+        long r1 = 0, r2 = 0, w1 = 0, w2 = 0, m1 = 0, m2 = 0;
+        const int a = cc_compare(8, 5, 0, hp, &r1, &w1, &m1);
+        const int b = cc_compare(8, 5, 0, hp, &r2, &w2, &m2);
+        printf("  repeatability at G=8: %ld vs %ld network rows\n", w1, w2);
+        CHECK(a == 0 && b == 0 && w1 == w2,
+              "a concurrent run was not reproducible");
+    }
+
+    /* The guarantees that matter most, driven through the batched path: a mate
+     * in 1 is still found, from both colours, with other games in flight. */
+    {
+        const char *fens[4] = {
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+            "r6k/8/8/8/8/8/5PPP/6K1 b - - 0 1",
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+            "r6k/8/8/8/8/8/5PPP/6K1 b - - 0 1",
+        };
+        const char *best[4] = { "a1a8", "a8a1", "a1a8", "a8a1" };
+        Mcts        ms[4];
+        Game        gs[4];
+        uint64_t    rng[4][4];
+        int32_t     vis[4][MAX_MOVES];
+        float       rv[4];
+        int         nout[4], sims[4], noise[4];
+        Mcts       *mp[4]; const Game *gp[4]; uint64_t *rp[4]; int32_t *vp[4];
+
+        for (int i = 0; i < 4; i++) {
+            mcts_init(&ms[i], 200000); mcts_defaults(&ms[i]);
+            load(&gs[i], fens[i]);
+            seed_rng(rng[i], 9u + (uint64_t)i);
+            mp[i] = &ms[i]; gp[i] = &gs[i]; rp[i] = rng[i]; vp[i] = vis[i];
+            sims[i] = 800; noise[i] = 0;
+        }
+        MctsBatch *b = mcts_batch_create(4);
+        mcts_search_many(4, mp, &g_trunk, hp, gp, sims, noise, rp, vp, rv, nout, b);
+        mcts_batch_free(b);
+
+        for (int i = 0; i < 4; i++) {
+            const int want = idx_of(&gs[i].pos, best[i]);
+            int arg = 0;
+            for (int j = 1; j < nout[i]; j++) if (vis[i][j] > vis[i][arg]) arg = j;
+            printf("  mate in 1 in flight with 3 others (%s): %s  root value %+.3f\n",
+                   best[i], (arg == want) ? "found" : "MISSED", (double)rv[i]);
+            CHECK(arg == want, "the batched search missed a mate in 1 (%s)", best[i]);
+            CHECK(rv[i] > 0.5f, "a forced mate in 1 did not read as winning");
+            mcts_free(&ms[i]);
+        }
+    }
+
+    free(heads);
+    net_seed(12345u);
+}
+
 int main(void)
 {
     chess_init();
@@ -1347,6 +1624,9 @@ int main(void)
 
     banner("17. reuse under root noise and under a starved pool");
     t_reuse_rough_conditions();
+
+    banner("19. G independent searches, batched, are exactly G lone searches");
+    t_concurrent();
 
     banner("18. benchmark (single core)");
     t_bench();

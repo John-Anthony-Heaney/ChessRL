@@ -251,8 +251,8 @@ void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *
  *
  *   heads[b]  the agent evaluating row b.  Rows that share a head are batched
  *             together when they are ADJACENT, so a caller that groups its batch
- *             by agent gets the fastest path; one that does not still gets a
- *             fully batched trunk, which is 77% of the arithmetic.
+ *             by agent gets the fastest path (worth ~25% at batch 32); one that
+ *             does not still gets a batched W1, which is 60% of the arithmetic.
  *   fidx[b]   row b's active features, nf[b] of them.  An array of pointers so
  *             the caller never has to copy ragged feature lists into a
  *             rectangular buffer.
@@ -272,6 +272,18 @@ void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *
  * Internally the batch is processed in tiles of 32; any nbatch is allowed. */
 void nn_eval_batch(const Trunk *t, const Head *const *heads, int nbatch,
                    const uint16_t *const *fidx, const int *nf, Fwd *out);
+
+/* Which kernels this build actually compiled -- "scalar", "neon",
+ * "neon+accelerate" -- and the batch size the tiling uses internally.  Worth
+ * logging next to any throughput number, since the three differ by 3x. */
+const char *nn_backend(void);
+int  nn_batch_tile(void);
+/* 1 when nn_eval_batch at this batch size is bit-identical to nn_eval, 0 when
+ * the batched dense layers go through cblas_sgemm and are therefore only equal
+ * to ~1e-6.  Always 1 without -DUSE_ACCELERATE, and always 1 for small batches
+ * even with it, because sgemm loses to the NEON kernel there anyway.  A caller
+ * that needs a bit-reproducible search should ask this. */
+int  nn_batch_is_exact(int nbatch);
 
 /* --------------------------------------------------------------- backward */
 /* Gradients use exactly the same layout as the weights. */

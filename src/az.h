@@ -24,6 +24,15 @@ typedef struct {
     int   generations;
     int   games_per_agent;
     int   threads;
+    /* CONCURRENT GAMES PER THREAD.  MCTS is sequential, so one game in flight
+     * can only ever ask the network for one position at a time and every
+     * evaluation is a batch of one.  G games per thread are stepped together
+     * and their pending leaves evaluated in a single batched call.  The games
+     * are independent -- own node pool, own tree, own repetition history, own
+     * rng stream -- so this is pure throughput: no virtual loss, and every
+     * game plays exactly the game it would have played alone.  1 reproduces
+     * the old one-game-at-a-time loop bit for bit.                           */
+    int   games_in_flight;
 
     /* self-play */
     /* Where games start.  Training across the 960 Chess960 arrays stops the
