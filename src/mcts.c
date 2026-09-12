@@ -583,15 +583,18 @@ static int mcts_select(const Mcts *m, const MctsNode *nd)
     const int n = nd->nchild;
 
     /* Every visit to this node after its own expansion descended into exactly
-     * one child, so sum_b N(s,b) == N(s) - 1.  On the first descent that sum is
-     * 0, so the exploration term vanishes and the first child is taken; the
-     * formula is applied literally, and the priors take over from the second
-     * descent onwards.  (AlphaZero's own pseudocode uses sqrt(sum + 1) here,
-     * which would cost nothing to switch to.) */
+     * one child, so sum_b N(s,b) == N(s) - 1.  With sqrt(sum) that is 0 on the
+     * first descent, the exploration term vanishes, and the node picks whatever
+     * gen_legal() happened to list first -- the policy is never consulted.
+     * Measured: that wasted the ONLY visit 22-42% of expanded nodes ever got,
+     * and at sims=1 a trained network, an early checkpoint and random weights
+     * all scored identically (0.074), which is the signature of a search that
+     * is ignoring its priors.  AlphaZero's pseudocode uses sqrt(sum + 1), which
+     * keeps the priors in play from the very first descent. */
     int32_t nsum = nd->N - 1;
     if (nsum < 0) nsum = 0;
 
-    const float sq  = sqrtf((float)nsum);
+    const float sq  = sqrtf((float)nsum + 1.0f);
     const float c   = m->c_puct;
 
     /* First-play urgency.  Flat by default; with fpu_reduction > 0 it becomes
