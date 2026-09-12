@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Sweep the champion against Stockfish across a graded ladder of strengths.
+"""Sweep the champion across a graded ladder of opponents, weakest first.
 
-Three ladders, because no single one covers the range:
+Four ladders, because no single one covers the range:
 
+  baselines  the dependency-free ladder in py/baselines.py -- random,
+         randomplus-P, the legacy 1-ply material grabber, then material-N and
+         mobility-N searchers.  This is the only group that BRACKETS a weak
+         agent: every Stockfish setting below, including one node of search,
+         is far above where an early self-play network plays, and a ladder
+         that scores 0% on every rung measures nothing.  These opponents
+         contain hand-coded chess knowledge on purpose; they are the ruler,
+         not the agent.  See py/baselines.py and docs/FROM_SCRATCH.md.
   nodes  Stockfish at FULL skill but starved of search (go nodes N). This is the
          only way to probe below Stockfish's rated floor, and it is perfectly
          reproducible -- a node budget does not move with CPU load, where a
@@ -13,8 +21,15 @@ Three ladders, because no single one covers the range:
 
 Usage:
   python3 py/sf_ladder.py [--games 60] [--threads 4] [--depth 4] [--policy-only]
-                          [--groups nodes,skill,elo] [--out runs/sf_ladder.json]
+                          [--groups baselines,nodes,skill,elo]
+                          [--baselines LIST] [--stop 2.0]
+                          [--out runs/sf_ladder.json]
                           [--scale uci|chesscom|fide|lichess]
+
+Each group is ordered weakest-first and is abandoned once a rung scores below
+--stop: the rungs above it would only produce more 0%s.  The rating-anchored
+`elo` group is never skipped on those grounds, because even a shutout against a
+calibrated opponent converts into an absolute bound.
 
 --scale converts the best absolute anchor onto another rating pool.  That is a
 conversion between pools, not a measurement, and it is far less certain than
@@ -24,10 +39,13 @@ import argparse, json, os, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import benchmark as B  # noqa: E402  -- the conversion lives there, in one place
+import baselines as L  # noqa: E402  -- the dependency-free rungs
 
 SF = "/opt/homebrew/bin/stockfish"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The dependency-free ladder, weakest first.  See py/baselines.py.
+BASELINE_RUNGS = list(L.DEFAULT_LADDER)
 # Full-skill Stockfish, search starved to N nodes.
 NODE_RUNGS  = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
 # "Skill Level" with a fixed, generous node budget so the skill setting is what varies.
@@ -38,30 +56,37 @@ ELO_RUNGS   = [1320, 1400, 1500, 1600, 1800, 2000]
 ELO_NODES   = 20000
 
 
-def rungs_for(groups):
+def rungs_for(groups, baseline_rungs=None):
     out = []
+    if "baselines" in groups:
+        for nm in (baseline_rungs if baseline_rungs is not None else BASELINE_RUNGS):
+            out.append(dict(group="base", label=nm, ref=None, opts=[], go=None,
+                            opponent=nm))
     if "nodes" in groups:
         for n in NODE_RUNGS:
             out.append(dict(group="nodes", label=f"nodes={n}", ref=None,
-                            opts=[], go=f"nodes={n}"))
+                            opts=[], go=f"nodes={n}", opponent=f"uci:{SF}"))
     if "skill" in groups:
         for s in SKILL_RUNGS:
             out.append(dict(group="skill", label=f"Skill {s}", ref=None,
-                            opts=[f"Skill Level={s}"], go=f"nodes={SKILL_NODES}"))
+                            opts=[f"Skill Level={s}"], go=f"nodes={SKILL_NODES}",
+                            opponent=f"uci:{SF}"))
     if "elo" in groups:
         for e in ELO_RUNGS:
             out.append(dict(group="elo", label=f"UCI_Elo {e}", ref=e,
                             opts=["UCI_LimitStrength=true", f"UCI_Elo={e}"],
-                            go=f"nodes={ELO_NODES}"))
+                            go=f"nodes={ELO_NODES}", opponent=f"uci:{SF}"))
     return out
 
 
 def play(rung, args, tmp):
     cmd = [sys.executable, os.path.join(ROOT, "py", "benchmark.py"),
-           "--model", args.model, "--opponent", f"uci:{SF}",
+           "--model", args.model, "--opponent", rung.get("opponent", f"uci:{SF}"),
            "--games", str(args.games), "--threads", str(args.threads),
-           "--seed", str(args.seed), "--opp-go", rung["go"],
+           "--seed", str(args.seed),
            "--ply-cap", str(args.ply_cap), "--no-md", "--quiet", "--json", tmp]
+    if rung.get("go"):
+        cmd += ["--opp-go", rung["go"]]
     if args.policy_only:
         cmd.append("--policy-only")
     else:
@@ -84,7 +109,15 @@ def main():
     ap.add_argument("--policy-only", action="store_true")
     ap.add_argument("--seed", type=int, default=20260911)
     ap.add_argument("--ply-cap", type=int, default=300)
-    ap.add_argument("--groups", default="nodes,skill,elo")
+    ap.add_argument("--groups", default="baselines,nodes,skill,elo")
+    ap.add_argument("--baselines", default="",
+                    help="comma list of py/baselines.py rungs for the 'baselines' "
+                         "group, weakest first (default: its DEFAULT_LADDER).  "
+                         "`python3 py/baselines.py list` prints them")
+    ap.add_argument("--stop", type=float, default=2.0, metavar="PCT",
+                    help="abandon a group once a rung scores below this percentage "
+                         "(default 2.0).  The rating-anchored 'elo' group is never "
+                         "abandoned: even a shutout there is an absolute bound")
     ap.add_argument("--out", default="runs/sf_ladder.json")
     ap.add_argument("--scale", default="uci", choices=list(B.SCALES),
                     help="also express the best absolute anchor on another rating pool "
@@ -92,8 +125,10 @@ def main():
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    rungs = rungs_for(groups)
-    who = "raw policy (no search)" if args.policy_only else f"alpha-beta depth {args.depth}"
+    bl = L.expand_group(args.baselines) if args.baselines else None
+    rungs = rungs_for(groups, bl)
+    who = ("raw policy (no search)" if args.policy_only
+           else f"MCTS depth {args.depth} = {args.depth * 64} simulations")
     print(f"ChessRL champion [{who}]  vs  Stockfish, {args.games} games per rung")
     print(f"{len(rungs)} rungs, seed {args.seed}, colour-reversed pairs, node-limited "
           f"(load independent)\n")
@@ -102,7 +137,15 @@ def main():
 
     results, tmp = [], "/tmp/_sf_rung.json"
     t0 = time.time()
-    for rung in rungs:
+    abandoned = {}
+    i = -1
+    while True:
+        i += 1
+        if i >= len(rungs):
+            break
+        rung = rungs[i]
+        if rung["group"] in abandoned:
+            continue
         d, err = play(rung, args, tmp)
         if d is None:
             print(f"{rung['group']:<6} {rung['label']:<14}  FAILED: {err}")
@@ -125,14 +168,24 @@ def main():
         sys.stdout.flush()
         results.append(dict(rung=rung, match=m))
 
-        # Stop climbing a ladder once it is a shutout; the rungs above tell us nothing.
-        if m["score_pct"] < 1.0 and rung["group"] == "nodes":
-            print(f"{'':6} (shutout -- skipping the rest of the node ladder)")
-            rungs = [r for r in rungs if r["group"] != "nodes" or r is rung]
+        # Stop climbing a ladder once the score falls through the floor; the
+        # rungs above it can only produce more 0%s.  The rating-anchored `elo`
+        # group is exempt: a shutout there is still an absolute bound, which is
+        # the entire reason for playing it.
+        if m["score_pct"] < args.stop and rung["group"] != "elo":
+            abandoned[rung["group"]] = rung["label"]
+            left = sum(1 for r in rungs[i + 1:] if r["group"] == rung["group"])
+            if left:
+                print(f"{'':6} (scored {m['score_pct']:.1f}% < {args.stop:.1f}% -- "
+                      f"skipping the remaining {left} '{rung['group']}' rung(s))")
 
     # Where does the score cross 50%?
     cross = None
-    for g in groups:
+    seen_groups = []
+    for r in results:
+        if r["rung"]["group"] not in seen_groups:
+            seen_groups.append(r["rung"]["group"])
+    for g in seen_groups:
         seq = [r for r in results if r["rung"]["group"] == g]
         for a, b in zip(seq, seq[1:]):
             sa, sb = a["match"]["score"], b["match"]["score"]
@@ -144,7 +197,8 @@ def main():
 
     out = dict(generated=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()),
                model=args.model, champion=who, games_per_rung=args.games,
-               seed=args.seed, crossing=cross, rungs=results)
+               seed=args.seed, crossing=cross, stop_pct=args.stop,
+               abandoned=abandoned, rungs=results)
     os.makedirs(os.path.dirname(os.path.join(ROOT, args.out)) or ".", exist_ok=True)
     with open(os.path.join(ROOT, args.out), "w") as f:
         json.dump(out, f, indent=1)

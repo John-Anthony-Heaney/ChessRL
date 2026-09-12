@@ -74,6 +74,46 @@
 #define ELO_K            24.0f
 #define ELO_SEED         1500.0f
 #define HOF_CAP          64
+
+/* ------------------------------------------------------- rating anchors */
+/* PERMANENT ANCHORS.  See docs/RATING.md for the bug these exist to kill.
+ *
+ * Two players whose strength is constant for the whole run and whose rating is
+ * PINNED and never updated:
+ *
+ *   AZ_ANCHOR_RANDOM  a uniform random legal mover.  Pinned at 0 BY
+ *                     DEFINITION; that one pin fixes the additive gauge of
+ *                     the whole scale.
+ *   AZ_ANCHOR_GEN0    the generation-0 randomly initialised network, copied
+ *                     before the first optimiser step and never trained.
+ *                     Pinned at whatever it measures against the random
+ *                     mover, once, at the start of the run.
+ *
+ * Neither holds a gram of chess knowledge -- one is gen_legal() plus a coin,
+ * the other is untrained weights -- so neither touches docs/FROM_SCRATCH.md.
+ * What they buy is the one thing a self-referential rating cannot have: a
+ * fixed point.  A population that has stopped improving goes on beating these
+ * two at exactly the same rate, so its rating stops moving.                  */
+enum { AZ_ANCHOR_RANDOM = 0, AZ_ANCHOR_GEN0 = 1, AZ_N_ANCHORS = 2 };
+#define ANCHOR_ID_BASE   (-1000)
+#define ANCHOR_ID(k)     (ANCHOR_ID_BASE - (k))
+#define ELO_ANCHOR_RANDOM  0.0f    /* the gauge */
+
+/* Bounds on a fitted rating.  A player who won or lost EVERY game in the
+ * window has no finite maximum-likelihood rating; it is clamped here and
+ * reported as bounded rather than emitted as an infinity. */
+#define ELO_FIT_LO       (-4000.0)
+#define ELO_FIT_HI       (12000.0)
+/* Games a hall-of-fame entry must have in the fit window before its rating is
+ * frozen and it joins the pinned reference set.  A rating from N games near
+ * even has a standard error of roughly 347/sqrt(N) Elo, so 48 games buys about
+ * +/-50 -- and a noisy number frozen for the rest of the run is a worse
+ * reference than no reference at all.  MEASURED: at 8 the pinned set of a
+ * frozen population, whose every member is the same strength, spread from
+ * +61 to +404, and that spread moved the population's own rating by ~50
+ * points as the first entries landed.  Entries that never reach the threshold
+ * simply stay free parameters, which costs only range, never correctness. */
+#define HOF_PIN_MIN_GAMES  48
 #define SHUFFLE_WINDOW   8      /* pair within +/- this many Elo ranks       */
 #define SAVE_EVERY       5      /* checkpoint cadence, in generations        */
 #define RESIGN_CONSEC    4      /* own moves below threshold before resigning */
@@ -401,16 +441,240 @@ static void azbuf_commit(AZBuf *b, const AZRec *r)
 typedef struct {
     Head  head;
     Hyper hy;
+    /* LEGACY rating: a copy of the then-best agent's incremental Elo.  That
+     * value was already drifting when it was copied, and copying it is what
+     * turned a bounded bias into a ratchet.  Kept only so old runs and old
+     * checkpoints stay readable -- nothing new is rated against it. */
     float elo;
+    /* The Bradley-Terry rating.  Free while the entry is provisional, then
+     * frozen: an entry is pinned only after `pin_lag` generations, so the
+     * value that gets frozen comes from games played AFTER the snapshot was
+     * selected.  Freezing the selection generation's estimate would freeze
+     * the winner's curse with it, and a winner's curse that compounds over
+     * snapshots is a ratchet of exactly the kind this replaces. */
+    float elo_fit;
+    int   pinned;
     int   gen;
 } HofEntry;
 
-/* id >= 0: live agent index.  id < 0: hall-of-fame entry -(id + 1). */
+/* id >= 0: live agent index.
+ * ANCHOR_ID_BASE < id < 0: hall-of-fame entry -(id + 1).
+ * id <= ANCHOR_ID_BASE:    permanent anchor ANCHOR_ID_BASE - id. */
 typedef struct { int32_t white, black; } AZPair;
 typedef struct { int16_t result, reason; } AZRes;
 
-#define IS_HOF(id)   ((id) < 0)
-#define HOF_IDX(id)  (-(id) - 1)
+#define IS_ANCHOR(id)  ((id) <= ANCHOR_ID_BASE)
+#define ANCHOR_IDX(id) (ANCHOR_ID_BASE - (id))
+#define IS_HOF(id)     ((id) < 0 && (id) > ANCHOR_ID_BASE)
+#define IS_REF(id)     ((id) < 0)   /* anything whose weights are frozen */
+#define HOF_IDX(id)    (-(id) - 1)
+
+/* One permanent anchor. */
+typedef struct {
+    Trunk      *trunk;    /* NULL for the random mover: it has no network    */
+    Head        head;
+    float       elo;      /* PINNED.  Never updated, ever.                   */
+    int         pinned;   /* 0 only for gen0 before its calibration lands    */
+    int         bounded;  /* the calibration score was 0 or 1: elo is a bound */
+    const char *name;
+} AZAnchor;
+
+/* ---------------------------------------------------- the rating window */
+/* One finished game, in the form the fit wants: two dense player indices and
+ * the score of the first.  Draws are 0.5, which is the standard reduction of
+ * Bradley-Terry to half a win plus half a loss. */
+typedef struct { int32_t a, b; float sa; int32_t gen; } EloGame;
+
+/* A ring of the last few generations' games.  Sized so it always holds at
+ * least `window` generations of pairings; entries older than that are ignored
+ * by the fit rather than deleted. */
+typedef struct {
+    EloGame *g;
+    int      cap, n, head;
+} EloWin;
+
+static int elowin_init(EloWin *w, int cap)
+{
+    memset(w, 0, sizeof *w);
+    if (cap < 1) cap = 1;
+    w->g = (EloGame *)calloc((size_t)cap, sizeof(EloGame));
+    w->cap = cap;
+    return w->g != NULL;
+}
+static void elowin_free(EloWin *w) { free(w->g); w->g = NULL; w->cap = w->n = w->head = 0; }
+
+static void elowin_push(EloWin *w, int32_t a, int32_t b, float sa, int gen)
+{
+    EloGame *e = &w->g[w->head];
+    e->a = a; e->b = b; e->sa = sa; e->gen = gen;
+    w->head = (w->head + 1) % w->cap;
+    if (w->n < w->cap) w->n++;
+}
+
+/* A hall-of-fame slot has been recycled, so every window entry that refers to
+ * it now refers to the wrong network.  Kill them rather than let a new
+ * snapshot inherit its predecessor's results. */
+static void elowin_forget(EloWin *w, int32_t pidx)
+{
+    for (int i = 0; i < w->n; i++)
+        if (w->g[i].a == pidx || w->g[i].b == pidx) w->g[i].a = w->g[i].b = -1;
+}
+
+/* ================= BRADLEY-TERRY / LOGISTIC MAXIMUM LIKELIHOOD ============
+ *
+ * The rating of every player is estimated JOINTLY, from one window of results,
+ * with the anchors' ratings held fixed.  This is what makes the scale
+ * unable to drift: it is not a running total that each generation adds to, it
+ * is a fresh fit whose zero is nailed to a player whose strength is constant.
+ *
+ * Model: player i has strength gamma_i = 10^(rating_i / 400) and
+ *
+ *     P(i beats j) = gamma_i / (gamma_i + gamma_j)
+ *
+ * which is standard logistic Elo written multiplicatively.  A draw counts as
+ * half a win and half a loss, the usual Bradley-Terry reduction.
+ *
+ * Solver: minorisation-maximisation (Zermelo 1929; Hunter 2004), one sweep of
+ *
+ *     gamma_i  <-  W_i / sum_over_i's_games 1 / (gamma_i + gamma_opponent)
+ *
+ * over the free players, with the pinned ones left alone.  Every sweep
+ * increases the log-likelihood, there is no step size to tune, and a few
+ * hundred sweeps over a few thousand games costs microseconds.
+ *
+ * DEGENERATE CASES, all of which occur in practice and none of which may be
+ * allowed to emit an infinity:
+ *   - no games in the window            -> not rated; the caller holds the
+ *                                          previous value and the count is
+ *                                          reported as elo_fit_unrated.
+ *   - won or lost every game            -> the likelihood has no interior
+ *                                          maximum.  The iterate is clamped to
+ *                                          [ELO_FIT_LO, ELO_FIT_HI] and the
+ *                                          player is reported as bounded: the
+ *                                          number is a bound, not an estimate.
+ *   - no path of games to any pinned    -> the component's ratings are only
+ *     player                               determined up to a constant, i.e.
+ *                                          exactly the drift being fixed.  The
+ *                                          component is left alone and counted
+ *                                          in elo_fit_unanchored.
+ */
+typedef struct {
+    int     np;
+    double *gamma, *rating, *wins, *den;
+    int    *ngames, *pinned, *bounded, *uf, *anchored;
+    /* Which slots hold a player that exists at all.  The hall-of-fame table
+     * is a fixed-size array that fills up over hundreds of generations, and
+     * counting its empty slots as "unrated" would bury the diagnostic that
+     * matters -- a LIVE agent with no games -- under 60 non-events. */
+    int    *active;
+    int     iters, n_unrated, n_bounded, n_unanchored, n_games;
+    double  delta;
+} EloFit;
+
+static int elofit_init(EloFit *f, int np)
+{
+    memset(f, 0, sizeof *f);
+    f->np       = np;
+    f->gamma    = (double *)calloc((size_t)np, sizeof(double));
+    f->rating   = (double *)calloc((size_t)np, sizeof(double));
+    f->wins     = (double *)calloc((size_t)np, sizeof(double));
+    f->den      = (double *)calloc((size_t)np, sizeof(double));
+    f->ngames   = (int *)   calloc((size_t)np, sizeof(int));
+    f->pinned   = (int *)   calloc((size_t)np, sizeof(int));
+    f->bounded  = (int *)   calloc((size_t)np, sizeof(int));
+    f->uf       = (int *)   calloc((size_t)np, sizeof(int));
+    f->anchored = (int *)   calloc((size_t)np, sizeof(int));
+    f->active   = (int *)   calloc((size_t)np, sizeof(int));
+    return f->gamma && f->rating && f->wins && f->den && f->ngames &&
+           f->pinned && f->bounded && f->uf && f->anchored && f->active;
+}
+
+static void elofit_free(EloFit *f)
+{
+    free(f->gamma); free(f->rating); free(f->wins); free(f->den);
+    free(f->ngames); free(f->pinned); free(f->bounded); free(f->uf);
+    free(f->anchored); free(f->active);
+    memset(f, 0, sizeof *f);
+}
+
+static int uf_find(int *uf, int x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; }
+static void uf_union(int *uf, int a, int b)
+{
+    a = uf_find(uf, a); b = uf_find(uf, b);
+    if (a != b) uf[b] = a;
+}
+
+static void elofit_run(EloFit *f, const EloGame *gm, int ng, int max_iter, double tol)
+{
+    const int np = f->np;
+    int it;
+
+    for (int i = 0; i < np; i++) {
+        f->wins[i] = 0.0; f->ngames[i] = 0; f->uf[i] = i;
+        f->bounded[i] = 0; f->anchored[i] = 0;
+        if (f->pinned[i]) f->gamma[i] = pow(10.0, f->rating[i] / 400.0);
+    }
+    for (int k = 0; k < ng; k++) {
+        const int a = gm[k].a, b = gm[k].b;
+        f->wins[a] += (double)gm[k].sa;
+        f->wins[b] += 1.0 - (double)gm[k].sa;
+        f->ngames[a]++; f->ngames[b]++;
+        uf_union(f->uf, a, b);
+    }
+    /* A pinned player with no games in the window anchors nothing. */
+    for (int i = 0; i < np; i++)
+        if (f->pinned[i] && f->ngames[i] > 0) f->anchored[uf_find(f->uf, i)] = 1;
+
+    /* DEGENERACY, decided from the data rather than from where the iterate
+     * happens to stop.  A player who took every point, or none, has a
+     * likelihood with no interior maximum: the estimate runs off to an
+     * infinity and only the clamp stops it.  Marking it here -- before a
+     * single sweep -- is what keeps such a player out of the pinned reference
+     * set.  Deciding it afterwards by comparing against the clamp is what the
+     * first version of this did, and `400 * log10(0)` landing exactly ON the
+     * clamp slipped through the comparison and pinned entries at -4000. */
+    for (int i = 0; i < np; i++)
+        if (!f->pinned[i] && f->ngames[i] > 0 &&
+            (f->wins[i] <= 0.0 || f->wins[i] >= (double)f->ngames[i]))
+            f->bounded[i] = 1;
+
+    f->delta = 0.0;
+    for (it = 0; it < max_iter; it++) {
+        double dmax = 0.0;
+        memset(f->den, 0, (size_t)np * sizeof(double));
+        for (int k = 0; k < ng; k++) {
+            const int a = gm[k].a, b = gm[k].b;
+            const double d = 1.0 / (f->gamma[a] + f->gamma[b]);
+            f->den[a] += d; f->den[b] += d;
+        }
+        for (int i = 0; i < np; i++) {
+            double g, r, d;
+            if (f->pinned[i] || f->ngames[i] == 0) continue;
+            if (!f->anchored[uf_find(f->uf, i)]) continue;
+            if (!(f->den[i] > 0.0)) continue;
+            g = f->wins[i] / f->den[i];
+            r = (g > 0.0) ? 400.0 * log10(g) : ELO_FIT_LO;
+            if (r <= ELO_FIT_LO)      { r = ELO_FIT_LO; f->bounded[i] = 1; }
+            else if (r >= ELO_FIT_HI) { r = ELO_FIT_HI; f->bounded[i] = 1; }
+            d = fabs(r - f->rating[i]);
+            if (d > dmax) dmax = d;
+            f->rating[i] = r;
+            f->gamma[i]  = pow(10.0, r / 400.0);
+        }
+        f->delta = dmax;
+        if (dmax < tol) { it++; break; }
+    }
+    f->iters = it;
+
+    f->n_unrated = f->n_bounded = f->n_unanchored = 0;
+    f->n_games   = ng;
+    for (int i = 0; i < np; i++) {
+        if (f->pinned[i] || !f->active[i]) continue;
+        if (f->ngames[i] == 0)                     f->n_unrated++;
+        else if (!f->anchored[uf_find(f->uf, i)])  f->n_unanchored++;
+        else if (f->bounded[i])                    f->n_bounded++;
+    }
+}
 
 /* ------------------------------------------------------------ head tensors */
 /* The layout table lives in net.h (NN_HEAD_TENSORS).  It used to be duplicated
@@ -516,6 +780,12 @@ typedef struct {
     int        resign_on, check_game, resign_live;
     int        consec[2];
     int        would_resign, resigned;
+    /* MEASUREMENT GAME.  One side is a permanent anchor.  Such a game is
+     * played for its result only: nothing it produces enters the replay
+     * buffer and nothing it produces enters the population statistics, so
+     * measuring the population cannot change the population or the numbers
+     * every past run was reported with. */
+    int        anchor_game;
 } AZSlot;
 
 /* The batch-size histogram.  Index 0 is unused; index k counts the rounds that
@@ -546,6 +816,16 @@ typedef struct {
     uint64_t  resign_checked, resign_would, resign_wrong;
 
     uint64_t  full_moves, all_moves; /* playout-cap randomisation accounting  */
+
+    /* ANCHOR SCORES.  The single most honest progress signal inside training:
+     * the raw fraction of a point the LIVE population takes per game against a
+     * player whose strength cannot change.  No model, no fit, no scale.
+     * anch_cal_* is the anchor-versus-anchor calibration game, gen0 vs random,
+     * scored from gen0's side. */
+    double    anch_score[AZ_N_ANCHORS];
+    uint64_t  anch_n[AZ_N_ANCHORS];
+    double    anch_cal_score;
+    uint64_t  anch_cal_n;
 
     /* learning */
     TrunkGrad *tg;
@@ -580,6 +860,21 @@ struct AZShared {
     float    *elo;
     HofEntry *hof;
     int       hof_n, hof_next;
+
+    /* ---- the anchored rating.  All of it is inert when anchors_on == 0. -- */
+    AZAnchor  anchors[AZ_N_ANCHORS];
+    int       anchors_on;
+    int       anchor_games;     /* pairing slots given to an anchor this gen  */
+    int       anchor_near;      /* the anchor nearest the population          */
+    uint64_t  cal_n;            /* gen0-vs-random games played so far         */
+    float    *elo_fit;          /* per live agent, from the global fit        */
+    EloWin    win;
+    EloFit    fit;
+    EloGame  *fit_scratch;
+    /* Legacy-scheme accounting, so the bug can be measured rather than
+     * argued about: how much rating the K-factor updates create out of
+     * nothing each generation by playing opponents whose rating is frozen. */
+    double    elo_inject, elo_sum_delta;
 
     AZPair   *pairs;
     AZRes    *results;
@@ -630,7 +925,24 @@ static void ema_blend(float *e, const float *p, float d, size_t n)
 
 static void resolve_side(const AZShared *sh, int32_t id, const Head **h)
 {
+    if (IS_ANCHOR(id)) {
+        /* The random mover has no network at all; nothing ever dereferences
+         * this, because an anchor's move never goes through the shared batch
+         * (it does not share the population's trunk). */
+        *h = sh->anchors[ANCHOR_IDX(id)].trunk ? &sh->anchors[ANCHOR_IDX(id)].head : NULL;
+        return;
+    }
     *h = IS_HOF(id) ? &sh->hof[HOF_IDX(id)].head : &sh->heads[id];
+}
+
+/* Dense player index for the fit: live agents, then hall of fame, then
+ * anchors. */
+static int elo_pidx(const AZShared *sh, int32_t id)
+{
+    const int n = sh->cfg->n_agents;
+    if (id >= 0)       return (int)id;
+    if (IS_ANCHOR(id)) return n + HOF_CAP + ANCHOR_IDX(id);
+    return n + HOF_IDX(id);
 }
 
 /* ==========================================================================
@@ -723,10 +1035,83 @@ static void az_slot_newgame(AZWorker *w, AZSlot *s)
     s->resign_on   = (c->resign_threshold > -1.0f);
     s->check_game  = s->resign_on && (az_u01(s->rng) < c->resign_check_frac);
     s->resign_live = s->resign_on && !s->check_game;
+    /* An anchor never resigns -- it has no value head to consult, or in gen0's
+     * case no business consulting one -- so letting only the live side resign
+     * would bias every anchor game towards the anchor.  Both sides play the
+     * game out.  The az_u01 draw above is kept so that turning anchors on does
+     * not shift the random stream of any game that has no anchor in it. */
+    s->anchor_game = IS_ANCHOR(s->pr.white) || IS_ANCHOR(s->pr.black);
+    if (s->anchor_game) s->resign_on = s->check_game = s->resign_live = 0;
     s->consec[0] = s->consec[1] = 0;
     s->would_resign = -1;
     s->resigned     = -1;
 
+    s->state = SL_MOVE;
+}
+
+/* Counts the move and plays it.  Shared by the searched path and the anchor
+ * path so the two cannot drift apart. */
+static void az_slot_play_move(AZWorker *w, AZSlot *s, Move mv)
+{
+    Game *g = &s->g;
+    if (!s->anchor_game) {   /* measurement games stay out of the statistics */
+        const int fl = MV_FLAG(mv);
+        if (MV_IS_CAPTURE(mv))   w->st.captures++;
+        if (fl == MF_EP)         w->st.ep_captures++;
+        if (MV_IS_PROMO(mv))     w->st.promotions++;
+        if (fl == MF_KCASTLE || fl == MF_QCASTLE) w->st.castles++;
+        if (g->ply == 0 && s->side == WHITE)
+            w->st.first_move[MV_FROM(mv) * 64 + MV_TO(mv)]++;
+    }
+    game_push(g, mv);
+    if (!s->anchor_game && in_check(&g->pos, g->pos.side)) w->st.checks++;
+}
+
+/* An anchor's move.  Played synchronously, outside the shared batch: the
+ * random mover needs no network, and the gen-0 network is not the population's
+ * trunk, which is what mcts_batch_run() evaluates everything against.  Anchor
+ * games are a few percent of a generation, so the lost batching is noise. */
+static void az_slot_anchor_move(AZWorker *w, AZSlot *s)
+{
+    AZShared *sh = w->sh;
+    const AZCfg *c = sh->cfg;
+    Game *g = &s->g;
+    const int k = ANCHOR_IDX(s->id);
+    Move mv;
+
+    if (k < 0 || k >= AZ_N_ANCHORS) { s->state = SL_ENDGAME; return; }
+
+    if (!sh->anchors[k].trunk) {
+        /* A UNIFORM RANDOM LEGAL MOVER.  gen_legal() plus a coin: the rules of
+         * chess and nothing else, which is exactly what
+         * docs/FROM_SCRATCH.md permits and exactly why this player's strength
+         * is a constant of nature rather than a moving target. */
+        const int nl = gen_legal(&g->pos, s->list);
+        if (nl <= 0) { s->state = SL_ENDGAME; return; }
+        mv = s->list[(int)(az_next(s->rng) % (uint64_t)nl)];
+    } else {
+        /* The FROZEN generation-0 network, playing EXACTLY as a live agent
+         * plays: full simulation budget (never the playout cap, so its
+         * strength does not move with --cap-frac), the same root noise, the
+         * same temperature schedule.  It is meant to be the population at
+         * generation 0, so anything that handicaps the population must
+         * handicap it too -- searching it cleanly while the population
+         * searches under Dirichlet noise measured a 300-point gap that was
+         * the noise, not the training. */
+        const AZAnchor *a = &sh->anchors[k];
+        float rv = 0.0f;
+        int nvis, nl, pick;
+        float temp;
+        nvis = mcts_search(&s->m, a->trunk, &a->head, g, c->sims, 1,
+                           s->rng, s->visits, &rv);
+        if (nvis <= 0) { s->state = SL_ENDGAME; return; }
+        nl = gen_legal(&g->pos, s->list);
+        if (nl != nvis) { s->state = SL_ENDGAME; return; }
+        temp = (g->ply < c->opening_plies) ? c->temp_start : c->temp_end;
+        pick = mcts_pick(s->visits, nvis, temp, s->rng);
+        mv   = s->list[pick < 0 ? 0 : pick];
+    }
+    az_slot_play_move(w, s, mv);
     s->state = SL_MOVE;
 }
 
@@ -748,6 +1133,8 @@ static void az_slot_begin_move(AZWorker *w, AZSlot *s)
     s->side = (int)g->pos.side;
     s->id   = (s->side == WHITE) ? s->pr.white : s->pr.black;
     s->h    = (s->side == WHITE) ? s->hw : s->hb;
+
+    if (IS_ANCHOR(s->id)) { az_slot_anchor_move(w, s); return; }
 
     /* PLAYOUT CAP RANDOMISATION (KataGo).  A "full" move gets the whole
      * simulation budget, root noise and a slot in the replay buffer; a "fast"
@@ -776,21 +1163,25 @@ static void az_slot_after_search(AZWorker *w, AZSlot *s)
     const int n = mcts_end(&s->m, s->visits, &rootv);
     if (n <= 0) { s->state = SL_ENDGAME; return; }   /* the search saw game over */
 
-    w->all_moves++;
-    if (s->full) w->full_moves++;
+    if (!s->anchor_game) {
+        w->all_moves++;
+        if (s->full) w->full_moves++;
+    }
 
     const int nl = gen_legal(&g->pos, s->list);
     if (nl != n) { s->state = SL_ENDGAME; return; }  /* cannot happen */
 
     mcts_target(s->visits, n, s->target);
 
-    w->rootv_sum += (double)rootv;
-    w->rootv_n++;
-    w->tgt_ent_sum += target_entropy_(s->target, n);
-    w->tgt_ent_n++;
+    if (!s->anchor_game) {
+        w->rootv_sum += (double)rootv;
+        w->rootv_n++;
+        w->tgt_ent_sum += target_entropy_(s->target, n);
+        w->tgt_ent_n++;
+    }
 
     /* ---- record: features, the visit-count policy target, the mover ------ */
-    if (s->full && !IS_HOF(s->id) && r->n < r->npos_cap &&
+    if (s->full && !IS_REF(s->id) && !s->anchor_game && r->n < r->npos_cap &&
         r->nk + (uint64_t)n <= r->nk_cap && n <= REC_MAX_MOVES) {
         AZPos *p = &r->pos[r->n];
         p->nf     = (uint8_t)nn_features(&g->pos, p->fidx);
@@ -826,21 +1217,7 @@ static void az_slot_after_search(AZWorker *w, AZSlot *s)
     /* ---- pick and play --------------------------------------------------- */
     const float temp = (g->ply < c->opening_plies) ? c->temp_start : c->temp_end;
     const int pick = mcts_pick(s->visits, n, temp, s->rng);
-    const Move mv = s->list[pick < 0 ? 0 : pick];
-
-    {   /* move statistics: pure counting, no evaluation */
-        const int fl = MV_FLAG(mv);
-        if (MV_IS_CAPTURE(mv))   w->st.captures++;
-        if (fl == MF_EP)         w->st.ep_captures++;
-        if (MV_IS_PROMO(mv))     w->st.promotions++;
-        if (fl == MF_KCASTLE || fl == MF_QCASTLE) w->st.castles++;
-        if (g->ply == 0 && s->side == WHITE)
-            w->st.first_move[MV_FROM(mv) * 64 + MV_TO(mv)]++;
-    }
-
-    game_push(g, mv);
-    if (in_check(&g->pos, g->pos.side)) w->st.checks++;
-
+    az_slot_play_move(w, s, s->list[pick < 0 ? 0 : pick]);
     s->state = SL_MOVE;
 }
 
@@ -871,6 +1248,31 @@ static void az_slot_endgame(AZWorker *w, AZSlot *s)
             w->resign_would++;
             if (!lost) w->resign_wrong++;
         }
+    }
+
+    /* ---- an anchor game is a measurement, not training data ------------- */
+    if (s->anchor_game) {
+        const int wa = IS_ANCHOR(s->pr.white), ba = IS_ANCHOR(s->pr.black);
+        const double sw = (result == GR_WHITE_WIN) ? 1.0
+                        : (result == GR_BLACK_WIN) ? 0.0 : 0.5;
+        if (wa && ba) {
+            /* The calibration game: gen0 against the random mover, scored
+             * from gen0's side. */
+            const int kw = ANCHOR_IDX(s->pr.white);
+            w->anch_cal_score += (kw == AZ_ANCHOR_GEN0) ? sw : 1.0 - sw;
+            w->anch_cal_n++;
+        } else {
+            const int k = wa ? ANCHOR_IDX(s->pr.white) : ANCHOR_IDX(s->pr.black);
+            if (k >= 0 && k < AZ_N_ANCHORS) {
+                /* Scored from the LIVE population's side. */
+                w->anch_score[k] += wa ? 1.0 - sw : sw;
+                w->anch_n[k]++;
+            }
+        }
+        sh->results[s->idx].result = (int16_t)result;
+        sh->results[s->idx].reason = (int16_t)reason;
+        s->state = SL_NEWGAME;
+        return;
     }
 
     /* ---- label every recorded ply from THAT ply's mover's view ---------- */
@@ -1481,25 +1883,203 @@ static int build_pairings(AZShared *sh, EloRank *rank, int32_t *wslot,
             else                   sh->pairs[t].black = hid;
         }
     }
+
+    /* ---- games routed to the permanent anchors -------------------------
+     * They REPLACE population pairings rather than adding to the generation,
+     * so measuring costs no wall-clock time; and they are spread evenly over
+     * the rank-ordered pairing list (which is sorted strongest-first before
+     * the window shuffle) so the sample is not drawn from one end of the
+     * population.  Half go to the anchor NEAREST the population's current
+     * strength, because a match that is 100% one way carries almost no
+     * information; the rest are split evenly so that every anchor is linked
+     * to the population in every window. */
+    sh->anchor_games = 0;
+    if (sh->anchors_on) {
+        int want = c->anchor_games, cal, total, stride;
+        /* Population-versus-anchor games, capped at a quarter of the
+         * generation so that measuring never eats the training. */
+        if (want < 0)      want = 0;
+        if (want > np / 4) want = np / 4;
+        /* Calibration games, gen0 against the random mover.  The quota is
+         * filled as fast as the cap allows and then drops to a trickle -- but
+         * it never stops, because two players who cannot change must score
+         * the same against each other forever, and a number that is supposed
+         * to be constant is worth continuing to check. */
+        {
+            const int quota = c->anchor_cal_games - (int)sh->cal_n;
+            const int maint = c->anchor_games / 8 > 2 ? c->anchor_games / 8 : 2;
+            cal = quota > 0 ? quota : maint;
+            if (cal > np / 4) cal = np / 4;
+            if (cal < 0)      cal = 0;
+        }
+        total = want + cal;                    /* both capped at np/4 above */
+        stride = total > 0 ? np / total : 0;
+        /* j counts the population-vs-anchor games and k the calibration ones,
+         * SEPARATELY, because both colour alternations have to be driven by a
+         * counter that advances once per game of that kind.  Alternating on
+         * the shared index i instead put the gen-0 anchor on the same colour
+         * in every calibration game whenever the two kinds interleaved
+         * regularly, which biased the one match the whole scale rests on. */
+        for (int i = 0, j = 0, k = 0; i < total && stride > 0; i++) {
+            /* Systematic sampling across the pairing list, which is sorted
+             * strongest-first before the window shuffle: anchor games are
+             * therefore spread over the whole population rather than drawn
+             * from one end of it.  The calibration games are interleaved for
+             * the same reason. */
+            const int t = i * stride + (int)(az_next(rng) % (uint64_t)stride);
+            /* Bresenham: exactly `cal` of the `total` selected slots are
+             * calibration games, spread evenly through them. */
+            const int is_cal = ((long)i * cal) / total < ((long)(i + 1) * cal) / total;
+            if (t >= np) continue;
+            if (is_cal) {
+                /* CALIBRATION: gen0 against the random mover.  This match is
+                 * what turns "rated 0 by definition" into a rating for the
+                 * second anchor; after that both are pinned forever. */
+                const int32_t g0 = ANCHOR_ID(AZ_ANCHOR_GEN0);
+                const int32_t rm = ANCHOR_ID(AZ_ANCHOR_RANDOM);
+                sh->pairs[t].white = (k & 1) ? rm : g0;
+                sh->pairs[t].black = (k & 1) ? g0 : rm;
+                k++;
+            } else {
+                const int ak = (j & 1) ? sh->anchor_near : (j / 2) % AZ_N_ANCHORS;
+                const int32_t aid = ANCHOR_ID(ak);
+                int32_t *wp = &sh->pairs[t].white, *bp = &sh->pairs[t].black;
+                if (IS_HOF(*wp))      *wp = aid;   /* keep a LIVE agent in it */
+                else if (IS_HOF(*bp)) *bp = aid;
+                else if (j & 2)       *wp = aid;
+                else                  *bp = aid;
+                j++;
+            }
+            sh->anchor_games++;
+        }
+    }
     return np;
 }
 
+/* ------------------------------------------------------ the legacy rating */
+/* Incremental Elo, K = 24.  Kept, computed and logged exactly as before so
+ * that every past run stays comparable -- and so that the bug it has can be
+ * MEASURED rather than argued about.
+ *
+ * Live against live is exactly zero-sum: the two updates are +K(s-e) and
+ * -K(s-e).  Live against a FROZEN opponent is not: the live agent's rating
+ * moves and nothing moves the other way, so rating enters the population from
+ * nowhere.  sh->elo_inject is precisely that quantity, summed over the
+ * generation, and sh->elo_sum_delta is the actual change in the population's
+ * total rating.  The two must be equal; that they are is the proof that
+ * frozen opponents are the ONLY source of drift.
+ *
+ * Anchor games are deliberately excluded here.  The anchors exist to rate the
+ * population honestly, and feeding them into the broken scheme as well would
+ * partly repair it and hide the very thing being demonstrated. */
 static void apply_elo(AZShared *sh)
 {
+    const int n = sh->cfg->n_agents;
+    double before = 0.0, after = 0.0, inject = 0.0;
+
+    for (int i = 0; i < n; i++) before += (double)sh->elo[i];
+
     for (int i = 0; i < sh->npairs; i++) {
         const AZPair p = sh->pairs[i];
         const int res = sh->results[i].result;
         if (p.white == p.black) continue;
         if (res == GR_ONGOING) continue;
+        if (IS_ANCHOR(p.white) || IS_ANCHOR(p.black)) continue;
 
         const float sw = (res == GR_WHITE_WIN) ? 1.0f : (res == GR_BLACK_WIN) ? 0.0f : 0.5f;
         const float rw = IS_HOF(p.white) ? sh->hof[HOF_IDX(p.white)].elo : sh->elo[p.white];
         const float rb = IS_HOF(p.black) ? sh->hof[HOF_IDX(p.black)].elo : sh->elo[p.black];
         const float ew = 1.0f / (1.0f + powf(10.0f, (rb - rw) / 400.0f));
 
-        if (!IS_HOF(p.white)) sh->elo[p.white] += ELO_K * (sw - ew);
-        if (!IS_HOF(p.black)) sh->elo[p.black] += ELO_K * ((1.0f - sw) - (1.0f - ew));
+        /* The two update expressions are written EXACTLY as they were before
+         * the injection accounting was added.  Hoisting either into a named
+         * float first would round it before the add and block the fused
+         * multiply-add the build's -ffp-contract=fast allows, which is a
+         * one-ULP change -- and a one-ULP change in one agent's rating is
+         * enough to make a checkpoint differ and a run diverge. Measured: it
+         * did exactly that. The accountancy below is kept in double and
+         * deliberately does not share a subexpression with them. */
+        if (!IS_HOF(p.white)) {
+            sh->elo[p.white] += ELO_K * (sw - ew);
+            if (IS_HOF(p.black)) inject += (double)ELO_K * ((double)sw - (double)ew);
+        }
+        if (!IS_HOF(p.black)) {
+            sh->elo[p.black] += ELO_K * ((1.0f - sw) - (1.0f - ew));
+            if (IS_HOF(p.white))
+                inject += (double)ELO_K * ((1.0 - (double)sw) - (1.0 - (double)ew));
+        }
     }
+
+    for (int i = 0; i < n; i++) after += (double)sh->elo[i];
+    sh->elo_inject    = inject;
+    sh->elo_sum_delta = after - before;
+}
+
+/* ==========================================================================
+ *                          THE ANCHORED RATING
+ * ========================================================================== */
+
+/* This generation's decided games go into the sliding window, then everyone
+ * who has games in it is re-fitted from scratch with the anchors held fixed.
+ * Nothing accumulates; there is no running total for an error to hide in. */
+static void az_rate_anchored(AZShared *sh, int gen)
+{
+    const AZCfg *c = sh->cfg;
+    const int n = c->n_agents;
+    EloFit *f = &sh->fit;
+    int ng = 0;
+
+    if (!sh->anchors_on) return;
+
+    for (int i = 0; i < sh->npairs; i++) {
+        const AZPair p = sh->pairs[i];
+        const int res = sh->results[i].result;
+        float sa;
+        if (p.white == p.black) continue;
+        if (res == GR_ONGOING) continue;
+        sa = (res == GR_WHITE_WIN) ? 1.0f : (res == GR_BLACK_WIN) ? 0.0f : 0.5f;
+        elowin_push(&sh->win, (int32_t)elo_pidx(sh, p.white),
+                    (int32_t)elo_pidx(sh, p.black), sa, gen);
+    }
+
+    {   /* compact the live part of the window into one contiguous array */
+        const int lo = gen - c->elo_window + 1;
+        for (int i = 0; i < sh->win.n; i++) {
+            const EloGame *e = &sh->win.g[i];
+            if (e->a < 0 || e->b < 0) continue;      /* a recycled hof slot */
+            if (e->gen < lo) continue;
+            sh->fit_scratch[ng++] = *e;
+        }
+    }
+
+    /* Who is pinned: the anchors that have been calibrated, and every hall-of
+     * fame entry past its provisional period.  Everyone else is free. */
+    for (int i = 0; i < f->np; i++) { f->pinned[i] = 0; f->active[i] = 0; }
+    for (int i = 0; i < n; i++) f->active[i] = 1;
+    for (int k = 0; k < sh->hof_n; k++) f->active[n + k] = 1;
+    for (int k = 0; k < AZ_N_ANCHORS; k++) f->active[n + HOF_CAP + k] = 1;
+    for (int k = 0; k < AZ_N_ANCHORS; k++) {
+        const int pi = n + HOF_CAP + k;
+        if (!sh->anchors[k].pinned) continue;
+        f->pinned[pi] = 1;
+        f->rating[pi] = (double)sh->anchors[k].elo;
+    }
+    for (int k = 0; k < sh->hof_n; k++) {
+        if (!sh->hof[k].pinned) continue;
+        f->pinned[n + k] = 1;
+        f->rating[n + k] = (double)sh->hof[k].elo_fit;
+    }
+
+    elofit_run(f, sh->fit_scratch, ng, c->elo_iters, 1e-4);
+
+    /* Only a real estimate is published.  A player with no games, one in a
+     * component with no pinned member, or one who took every point or none of
+     * them keeps its previous value -- and is counted in elo_fit_unrated /
+     * _unanchored / _bounded, so the reader knows the number is stale rather
+     * than being handed a clamp dressed up as a rating. */
+    for (int i = 0; i < n; i++)
+        if (f->ngames[i] > 0 && !f->bounded[i] && f->anchored[uf_find(f->uf, i)])
+            sh->elo_fit[i] = (float)f->rating[i];
 }
 
 /* ==========================================================================
@@ -1518,6 +2098,25 @@ typedef struct {
     uint64_t batch_hist[AZ_BATCH_HIST];
     double elo_best, elo_mean, elo_p10;
     int    best_i;
+
+    /* ---- the anchored rating and the evidence for it ------------------- */
+    int      anchored_on;
+    double   elo_anchored_best, elo_anchored_mean, elo_anchored_p10;
+    int      elo_anchored_best_i;
+    double   anchor_score[AZ_N_ANCHORS];
+    uint64_t anchor_n[AZ_N_ANCHORS];
+    double   anchor_elo[AZ_N_ANCHORS];
+    int      anchor_pinned[AZ_N_ANCHORS], anchor_bounded[AZ_N_ANCHORS];
+    double   anchor_cal_score;
+    uint64_t anchor_cal_n, anchor_cal_total;
+    uint64_t anchor_games;
+    int      fit_games, fit_iters, fit_unrated, fit_bounded, fit_unanchored;
+    double   fit_delta;
+    int      hof_n, hof_pinned;
+    double   hof_fit_min, hof_fit_max, hof_fit_mean;
+    /* the legacy scheme, measured */
+    double   elo_inject, elo_sum_delta, elo_sum, elo_sum_carry;
+    double   hof_elo_min, hof_elo_max;   /* LEGACY hof ratings: the ratchet */
     uint64_t evals;
     double loss_pol, loss_val, loss_tot, policy_entropy, target_entropy;
     double value_acc, value_acc_decisive, head_grad_norm, grad_norm, lr;
@@ -1575,6 +2174,71 @@ static void write_telemetry(FILE *f, const AZShared *sh, const AZStats *st,
     fprintf(f, ",\"elo_best\":");      jnum(f, gs->elo_best);
     fprintf(f, ",\"elo_mean\":");      jnum(f, gs->elo_mean);
     fprintf(f, ",\"elo_p10\":");       jnum(f, gs->elo_p10);
+
+    /* ---- the anchored rating -------------------------------------------
+     * elo_best / elo_mean / elo_p10 above are the OLD, drifting numbers.
+     * They are still written so that runs before and after this change can be
+     * plotted on the same axes -- and so the drift stays visible.  The
+     * numbers below are the ones to believe.  See docs/RATING.md.          */
+    if (gs->anchored_on) {
+        fprintf(f, ",\"elo_anchored_best\":");  jnum(f, gs->elo_anchored_best);
+        fprintf(f, ",\"elo_anchored_mean\":");  jnum(f, gs->elo_anchored_mean);
+        fprintf(f, ",\"elo_anchored_p10\":");   jnum(f, gs->elo_anchored_p10);
+        fprintf(f, ",\"elo_anchor\":[");
+        for (int k = 0; k < AZ_N_ANCHORS; k++) {
+            fprintf(f, "%s{\"name\":\"%s\",\"elo\":", k ? "," : "",
+                    sh->anchors[k].name ? sh->anchors[k].name : "?");
+            jnum(f, gs->anchor_elo[k]);
+            fprintf(f, ",\"pinned\":%d,\"bounded\":%d,\"games\":%llu,\"score\":",
+                    gs->anchor_pinned[k], gs->anchor_bounded[k],
+                    (unsigned long long)gs->anchor_n[k]);
+            jnum(f, gs->anchor_n[k] ? gs->anchor_score[k] / (double)gs->anchor_n[k]
+                                    : 0.0);
+            fputc('}', f);
+        }
+        fputc(']', f);
+        /* gen0 vs the random mover: two players who can never change, so this
+         * score can never change either.  If it moves, something that was
+         * supposed to be frozen is not. */
+        fprintf(f, ",\"anchor_cal_games\":%llu",
+                (unsigned long long)gs->anchor_cal_n);
+        fprintf(f, ",\"anchor_cal_score\":");
+        jnum(f, gs->anchor_cal_n ? gs->anchor_cal_score / (double)gs->anchor_cal_n
+                                 : 0.0);
+        fprintf(f, ",\"anchor_cal_total\":%llu",
+                (unsigned long long)gs->anchor_cal_total);
+        fprintf(f, ",\"anchor_games\":%llu", (unsigned long long)gs->anchor_games);
+        fprintf(f, ",\"elo_fit_games\":%d",      gs->fit_games);
+        fprintf(f, ",\"elo_fit_iters\":%d",      gs->fit_iters);
+        fprintf(f, ",\"elo_fit_delta\":");       jnum(f, gs->fit_delta);
+        fprintf(f, ",\"elo_fit_unrated\":%d",    gs->fit_unrated);
+        fprintf(f, ",\"elo_fit_bounded\":%d",    gs->fit_bounded);
+        fprintf(f, ",\"elo_fit_unanchored\":%d", gs->fit_unanchored);
+        fprintf(f, ",\"hof_n\":%d,\"hof_pinned\":%d", gs->hof_n, gs->hof_pinned);
+        fprintf(f, ",\"hof_fit_min\":");  jnum(f, gs->hof_fit_min);
+        fprintf(f, ",\"hof_fit_max\":");  jnum(f, gs->hof_fit_max);
+        /* The MEAN matters more than the extremes: min and max are order
+         * statistics over a set that grows all run, so they spread even when
+         * nothing drifts. */
+        fprintf(f, ",\"hof_fit_mean\":"); jnum(f, gs->hof_fit_mean);
+    }
+    /* The bug, measured.  elo_inject is the rating the K-factor updates
+     * created out of nothing this generation by playing frozen opponents;
+     * elo_sum_delta is the population's total change.  They are equal because
+     * live-versus-live Elo is exactly zero-sum. */
+    fprintf(f, ",\"elo_inject\":");     jnum(f, gs->elo_inject);
+    fprintf(f, ",\"elo_sum_delta\":");  jnum(f, gs->elo_sum_delta);
+    fprintf(f, ",\"elo_sum\":");        jnum(f, gs->elo_sum);
+    /* The change EVOLUTION made to the total rating, measured rather than
+     * assumed.  Exactly zero: a culled agent keeps its own rating when it
+     * receives an elite's head. */
+    fprintf(f, ",\"elo_sum_carry\":");  jnum(f, gs->elo_sum_carry);
+    /* And the ratchet itself: the LEGACY ratings sitting in the hall of fame.
+     * Each snapshot was stamped with the then-best agent's already-drifted
+     * rating, so these climb in lockstep with the population and go on
+     * supplying an opponent that is "similarly rated but beatable" forever. */
+    fprintf(f, ",\"hof_elo_min\":");    jnum(f, gs->hof_elo_min);
+    fprintf(f, ",\"hof_elo_max\":");    jnum(f, gs->hof_elo_max);
     fprintf(f, ",\"white_win\":");     jnum(f, (double)st->white_wins / gd);
     fprintf(f, ",\"black_win\":");     jnum(f, (double)st->black_wins / gd);
     fprintf(f, ",\"draw\":");          jnum(f, (double)st->draws / gd);
@@ -1823,6 +2487,18 @@ void az_default_cfg(AZCfg *c)
     c->hof_every        = 10;
     c->hof_frac_pct     = 15;
 
+    /* The anchored rating is ON by default.  It costs no wall-clock time --
+     * its games replace population games rather than adding to them -- and
+     * the number it produces is the only internal rating that means
+     * anything.  See docs/RATING.md. */
+    c->anchor_elo       = 1;
+    c->anchor_games     = 24;
+    c->anchor_cal_games = 48;
+    c->anchor_pin_gen   = 1;
+    c->elo_window       = 8;
+    c->elo_iters        = 400;
+    c->hof_pin_lag      = 0;      /* 0 = elo_window */
+
     c->seed             = 20260911u;
     c->run_dir          = "runs/az";
     c->quiet            = 0;
@@ -1883,6 +2559,19 @@ static void az_sanitise(AZCfg *c)
     if (c->hof_every < 1)         c->hof_every = 10;
     if (c->hof_frac_pct < 0)      c->hof_frac_pct = 0;
     if (c->hof_frac_pct > 100)    c->hof_frac_pct = 100;
+    if (c->anchor_elo != 0)       c->anchor_elo = 1;
+    if (c->anchor_games < 0)      c->anchor_games = 0;
+    if (c->anchor_cal_games < 0)  c->anchor_cal_games = 0;
+    if (c->anchor_pin_gen < 1)    c->anchor_pin_gen = 1;
+    if (c->elo_window < 1)        c->elo_window = 1;
+    if (c->elo_window > 128)      c->elo_window = 128;
+    if (c->elo_iters < 1)         c->elo_iters = 1;
+    if (c->elo_iters > 100000)    c->elo_iters = 100000;
+    if (c->hof_pin_lag < 0)       c->hof_pin_lag = 0;
+    /* An anchor that never plays anchors nothing, so asking for the anchored
+     * rating with no anchor games is a contradiction rather than a setting. */
+    if (c->anchor_elo && c->anchor_games < AZ_N_ANCHORS)
+        c->anchor_games = AZ_N_ANCHORS;
     if (!c->run_dir || !*c->run_dir) c->run_dir = "runs/az";
 }
 
@@ -1895,6 +2584,8 @@ int az_run(AZCfg *c)
     Head     *ema_heads = NULL;
     Hyper    *hypers = NULL;
     float    *elo = NULL, *elo_sorted = NULL;
+    float    *elo_fit = NULL;
+    Trunk    *gen0_trunk = NULL;
     HofEntry *hof = NULL;
     AZPair   *pairs = NULL;
     AZRes    *results = NULL;
@@ -1912,6 +2603,10 @@ int az_run(AZCfg *c)
     int       adam_ready = 0, nadam = 0, nspawned = 0, bar_ready = 0;
     int       nworkers_init = 0;
     int       h2h_next = 1, ema_wins = 0;
+    int       hof_pin_lag = 0, win_cap = 0;
+    double    cal_score = 0.0;
+    double    elo_sum_prev = 0.0;
+    uint64_t  cal_n = 0;
     double    t_run0, ema_gen = 0.0, best_saved = -1e30;
     uint64_t  total_games = 0, total_plies = 0, total_evals = 0;
     void    (*old_sigint)(int) = SIG_DFL;
@@ -1949,6 +2644,7 @@ int az_run(AZCfg *c)
     hypers     = (Hyper *)     calloc((size_t)n, sizeof(Hyper));
     elo        = (float *)     calloc((size_t)n, sizeof(float));
     elo_sorted = (float *)     calloc((size_t)n, sizeof(float));
+    elo_fit    = (float *)     calloc((size_t)n, sizeof(float));
     hof        = (HofEntry *)  calloc((size_t)HOF_CAP, sizeof(HofEntry));
     pairs      = (AZPair *)    calloc((size_t)npairs, sizeof(AZPair));
     results    = (AZRes *)     calloc((size_t)npairs, sizeof(AZRes));
@@ -1967,8 +2663,8 @@ int az_run(AZCfg *c)
     sh.aoff      = (int *)     calloc((size_t)n, sizeof(int));
     sh.tstart    = (int *)     calloc((size_t)nthreads + 1, sizeof(int));
 
-    if (!trunk || !heads || !hypers || !elo || !elo_sorted || !hof || !pairs ||
-        !results || !rank || !wslot || !bslot || !hgrad || !tgsum ||
+    if (!trunk || !heads || !hypers || !elo || !elo_sorted || !elo_fit || !hof ||
+        !pairs || !results || !rank || !wslot || !bslot || !hgrad || !tgsum ||
         !head_adam || !workers || !tids || !sh.batch || !sh.batch_tmp ||
         !sh.acount || !sh.aoff || !sh.tstart) {
         fprintf(stderr, "az: out of memory\n");
@@ -1993,10 +2689,63 @@ int az_run(AZCfg *c)
         az_hyper_mutate(&hypers[i], master);
         elo[i] = ELO_SEED;
     }
+    elo_sum_prev = (double)n * (double)ELO_SEED;
     if (ema_trunk) {                       /* the average starts AT the start */
         *ema_trunk = *trunk;
         memcpy(ema_heads, heads, (size_t)n * sizeof(Head));
     }
+
+    /* ---- the permanent anchors ------------------------------------------
+     * Taken here, before a single optimiser step, and never touched again.
+     * The gen-0 copy is a whole extra Trunk + Head for the life of the run,
+     * which is the price of having one player in the tournament whose
+     * strength is known to be constant. */
+    sh.anchors[AZ_ANCHOR_RANDOM].trunk   = NULL;
+    sh.anchors[AZ_ANCHOR_RANDOM].elo     = ELO_ANCHOR_RANDOM;
+    sh.anchors[AZ_ANCHOR_RANDOM].pinned  = 1;
+    sh.anchors[AZ_ANCHOR_RANDOM].bounded = 0;
+    sh.anchors[AZ_ANCHOR_RANDOM].name    = "random";
+    sh.anchors[AZ_ANCHOR_GEN0].elo       = ELO_ANCHOR_RANDOM;
+    sh.anchors[AZ_ANCHOR_GEN0].pinned    = 0;   /* until it is calibrated */
+    sh.anchors[AZ_ANCHOR_GEN0].bounded   = 0;
+    sh.anchors[AZ_ANCHOR_GEN0].name      = "gen0";
+    sh.anchors_on = c->anchor_elo;
+    if (sh.anchors_on) {
+        gen0_trunk = (Trunk *)calloc(1, sizeof(Trunk));
+        if (!gen0_trunk) { fprintf(stderr, "az: out of memory for the gen-0 anchor\n"); goto done; }
+        *gen0_trunk = *trunk;
+        sh.anchors[AZ_ANCHOR_GEN0].head  = heads[0];
+        sh.anchors[AZ_ANCHOR_GEN0].trunk = gen0_trunk;
+
+        hof_pin_lag = c->hof_pin_lag > 0 ? c->hof_pin_lag : c->elo_window;
+        /* One generation of slack so the ring always covers elo_window whole
+         * generations, and a hard ceiling so that a large population crossed
+         * with a large --elo-window cannot quietly ask for a gigabyte. */
+        {
+            long want = (long)(c->elo_window + 1) * (long)npairs;
+            if (want > 4000000L) want = 4000000L;
+            win_cap = (int)want;
+        }
+        if (!elowin_init(&sh.win, win_cap) ||
+            !elofit_init(&sh.fit, n + HOF_CAP + AZ_N_ANCHORS)) {
+            fprintf(stderr, "az: out of memory for the rating window\n");
+            goto done;
+        }
+        sh.fit_scratch = (EloGame *)calloc((size_t)sh.win.cap, sizeof(EloGame));
+        if (!sh.fit_scratch) {
+            fprintf(stderr, "az: out of memory for the rating window\n");
+            goto done;
+        }
+        /* Every rating starts at the gauge and is pulled to where the games
+         * say it belongs.  Nothing here is a seed that survives: the fit
+         * rewrites the free ratings from scratch every generation. */
+        for (int i = 0; i < sh.fit.np; i++) {
+            sh.fit.rating[i] = (double)ELO_ANCHOR_RANDOM;
+            sh.fit.gamma[i]  = 1.0;
+        }
+        for (int i = 0; i < n; i++) elo_fit[i] = ELO_ANCHOR_RANDOM;
+    }
+    sh.elo_fit = elo_fit;
 
     adam_init(&sh.trunk_adam, (int)TRUNK_NPARAM);
     for (nadam = 0; nadam < n; nadam++) adam_init(&head_adam[nadam], (int)HEAD_NPARAM);
@@ -2084,6 +2833,14 @@ int az_run(AZCfg *c)
                (double)c->resign_threshold, (double)c->resign_check_frac * 100.0,
                (double)c->elite_frac * 100.0, (double)c->cull_frac * 100.0,
                c->hof_every, c->hof_frac_pct, (unsigned long long)c->seed);
+        if (sh.anchors_on)
+            printf("            anchored elo ON: %d anchor games/gen (%d calibration "
+                   "in gen %d), fit window %d gens, hof pinned after %d\n",
+                   c->anchor_games, c->anchor_cal_games, c->anchor_pin_gen,
+                   c->elo_window, hof_pin_lag);
+        else
+            printf("            anchored elo OFF: elo_best is the LEGACY drifting "
+                   "number, see docs/RATING.md\n");
         printf("            run dir %s\n", c->run_dir);
         fflush(stdout);
     }
@@ -2114,6 +2871,18 @@ int az_run(AZCfg *c)
         gs.ema_h2h = -1.0;          /* -1 = not measured this generation */
         st_zero(&st);
         sh.generation = gen;
+
+        /* What EVOLUTION did to the population's total rating since the last
+         * generation was rated.  Cloning an elite's head onto a culled agent
+         * leaves that agent's rating alone, so this is exactly zero -- which
+         * is the measured answer to "does the cull/clone step inflate?".
+         * See docs/RATING.md; the interesting part of that answer is the
+         * INDIRECT channel, which this number deliberately does not hide. */
+        {
+            double s0 = 0.0;
+            for (int i = 0; i < n; i++) s0 += (double)elo[i];
+            gs.elo_sum_carry = s0 - elo_sum_prev;
+        }
 
         /* Linear warmup, then the cosine decay over what is left.  Adam's
          * second-moment estimate is worthless for its first few dozen steps,
@@ -2157,6 +2926,10 @@ int az_run(AZCfg *c)
             w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
             w->resign_checked = w->resign_would = w->resign_wrong = 0;
             w->full_moves = w->all_moves = 0;
+            memset(w->anch_score, 0, sizeof w->anch_score);
+            memset(w->anch_n, 0, sizeof w->anch_n);
+            w->anch_cal_score = 0.0;
+            w->anch_cal_n     = 0;
         }
         az_dispatch(&sh, JOB_SELFPLAY);
         gs.selfplay_sec = now_sec() - t0;
@@ -2183,6 +2956,12 @@ int az_run(AZCfg *c)
                 cmiss           += workers[t].cache_misses;
                 for (int k = 0; k < AZ_BATCH_HIST; k++)
                     gs.batch_hist[k] += workers[t].batch_hist[k];
+                for (int k = 0; k < AZ_N_ANCHORS; k++) {
+                    gs.anchor_score[k] += workers[t].anch_score[k];
+                    gs.anchor_n[k]     += workers[t].anch_n[k];
+                }
+                gs.anchor_cal_score += workers[t].anch_cal_score;
+                gs.anchor_cal_n     += workers[t].anch_cal_n;
             }
             gs.batch_mean = gs.batch_rounds
                           ? (double)brows / (double)gs.batch_rounds : 0.0;
@@ -2378,6 +3157,129 @@ int az_run(AZCfg *c)
             gs.elo_p10  = (double)elo_sorted[(int)(0.10 * (double)(n - 1))];
             gs.best_i   = best;
         }
+        gs.elo_inject    = sh.elo_inject;
+        gs.elo_sum_delta = sh.elo_sum_delta;
+        {
+            double s1 = 0.0;
+            for (int i = 0; i < n; i++) s1 += (double)elo[i];
+            gs.elo_sum   = s1;
+            elo_sum_prev = s1;
+        }
+        gs.hof_elo_min   =  1e30;
+        gs.hof_elo_max   = -1e30;
+        for (int k = 0; k < sh.hof_n; k++) {
+            if ((double)hof[k].elo < gs.hof_elo_min) gs.hof_elo_min = hof[k].elo;
+            if ((double)hof[k].elo > gs.hof_elo_max) gs.hof_elo_max = hof[k].elo;
+        }
+        if (sh.hof_n == 0) gs.hof_elo_min = gs.hof_elo_max = 0.0;
+
+        /* -- 4a. THE ANCHORED RATING ------------------------------------- */
+        if (sh.anchors_on) {
+            /* The gen-0 anchor's pin.  Measured once, against the random
+             * mover, and then never moved again.  An all-wins match has no
+             * finite maximum-likelihood gap, so the score is adjusted by the
+             * usual half-a-game rule and the result is reported as a LOWER
+             * BOUND rather than dressed up as an estimate. */
+            cal_score += gs.anchor_cal_score;
+            cal_n     += gs.anchor_cal_n;
+            sh.cal_n   = cal_n;
+            gs.anchor_cal_total = cal_n;
+            if (!sh.anchors[AZ_ANCHOR_GEN0].pinned && gen >= c->anchor_pin_gen &&
+                (int)cal_n >= c->anchor_cal_games) {
+                if (cal_n > 0) {
+                    const double raw = cal_score / (double)cal_n;
+                    const double s   = (cal_score + 0.5) / (double)(cal_n + 1);
+                    sh.anchors[AZ_ANCHOR_GEN0].elo =
+                        (float)(ELO_ANCHOR_RANDOM + 400.0 * log10(s / (1.0 - s)));
+                    sh.anchors[AZ_ANCHOR_GEN0].bounded = (raw <= 0.0 || raw >= 1.0);
+                    sh.anchors[AZ_ANCHOR_GEN0].pinned  = 1;
+                    if (!c->quiet)
+                        printf("      anchor gen0 pinned at %.0f Elo from %llu games "
+                               "vs the random mover (score %.3f%s)\n",
+                               (double)sh.anchors[AZ_ANCHOR_GEN0].elo,
+                               (unsigned long long)cal_n, raw,
+                               sh.anchors[AZ_ANCHOR_GEN0].bounded
+                                   ? ", a LOWER BOUND: the match was 100% one way" : "");
+                }
+            }
+
+            az_rate_anchored(&sh, gen);
+
+            /* A hall-of-fame entry's rating freezes only after it has had
+             * hof_pin_lag generations of games of its own.  Freezing the
+             * estimate from the generation that SELECTED it would freeze the
+             * winner's curse -- the max of n noisy ratings is biased upward --
+             * and a bias that compounds across snapshots is a ratchet, which
+             * is the whole thing being fixed here. */
+            for (int k = 0; k < sh.hof_n; k++) {
+                HofEntry *e = &hof[k];
+                const int pi = n + k;
+                if (e->pinned) continue;
+                if (gen - e->gen < hof_pin_lag) continue;
+                /* A rating that is about to be frozen for the rest of the run
+                 * had better rest on more than a couple of games.  An entry
+                 * that never gets there simply stays a free parameter, which
+                 * is harmless: free players cannot inject drift, they just do
+                 * not extend the range the anchors can measure. */
+                if (sh.fit.ngames[pi] < HOF_PIN_MIN_GAMES) continue;
+                if (!sh.fit.anchored[uf_find(sh.fit.uf, pi)]) continue;
+                if (sh.fit.bounded[pi]) continue;   /* a bound is not a rating */
+                e->elo_fit = (float)sh.fit.rating[pi];
+                e->pinned  = 1;
+            }
+
+            {
+                double mean = 0.0;
+                int best = 0;
+                for (int i = 0; i < n; i++) {
+                    mean += (double)elo_fit[i];
+                    if (elo_fit[i] > elo_fit[best]) best = i;
+                }
+                memcpy(elo_sorted, elo_fit, (size_t)n * sizeof(float));
+                qsort(elo_sorted, (size_t)n, sizeof(float), cmp_float_asc);
+                gs.anchored_on         = 1;
+                gs.elo_anchored_mean   = mean / (double)n;
+                gs.elo_anchored_best   = (double)elo_fit[best];
+                gs.elo_anchored_p10    = (double)elo_sorted[(int)(0.10 * (double)(n - 1))];
+                gs.elo_anchored_best_i = best;
+            }
+            gs.anchor_games    = (uint64_t)sh.anchor_games;
+            gs.fit_games       = sh.fit.n_games;
+            gs.fit_iters       = sh.fit.iters;
+            gs.fit_delta       = sh.fit.delta;
+            gs.fit_unrated     = sh.fit.n_unrated;
+            gs.fit_bounded     = sh.fit.n_bounded;
+            gs.fit_unanchored  = sh.fit.n_unanchored;
+            gs.hof_n           = sh.hof_n;
+            gs.hof_fit_min     =  1e30;
+            gs.hof_fit_max     = -1e30;
+            for (int k = 0; k < sh.hof_n; k++) {
+                if (!hof[k].pinned) continue;
+                gs.hof_pinned++;
+                gs.hof_fit_mean += (double)hof[k].elo_fit;
+                if ((double)hof[k].elo_fit < gs.hof_fit_min) gs.hof_fit_min = hof[k].elo_fit;
+                if ((double)hof[k].elo_fit > gs.hof_fit_max) gs.hof_fit_max = hof[k].elo_fit;
+            }
+            if (gs.hof_pinned == 0) gs.hof_fit_min = gs.hof_fit_max = 0.0;
+            else gs.hof_fit_mean /= (double)gs.hof_pinned;
+            for (int k = 0; k < AZ_N_ANCHORS; k++) {
+                gs.anchor_elo[k]     = (double)sh.anchors[k].elo;
+                gs.anchor_pinned[k]  = sh.anchors[k].pinned;
+                gs.anchor_bounded[k] = sh.anchors[k].bounded;
+            }
+            /* Next generation, send half the anchor games to whichever anchor
+             * the population is closest to.  A 100%-one-way match carries
+             * almost no information about a rating difference. */
+            {
+                int near = 0;
+                double bd = 1e30;
+                for (int k = 0; k < AZ_N_ANCHORS; k++) {
+                    const double d = fabs((double)sh.anchors[k].elo - gs.elo_anchored_mean);
+                    if (d < bd) { bd = d; near = k; }
+                }
+                sh.anchor_near = near;
+            }
+        }
 
         /* -- 4b. EMA vs RAW ---------------------------------------------
          * Polyak averaging is USUALLY stronger, which is not the same as
@@ -2443,6 +3345,22 @@ int az_run(AZCfg *c)
                    gs.loss_val, gs.value_mse_baseline, gs.value_mse_ratio,
                    gs.grad_norm, 100.0 * gs.grad_clip_frac,
                    100.0 * gs.buffer_fill, gs.sec, eta);
+            /* The honest line: the anchored rating, and the raw scores against
+             * the fixed-strength anchors that produced it.  A score that has
+             * stopped moving is a population that has stopped improving,
+             * whatever the rating above it says. */
+            if (sh.anchors_on)
+                printf("            anchored %7.1f/%7.1f/%7.1f  vs random %.3f (%llu)  "
+                       "vs gen0 %.3f (%llu)  fit %d games %d it%s\n",
+                       gs.elo_anchored_best, gs.elo_anchored_mean, gs.elo_anchored_p10,
+                       gs.anchor_n[AZ_ANCHOR_RANDOM]
+                         ? gs.anchor_score[AZ_ANCHOR_RANDOM] / (double)gs.anchor_n[AZ_ANCHOR_RANDOM] : 0.0,
+                       (unsigned long long)gs.anchor_n[AZ_ANCHOR_RANDOM],
+                       gs.anchor_n[AZ_ANCHOR_GEN0]
+                         ? gs.anchor_score[AZ_ANCHOR_GEN0] / (double)gs.anchor_n[AZ_ANCHOR_GEN0] : 0.0,
+                       (unsigned long long)gs.anchor_n[AZ_ANCHOR_GEN0],
+                       gs.fit_games, gs.fit_iters,
+                       (gs.fit_bounded || gs.fit_unanchored) ? "  [BOUNDED]" : "");
             fflush(stdout);
         }
 
@@ -2480,10 +3398,22 @@ int az_run(AZCfg *c)
         /* -- 7. HALL OF FAME --------------------------------------------- */
         if (sh.hof_n == 0 || gen % c->hof_every == 0) {
             HofEntry *e = &hof[sh.hof_next];
-            e->head = heads[gs.best_i];
-            e->hy   = hypers[gs.best_i];
-            e->elo  = elo[gs.best_i];
-            e->gen  = gen;
+            /* THE RATCHET, for the record.  e->elo takes the CURRENT best
+             * agent's incremental rating, which has already drifted; the next
+             * snapshot inherits that drift and adds to it.  It is kept only so
+             * the legacy number stays reproducible.  The rating that is used
+             * for anything starts provisional and comes from the fit. */
+            e->head    = heads[gs.best_i];
+            e->hy      = hypers[gs.best_i];
+            e->elo     = elo[gs.best_i];
+            e->elo_fit = elo_fit[gs.best_i];
+            e->pinned  = 0;
+            e->gen     = gen;
+            /* Recycling a slot means the results in the window now belong to a
+             * network that no longer exists.  Drop them rather than let the
+             * new snapshot inherit its predecessor's record. */
+            if (sh.anchors_on && sh.hof_n == HOF_CAP)
+                elowin_forget(&sh.win, (int32_t)(n + sh.hof_next));
             sh.hof_next = (sh.hof_next + 1) % HOF_CAP;
             if (sh.hof_n < HOF_CAP) sh.hof_n++;
         }
@@ -2554,6 +3484,11 @@ done:
     free(sh.batch_tmp); free(sh.batch);
     free(tids); free(workers); free(head_adam); free(tgsum); free(hgrad);
     free(bslot); free(wslot); free(rank); free(results); free(pairs);
+    elowin_free(&sh.win);
+    elofit_free(&sh.fit);
+    free(sh.fit_scratch);
+    free(gen0_trunk);
+    free(elo_fit);
     free(hof); free(elo_sorted); free(elo); free(hypers); free(heads); free(trunk);
     free(ema_heads); free(ema_trunk);
     return rc;

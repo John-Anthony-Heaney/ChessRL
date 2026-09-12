@@ -107,6 +107,37 @@ typedef struct {
     int   hof_every;
     int   hof_frac_pct;
 
+    /* ======================================================================
+     *                        THE ANCHORED RATING
+     * ======================================================================
+     * The incremental Elo this trainer has always reported is not a strength
+     * measurement: it drifts upward at a constant rate whether or not the
+     * population is learning anything.  docs/RATING.md has the evidence, the
+     * mechanism and the acid test.  The fields below configure the
+     * replacement: two players of permanently fixed strength whose rating is
+     * PINNED, and a Bradley-Terry maximum-likelihood fit over a sliding
+     * window of results that re-estimates every rating from scratch each
+     * generation instead of accumulating increments.
+     *
+     * Neither anchor holds any chess knowledge -- one is a uniform random
+     * legal mover, the other is the untrained generation-0 network -- so
+     * docs/FROM_SCRATCH.md is untouched.                                   */
+    int   anchor_elo;        /* 1 = run the anchors and the fit (default 1)  */
+    int   anchor_games;      /* pairing slots per generation given to an
+                              * anchor.  They REPLACE population games, so
+                              * they cost no extra wall-clock time.          */
+    int   anchor_cal_games;  /* one-off gen0-vs-random games that pin the
+                              * gen-0 anchor's rating                        */
+    int   anchor_pin_gen;    /* generation after which gen0's pin is fixed   */
+    int   elo_window;        /* generations of results in the fit window     */
+    int   elo_iters;         /* maximum minorisation-maximisation sweeps     */
+    int   hof_pin_lag;       /* generations a hall-of-fame entry stays a FREE
+                              * parameter before its rating is frozen.  Long
+                              * enough that the frozen value comes from games
+                              * played after the snapshot was selected, so
+                              * the winner's curse is not frozen with it.
+                              * 0 = use elo_window.                          */
+
     uint64_t    seed;
     const char *run_dir;
     int         quiet;

@@ -165,6 +165,15 @@ static int cmd_az(int argc, char **argv)
     c.hof_every        = (int)opt_int(argc, argv, "--hof-every",       c.hof_every);
     c.hof_frac_pct     = (int)opt_int(argc, argv, "--hof-pct",         c.hof_frac_pct);
     c.warmup_gens      = (int)opt_int(argc, argv, "--warmup",          c.warmup_gens);
+    /* THE ANCHORED RATING -- docs/RATING.md.  --no-anchor-elo turns it off and
+     * leaves only the legacy incremental Elo, which inflates. */
+    c.anchor_games     = (int)opt_int(argc, argv, "--anchor-games",     c.anchor_games);
+    c.anchor_cal_games = (int)opt_int(argc, argv, "--anchor-cal-games", c.anchor_cal_games);
+    c.anchor_pin_gen   = (int)opt_int(argc, argv, "--anchor-pin-gen",   c.anchor_pin_gen);
+    c.elo_window       = (int)opt_int(argc, argv, "--elo-window",       c.elo_window);
+    c.elo_iters        = (int)opt_int(argc, argv, "--elo-iters",        c.elo_iters);
+    c.hof_pin_lag      = (int)opt_int(argc, argv, "--hof-pin-lag",      c.hof_pin_lag);
+    if (opt_flag(argc, argv, "--no-anchor-elo")) c.anchor_elo = 0;
     c.ema_h2h_games    = (int)opt_int(argc, argv, "--ema-h2h",         c.ema_h2h_games);
     c.cap_sims         = (int)opt_int(argc, argv, "--cap-sims",        c.cap_sims);
 
@@ -809,6 +818,17 @@ static int usage(void)
 "    --temp-start X --temp-end X --cpuct X --dir-alpha X --dir-eps X\n"
 "    --resign X --resign-check X --elite F --cull F --mutate-sigma X\n"
 "    --hof-every N --hof-pct N\n"
+"    --anchor-games N      games/gen played against the permanent anchors,\n"
+"                          which is what makes the reported rating mean\n"
+"                          something                            (default 24)\n"
+"    --anchor-cal-games N  one-off gen0-vs-random games that pin the second\n"
+"                          anchor's rating                      (default 48)\n"
+"    --elo-window N        generations of results in the Bradley-Terry fit\n"
+"                                                                (default 8)\n"
+"    --elo-iters N --anchor-pin-gen N --hof-pin-lag N\n"
+"    --no-anchor-elo       report ONLY the legacy incremental Elo, which\n"
+"                          inflates at ~1.2 points/generation regardless of\n"
+"                          whether anything is learned -- docs/RATING.md\n"
 "    --seed N --run NAME --quiet\n"
 "\n"
 "  lrfind     learning-rate range test (Smith 2015) on the real self-play data\n"

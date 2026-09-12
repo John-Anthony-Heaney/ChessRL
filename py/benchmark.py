@@ -14,8 +14,19 @@ Opponents
 ---------
 ``random``      uniformly random legal move.  Needs nothing installed, so the
                 harness is useful on a bare machine.
-``material``    1-ply greedy on material, random tie-break.  A slightly higher
-                floor than random.
+``material``    1-ply greedy on material, random tie-break, NO quiescence.  A
+                slightly higher floor than random.  Kept under this name for
+                continuity with every measurement made before py/baselines.py
+                existed; it is NOT the same player as ``material-1``.
+``material-N``  negamax depth N over material with alpha-beta and a quiescence
+``mobility-N``  search; ``mobility-N`` adds a small mobility term.  From
+``randomplus-P``py/baselines.py, which also provides ``randomplus-P``: the
+                material-1 move with probability P and a random one otherwise,
+                a continuous dial between ``random`` and ``material-1``.
+                ``python3 py/baselines.py list`` prints the whole ladder.
+                These opponents contain hand-coded chess knowledge ON PURPOSE:
+                they are measuring instruments, not agents, and
+                docs/FROM_SCRATCH.md constrains the agent, not the ruler.
 ``uci:<cmd>``   any UCI engine driven over stdin/stdout pipes.  ``<cmd>`` is a
                 full command line, e.g. ``uci:./build/chessrl uci`` or
                 ``uci:/opt/homebrew/bin/stockfish``.  Options are passed through
@@ -64,6 +75,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import engine as chessrl  # noqa: E402  (path juggling above is deliberate)
+import baselines  # noqa: E402  -- the graded opponent ladder; see its header
 
 REPO_ROOT = _HERE.parent
 DEFAULT_MODEL = REPO_ROOT / "runs" / "pilot" / "best.crl"
@@ -653,7 +665,14 @@ class MaterialPlayer(Player):
 
 
 class ChampionPlayer(Player):
-    """Our trained agent, either raw policy or alpha-beta search."""
+    """Our trained agent: the shipped PUCT MCTS, or the raw policy head.
+
+    ``depth`` is api_engine_move()'s depth, which src/api.c maps onto MCTS
+    simulations as ``sims = clamp(depth,1,63) * 64`` -- so the default depth 4
+    is 256 simulations.  It is NOT alpha-beta; that searcher exists in
+    src/search.c as a measurement baseline and api_engine_move() does not
+    select it.
+    """
 
     kind = "champion"
     reports_eval = True
@@ -728,7 +747,8 @@ class ChampionPlayer(Player):
         if self.mode == "policy":
             return "champion, raw policy (no search)%s" % (
                 ", temp %.2f" % self.policy_temp if self.policy_temp > 0 else ", argmax")
-        return "champion, alpha-beta depth %d (movetime cap %dms)" % (self.depth, self.movetime)
+        return ("champion, MCTS depth %d = %d simulations (movetime cap %dms)"
+                % (self.depth, self.depth * 64, self.movetime))
 
 
 def _sample_policy(pol, temp, rng):
@@ -865,7 +885,11 @@ def opponent_spec(args, go_spec=None, options=None, label=None):
         return PlayerSpec("random", lambda: RandomPlayer(), "uniformly random legal move")
     if s == "material":
         return PlayerSpec("material", lambda: MaterialPlayer(),
-                          "1-ply greedy on material, random tie-break")
+                          "1-ply greedy on material, random tie-break, no quiescence")
+    if baselines.is_baseline(s):
+        # py/baselines.py: material-N, mobility-N, randomplus-P and `random`.
+        return PlayerSpec(s, (lambda n=s: baselines.make_baseline(n)),
+                          baselines.describe(s))
     if s.startswith("uci:"):
         argv = parse_uci_spec(s)
         opts = dict(args.opp_option_map)
@@ -880,7 +904,9 @@ def opponent_spec(args, go_spec=None, options=None, label=None):
                           lambda: UciPlayer(argv, opts, go, args.opp_timeout,
                                             name=nm, debug=args.debug_uci),
                           "; ".join(detail_bits))
-    raise BenchError("unknown opponent %r (expected 'random', 'material' or 'uci:<command>')" % s)
+    raise BenchError("unknown opponent %r (expected 'random', 'material', one of "
+                     "the py/baselines.py rungs -- %s -- or 'uci:<command>')"
+                     % (s, baselines.BASELINE_HELP))
 
 
 def champion_spec(args, mode=None, depth=None, name=None):
@@ -896,7 +922,8 @@ def champion_spec(args, mode=None, depth=None, name=None):
         detail = "raw policy head, argmax" if args.policy_temp <= 0 else \
                  "raw policy head, sampled at temperature %.2f" % args.policy_temp
     else:
-        detail = "alpha-beta depth %d, movetime cap %dms" % (depth, args.movetime)
+        detail = ("MCTS depth %d = %d simulations, movetime cap %dms"
+                  % (depth, depth * 64, args.movetime))
     return PlayerSpec(nm, make, detail)
 
 
@@ -1179,16 +1206,36 @@ def probe_uci(args):
         eng.close()
 
 
+def weak_rung(name):
+    """One rung of the built-in (no external engine needed) part of the ladder.
+
+    ``random`` and ``material`` stay on the classes that have always
+    implemented them, so every number measured before py/baselines.py existed
+    is still comparable.  Everything else comes from py/baselines.py.
+    """
+    if name == "random":
+        return {"name": "random",
+                "spec": PlayerSpec("random", lambda: RandomPlayer(),
+                                   "uniformly random legal move"),
+                "detail": "uniformly random legal move", "anchor_elo": None}
+    if name == "material":
+        return {"name": "material",
+                "spec": PlayerSpec("material", lambda: MaterialPlayer(),
+                                   "1-ply greedy on material"),
+                "detail": "1-ply greedy on material, random tie-break, no quiescence",
+                "anchor_elo": None}
+    d = baselines.describe(name)
+    return {"name": name,
+            "spec": PlayerSpec(name, (lambda n=name: baselines.make_baseline(n)), d),
+            "detail": d, "anchor_elo": None}
+
+
 def build_ladder(args, probe):
     """The graded series of opponents, weakest first."""
-    rungs = [
-        {"name": "random", "spec": PlayerSpec("random", lambda: RandomPlayer(),
-                                              "uniformly random legal move"),
-         "detail": "uniformly random legal move", "anchor_elo": None},
-        {"name": "material", "spec": PlayerSpec("material", lambda: MaterialPlayer(),
-                                                "1-ply greedy on material"),
-         "detail": "1-ply greedy on material, random tie-break", "anchor_elo": None},
-    ]
+    spec = (getattr(args, "ladder_baselines", "") or "").strip()
+    names = [] if spec.lower() in ("", "none") else \
+        [x.strip() for x in spec.split(",") if x.strip()]
+    rungs = [weak_rung(n) for n in names]
     if probe is None:
         return rungs
 
@@ -2297,7 +2344,10 @@ def parse_args(argv=None):
                    help="agent index inside the model; <0 selects the highest-Elo agent")
     p.add_argument("--games", type=int, default=200, help="games in the single match (default 200)")
     p.add_argument("--opponent", default="random",
-                   help="random | material | uci:<command line>  (default random)")
+                   help="random | material | material-N | mobility-N | randomplus-P "
+                        "| uci:<command line>  (default random).  The graded rungs "
+                        "come from py/baselines.py; run `python3 py/baselines.py list` "
+                        "to see them")
 
     p.add_argument("--depth", type=int, default=4, help="champion search depth (default 4)")
     p.add_argument("--movetime", type=int, default=1000,
@@ -2328,6 +2378,12 @@ def parse_args(argv=None):
                    help="consecutive opponent plies required by --resign-cp (default 8)")
 
     p.add_argument("--ladder", action="store_true", help="play the graded opponent ladder")
+    p.add_argument("--ladder-baselines",
+                   default="random,material,material-1,material-2,material-3,material-4",
+                   metavar="LIST",
+                   help="the built-in rungs the ladder starts with, weakest first "
+                        "(default random,material,material-1..4).  'none' leaves only "
+                        "the external-engine rungs.  See py/baselines.py")
     p.add_argument("--ladder-games", type=int, default=40, help="games per ladder rung (default 40)")
     p.add_argument("--ladder-stop", type=float, default=0.05,
                    help="stop climbing once the score drops below this (default 0.05)")
