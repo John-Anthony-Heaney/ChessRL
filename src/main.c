@@ -223,6 +223,81 @@ static int cmd_az(int argc, char **argv)
     return az_run(&c) ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------ lrfind */
+/* Learning-rate range test (Smith 2015, arxiv 1506.01186).  Fills the replay
+ * buffer with real self-play, ramps the learning rate geometrically over a few
+ * hundred optimiser steps, and reads the usable range off the loss curve.  The
+ * weights are snapshotted and restored, and the restoration is checked, so the
+ * model on disk is never modified -- see docs/LR_FINDER.md. */
+
+static int cmd_lrfind(int argc, char **argv)
+{
+    AZLrFindCfg lf;
+    az_lrfind_default_cfg(&lf);
+    AZCfg *c = &lf.az;
+
+    lf.model       = opt_str(argc, argv, "--model", NULL);
+    lf.lo          = opt_num(argc, argv, "--lo",          lf.lo);
+    lf.hi          = opt_num(argc, argv, "--hi",          lf.hi);
+    lf.steps       = (int)opt_int(argc, argv, "--steps",  lf.steps);
+    lf.warm_games  = (int)opt_int(argc, argv, "--warm-games", lf.warm_games);
+    lf.smooth      = opt_num(argc, argv, "--smooth",      lf.smooth);
+    lf.stop_factor = opt_num(argc, argv, "--stop-factor", lf.stop_factor);
+    lf.csv         = opt_str(argc, argv, "--csv", NULL);
+    lf.plot_rows   = (int)opt_int(argc, argv, "--plot-rows", lf.plot_rows);
+    lf.plot_cols   = (int)opt_int(argc, argv, "--plot-cols", lf.plot_cols);
+
+    /* The self-play and objective knobs, so the sweep can be run with the same
+     * configuration as the training run it is meant to inform.  --agents is
+     * ignored when --model is given: the checkpoint decides. */
+    c->n_agents        = (int)opt_int(argc, argv, "--agents",          c->n_agents);
+    c->games_per_agent = (int)opt_int(argc, argv, "--games-per-agent", c->games_per_agent);
+    c->threads         = (int)opt_int(argc, argv, "--threads",         c->threads);
+    c->sims            = (int)opt_int(argc, argv, "--sims",            c->sims);
+    c->max_plies       = (int)opt_int(argc, argv, "--max-plies",       c->max_plies);
+    c->opening_plies   = (int)opt_int(argc, argv, "--opening-plies",   c->opening_plies);
+    c->batch_size      = (int)opt_int(argc, argv, "--batch",           c->batch_size);
+    c->buffer_positions= (int)opt_int(argc, argv, "--buffer",          c->buffer_positions);
+    c->cap_sims        = (int)opt_int(argc, argv, "--cap-sims",        c->cap_sims);
+
+    c->weight_decay    = (float)opt_num(argc, argv, "--wd",           c->weight_decay);
+    c->grad_clip       = (float)opt_num(argc, argv, "--clip",         c->grad_clip);
+    c->grad_clip_head  = (float)opt_num(argc, argv, "--clip-head",    c->grad_clip_head);
+    c->value_coef      = (float)opt_num(argc, argv, "--value-coef",   c->value_coef);
+    c->value_mix       = (float)opt_num(argc, argv, "--value-mix",    c->value_mix);
+    c->cap_frac        = (float)opt_num(argc, argv, "--cap-frac",     c->cap_frac);
+    c->draw_penalty    = (float)opt_num(argc, argv, "--draw-penalty", c->draw_penalty);
+    c->c_puct          = (float)opt_num(argc, argv, "--cpuct",        c->c_puct);
+    c->dirichlet_alpha = (float)opt_num(argc, argv, "--dir-alpha",    c->dirichlet_alpha);
+    c->dirichlet_eps   = (float)opt_num(argc, argv, "--dir-eps",      c->dirichlet_eps);
+    c->temp_start      = (float)opt_num(argc, argv, "--temp-start",   c->temp_start);
+    c->temp_end        = (float)opt_num(argc, argv, "--temp-end",     c->temp_end);
+    c->resign_threshold= (float)opt_num(argc, argv, "--resign",       c->resign_threshold);
+    c->resign_check_frac=(float)opt_num(argc, argv, "--resign-check", c->resign_check_frac);
+
+    /* Reported, not used, by the sweep: the schedule the run is configured
+     * with, so lrfind can say how far off it is. */
+    c->lr              = (float)opt_num(argc, argv, "--current-lr",       c->lr);
+    c->lr_final        = (float)opt_num(argc, argv, "--current-lr-final", c->lr_final);
+
+    c->seed            = (uint64_t)opt_int(argc, argv, "--seed",      (long)c->seed);
+
+    {   /* --start classical|960|mixed */
+        const char *sm = opt_str(argc, argv, "--start", NULL);
+        if (sm) {
+            if      (!strcmp(sm, "classical")) c->start_mode = AZ_START_CLASSICAL;
+            else if (!strcmp(sm, "960"))       c->start_mode = AZ_START_960;
+            else if (!strcmp(sm, "mixed"))     c->start_mode = AZ_START_MIXED;
+            else { fprintf(stderr, "error: --start must be classical|960|mixed\n"); return 2; }
+        }
+    }
+    if (!(lf.lo > 0.0) || !(lf.hi > lf.lo)) {
+        fprintf(stderr, "error: need 0 < --lo < --hi\n");
+        return 2;
+    }
+    return az_lrfind(&lf);
+}
+
 /* ------------------------------------------------------------------- bench */
 /* The headline number. Full games, network in the loop, exactly the same code
  * path play_game() takes during training (minus the gradient work). */
@@ -727,6 +802,20 @@ static int usage(void)
 "    --hof-every N --hof-pct N\n"
 "    --seed N --run NAME --quiet\n"
 "\n"
+"  lrfind     learning-rate range test (Smith 2015) on the real self-play data\n"
+"    --model PATH          checkpoint to test  (default: a fresh network)\n"
+"    --lo X --hi X         sweep bounds, geometric      (default 1e-6 -> 1.0)\n"
+"    --steps N             optimiser steps in the sweep          (default 300)\n"
+"    --warm-games N        self-play games used to fill the buffer (default 256,\n"
+"                          rounded up to a whole number of pairing rounds)\n"
+"    --batch N --smooth X --stop-factor X --csv PATH\n"
+"    --plot-rows N --plot-cols N\n"
+"    --current-lr X --current-lr-final X   the schedule to compare against\n"
+"    plus the az self-play knobs: --agents --sims --cap-frac --cap-sims\n"
+"    --start --draw-penalty --value-coef --value-mix --wd --clip --clip-head\n"
+"    --buffer --max-plies --cpuct --dir-alpha --dir-eps --temp-start --temp-end\n"
+"    --resign --resign-check --games-per-agent --threads --seed\n"
+"\n"
 "  bench      measure throughput: full games/sec with the network in the loop\n"
 "    --seconds S --threads N --max-plies N --no-record --model PATH\n"
 "\n"
@@ -767,6 +856,7 @@ int main(int argc, char **argv)
 
     if (!strcmp(cmd, "train"))    return cmd_train(rargc, rargv);
     if (!strcmp(cmd, "az"))       return cmd_az(rargc, rargv);
+    if (!strcmp(cmd, "lrfind"))   return cmd_lrfind(rargc, rargv);
     if (!strcmp(cmd, "bench"))    return cmd_bench(rargc, rargv);
     if (!strcmp(cmd, "perft"))    return cmd_perft(rargc, rargv);
     if (!strcmp(cmd, "selfplay")) return cmd_selfplay(rargc, rargv);

@@ -245,6 +245,34 @@ void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *f
 /* Logits for n moves.  `keys` may be NULL, in which case it is derived from p. */
 void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *logits);
 
+/* ------------------------------------------------------- batched forward */
+/* `nbatch` independent positions at once, each against ITS OWN head -- different
+ * agents play different games, so nothing here assumes one head.
+ *
+ *   heads[b]  the agent evaluating row b.  Rows that share a head are batched
+ *             together when they are ADJACENT, so a caller that groups its batch
+ *             by agent gets the fastest path; one that does not still gets a
+ *             fully batched trunk, which is 77% of the arithmetic.
+ *   fidx[b]   row b's active features, nf[b] of them.  An array of pointers so
+ *             the caller never has to copy ragged feature lists into a
+ *             rectangular buffer.
+ *   out       an array of `nbatch` Fwd.  It is the output AND the working
+ *             storage: h1/h2/hv0 are read back out of it as GEMM inputs at
+ *             their natural stride, so a batched evaluation copies nothing and
+ *             needs no workspace argument.
+ *
+ * Each row of the result is bit-identical to what nn_eval() produces for that
+ * row at every batch size, INCLUDING 1 -- the batched kernels accumulate each
+ * output in the same lanes in the same order.  Built with -DUSE_ACCELERATE the
+ * two trunk matrices go through cblas_sgemm instead, which regroups the sums:
+ * rows then agree with nn_eval to about 1e-6 relative rather than exactly, and
+ * the summation order becomes a function of the batch size.  tests/test_net.c
+ * checks whichever of the two guarantees the build is making.
+ *
+ * Internally the batch is processed in tiles of 32; any nbatch is allowed. */
+void nn_eval_batch(const Trunk *t, const Head *const *heads, int nbatch,
+                   const uint16_t *const *fidx, const int *nf, Fwd *out);
+
 /* --------------------------------------------------------------- backward */
 /* Gradients use exactly the same layout as the weights. */
 typedef Trunk TrunkGrad;

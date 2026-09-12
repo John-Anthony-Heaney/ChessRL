@@ -569,6 +569,14 @@ struct AZShared {
     Head      *ema_heads;
     float      head_clip;           /* effective per-head clip                 */
     int        cap_sims;            /* effective fast-search budget            */
+
+    /* Set by the learning-rate range test only.  A JOB_LEARN dispatch then
+     * takes EXACTLY ONE optimiser step instead of cfg->steps_per_gen, because
+     * the sweep has to change lr_now between steps, and it skips the
+     * PROBE_STEP instrumentation, which would otherwise fire on every step
+     * (PROBE_STEP is 0) and triple the backward cost for a diagnostic the
+     * sweep does not read.  Zero for az_run, which is therefore unchanged. */
+    int        one_step;
 };
 
 /* e += (1 - d) * (p - e).  Polyak averaging, in place. */
@@ -973,8 +981,10 @@ static void az_learn_job(AZWorker *w)
     const float ema_d = c->ema_decay;
     const int   ema_on = (ema_d > 0.0f) && (ema_d < 1.0f) && sh->ema_trunk;
 
-    for (int step = 0; step < c->steps_per_gen; step++) {
-        w->probe = (step == PROBE_STEP);
+    const int nsteps = sh->one_step ? 1 : c->steps_per_gen;
+
+    for (int step = 0; step < nsteps; step++) {
+        w->probe = !sh->one_step && (step == PROBE_STEP);
         if (w->probe) {
             grad_zero(w->tg_pol,   (int)TRUNK_NPARAM);
             grad_zero(w->tg_val,   (int)TRUNK_NPARAM);
@@ -1468,9 +1478,10 @@ static void write_telemetry(FILE *f, const AZShared *sh, const AZStats *st,
 
 void az_default_cfg(AZCfg *c)
 {
-    c->start_mode        = AZ_START_MIXED;
     if (!c) return;
     memset(c, 0, sizeof *c);
+
+    c->start_mode       = AZ_START_MIXED;
 
     c->n_agents         = 32;
     c->generations      = 200;
@@ -2253,5 +2264,933 @@ done:
     free(bslot); free(wslot); free(rank); free(results); free(pairs);
     free(hof); free(elo_sorted); free(elo); free(hypers); free(heads); free(trunk);
     free(ema_heads); free(ema_trunk);
+    return rc;
+}
+
+/* ==========================================================================
+ *                    LEARNING-RATE RANGE TEST (Smith 2015)
+ * ==========================================================================
+ * https://arxiv.org/abs/1506.01186, section 3.3.
+ *
+ * The procedure, and the three things that make it honest here:
+ *
+ *   1. THE DATA IS REAL.  The buffer is filled by az_dispatch(JOB_SELFPLAY),
+ *      the identical call training makes, with the identical AZCfg.  A range
+ *      test on synthetic or stale positions measures the wrong curvature.
+ *
+ *   2. THE OPTIMISER STEP IS REAL.  Each point on the curve is one
+ *      az_dispatch(JOB_LEARN) with AZShared.one_step set, i.e. exactly the
+ *      minibatch, the counting-sort by agent, the per-head Adam with that
+ *      agent's lr_scale, the trunk reduction and the same clip that training
+ *      uses.  Only lr_now differs from step to step.
+ *
+ *   3. THE MODEL IS NOT TOUCHED.  The weights are snapshotted before the sweep
+ *      and restored after it, and the restoration is CHECKED with memcmp over
+ *      every float.  The command never writes a checkpoint.
+ *
+ * WHAT IS DELIBERATELY NOT REAL: Adam's moment estimates start at zero.  A
+ * checkpoint stores weights, not optimiser state, so there is nothing else to
+ * start them from.  The sweep therefore measures the rate at which a FRESH
+ * Adam is stable on this weight configuration and this data distribution --
+ * which is the question a range test is meant to answer, and is also exactly
+ * the situation at the start of a training run.
+ *
+ * The loss recorded at step i is the loss of the minibatch BEFORE that step's
+ * update is applied, which is the usual convention: it reflects the damage
+ * done by steps 1..i-1, so the curve turns up once the rate has become too
+ * large to recover from.
+ */
+
+typedef struct {
+    double lr;
+    double loss, pol, val;      /* total = pol + value_coef * val            */
+    double gnorm, hgnorm;       /* PRE-clip trunk / mean per-head grad norm  */
+    double s_tot, s_pol, s_val; /* debiased EMA of each                      */
+    int    nb;                  /* positions actually in the minibatch       */
+    int    finite;
+} LrfRow;
+
+void az_lrfind_default_cfg(AZLrFindCfg *c)
+{
+    if (!c) return;
+    memset(c, 0, sizeof *c);
+    az_default_cfg(&c->az);
+    /* Two games per agent per round is the minimum the pairing code allows,
+     * and makes --warm-games quantise in units of one game per agent. */
+    c->az.games_per_agent = 2;
+    c->az.quiet           = 1;
+    c->model       = NULL;
+    c->lo          = 1e-6;
+    c->hi          = 1.0;
+    c->steps       = 300;
+    c->warm_games  = 256;
+    /* beta = 0.9 is a ~10-step window.  Over a 300-step sweep of six decades
+     * that is 0.2 decades of lag -- enough to suppress minibatch noise, small
+     * enough not to displace the minimum.  Printed with the result so the
+     * number can never be read without knowing what smoothed it. */
+    c->smooth      = 0.9;
+    c->stop_factor = 0.0;        /* run the whole sweep by default           */
+    c->csv         = NULL;
+    c->plot_rows   = 18;
+    c->plot_cols   = 62;
+}
+
+/* Debiased exponential moving average, in place over n rows. */
+static void lrf_smooth(LrfRow *r, int n, double beta)
+{
+    double a = 0.0, b = 0.0, d = 0.0, w = 1.0;
+    for (int i = 0; i < n; i++) {
+        w *= beta;
+        const double corr = 1.0 - w;
+        if (r[i].finite) {
+            a = beta * a + (1.0 - beta) * r[i].loss;
+            b = beta * b + (1.0 - beta) * r[i].pol;
+            d = beta * d + (1.0 - beta) * r[i].val;
+            r[i].s_tot = a / corr;
+            r[i].s_pol = b / corr;
+            r[i].s_val = d / corr;
+        } else {
+            /* A non-finite loss cannot enter an average without destroying
+             * every later value, so the EMA is frozen and the row is marked. */
+            r[i].s_tot = r[i].s_pol = r[i].s_val = (double)INFINITY;
+        }
+    }
+}
+
+/* argmin of a smoothed column, over finite rows only.  Returns -1 if none. */
+static int lrf_argmin(const LrfRow *r, int n, int which)
+{
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (!r[i].finite) continue;
+        const double v = (which == 0) ? r[i].s_tot
+                       : (which == 1) ? r[i].s_pol : r[i].s_val;
+        if (!isfinite(v)) continue;
+        const double bv = (best < 0) ? 0.0
+                        : ((which == 0) ? r[best].s_tot
+                        :  (which == 1) ? r[best].s_pol : r[best].s_val);
+        if (best < 0 || v < bv) best = i;
+    }
+    return best;
+}
+
+/* d(smoothed total)/d(log10 lr), differenced over +/- win rows so that the
+ * slope is read off the curve rather than off the minibatch noise. */
+static double lrf_slope(const LrfRow *r, int n, int i, int win)
+{
+    int a = i - win, b = i + win;
+    if (a < 0) a = 0;
+    if (b > n - 1) b = n - 1;
+    while (a < b && !(r[a].finite && isfinite(r[a].s_tot))) a++;
+    while (b > a && !(r[b].finite && isfinite(r[b].s_tot))) b--;
+    if (b <= a) return 0.0;
+    const double dx = log10(r[b].lr) - log10(r[a].lr);
+    if (!(dx > 0.0)) return 0.0;
+    return (r[b].s_tot - r[a].s_tot) / dx;
+}
+
+/* -------------------------------------------------------------- the plot */
+/* Smoothed total loss against log10(lr).  Columns are log-lr bins; the value
+ * plotted in a bin is the mean of the smoothed losses that fall in it.  Rows
+ * above the clip ceiling are drawn as '!' on the top row and counted, so a
+ * divergence to 1e9 cannot flatten the interesting part of the curve. */
+static void lrf_plot(const LrfRow *r, int n, int rows, int cols,
+                     int i_min, int i_rec, int i_div)
+{
+    if (n < 2 || rows < 6 || cols < 20) return;
+
+    double *acc = (double *)calloc((size_t)cols, sizeof(double));
+    int    *cnt = (int *)   calloc((size_t)cols, sizeof(int));
+    int    *bad = (int *)   calloc((size_t)cols, sizeof(int));
+    char   *grid = (char *) malloc((size_t)rows * (size_t)cols);
+    char   *mark = (char *) malloc((size_t)cols + 1);
+    if (!acc || !cnt || !bad || !grid || !mark) {
+        free(acc); free(cnt); free(bad); free(grid); free(mark);
+        return;
+    }
+    memset(grid, ' ', (size_t)rows * (size_t)cols);
+    memset(mark, ' ', (size_t)cols);
+    mark[cols] = 0;
+
+    const double x0 = log10(r[0].lr), x1 = log10(r[n - 1].lr);
+    const double xs = (x1 > x0) ? (double)(cols - 1) / (x1 - x0) : 0.0;
+
+    /* y range: floor at the minimum, ceiling at 1.5x the starting loss, so
+     * the descent and the turn-up both occupy most of the plot. */
+    double ymin = 1e300, ystart = 0.0, ymaxf = -1e300;
+    int have = 0;
+    for (int i = 0; i < n; i++) {
+        if (!r[i].finite || !isfinite(r[i].s_tot)) continue;
+        if (!have) { ystart = r[i].s_tot; have = 1; }
+        if (r[i].s_tot < ymin)  ymin  = r[i].s_tot;
+        if (r[i].s_tot > ymaxf) ymaxf = r[i].s_tot;
+    }
+    if (!have) { free(acc); free(cnt); free(bad); free(grid); free(mark); return; }
+    double ymax = ystart + 0.5 * (ystart - ymin);
+    if (ymax > ymaxf) ymax = ymaxf;
+    if (!(ymax > ymin)) ymax = ymin + (fabs(ymin) > 0.0 ? fabs(ymin) * 0.1 : 1.0);
+
+    int clipped = 0;
+    for (int i = 0; i < n; i++) {
+        int col = (int)((log10(r[i].lr) - x0) * xs + 0.5);
+        if (col < 0) col = 0;
+        if (col > cols - 1) col = cols - 1;
+        if (!r[i].finite || !isfinite(r[i].s_tot)) { bad[col]++; continue; }
+        if (r[i].s_tot > ymax) { bad[col]++; clipped++; continue; }
+        acc[col] += r[i].s_tot;
+        cnt[col]++;
+    }
+    for (int col = 0; col < cols; col++) {
+        if (cnt[col] > 0) {
+            const double v = acc[col] / (double)cnt[col];
+            int row = (int)((ymax - v) / (ymax - ymin) * (double)(rows - 1) + 0.5);
+            if (row < 0) row = 0;
+            if (row > rows - 1) row = rows - 1;
+            grid[(size_t)row * (size_t)cols + (size_t)col] = '*';
+        } else if (bad[col] > 0) {
+            grid[(size_t)col] = '!';
+        }
+    }
+    {   /* markers under the axis */
+        const int idx[3] = { i_min, i_rec, i_div };
+        const char ch[3] = { 'm', 'R', 'd' };
+        for (int k = 0; k < 3; k++) {
+            if (idx[k] < 0 || idx[k] >= n) continue;
+            int col = (int)((log10(r[idx[k]].lr) - x0) * xs + 0.5);
+            if (col < 0) col = 0;
+            if (col > cols - 1) col = cols - 1;
+            mark[col] = ch[k];
+        }
+    }
+
+    printf("\n  smoothed total loss against log10(learning rate)\n\n");
+    for (int row = 0; row < rows; row++) {
+        const double v = ymax - (ymax - ymin) * (double)row / (double)(rows - 1);
+        if (row == 0 || row == rows - 1 || row == rows / 2)
+            printf("  %8.4f |", v);
+        else
+            printf("           |");
+        fwrite(grid + (size_t)row * (size_t)cols, 1, (size_t)cols, stdout);
+        printf("|\n");
+    }
+    printf("           +");
+    for (int col = 0; col < cols; col++) putchar('-');
+    printf("+\n            %s\n", mark);
+    printf("           ");
+    {   /* decade ticks along the x axis */
+        char axis[256];
+        const int w = (cols < 250) ? cols : 250;
+        memset(axis, ' ', sizeof axis);
+        for (int e = (int)ceil(x0); e <= (int)floor(x1); e++) {
+            int col = (int)(((double)e - x0) * xs + 0.5);
+            char t[16];
+            int tw;
+            snprintf(t, sizeof t, "1e%d", e);
+            tw = (int)strlen(t);
+            if (col < 0) continue;
+            if (col + tw > w) col = w - tw;          /* keep the last tick on */
+            if (col < 0) continue;
+            if (axis[col] != ' ') continue;          /* do not overwrite one  */
+            memcpy(axis + col, t, (size_t)tw);
+        }
+        axis[w] = 0;
+        printf(" %s\n", axis);
+    }
+    printf("            m = min smoothed loss   R = recommendation   "
+           "d = divergence\n");
+    if (clipped > 0)
+        printf("            %d step(s) above the top of the plot, drawn as '!'\n",
+               clipped);
+
+    free(acc); free(cnt); free(bad); free(grid); free(mark);
+}
+
+/* ------------------------------------------------------------ the command */
+
+int az_lrfind(AZLrFindCfg *lc)
+{
+    AZShared  sh;
+    AZCfg    *c;
+    Trunk    *trunk = NULL, *snap_trunk = NULL;
+    Head     *heads = NULL, *snap_heads = NULL;
+    Hyper    *hypers = NULL;
+    float    *elo = NULL;
+    HofEntry *hof = NULL;
+    AZPair   *pairs = NULL;
+    AZRes    *results = NULL;
+    EloRank  *rank = NULL;
+    int32_t  *wslot = NULL, *bslot = NULL;
+    HeadGrad *hgrad = NULL;
+    TrunkGrad *tgsum = NULL;
+    Adam     *head_adam = NULL;
+    AZWorker *workers = NULL;
+    pthread_t *tids = NULL;
+    LrfRow   *row = NULL;
+    uint64_t  master[4];
+    int  n, gpa, nthreads, npairs_max, rc = 1;
+    int  adam_ready = 0, nadam = 0, nspawned = 0, bar_ready = 0, nworkers_init = 0;
+    int  gen_loaded = 0, nsteps = 0, n_rows = 0;
+    int  restored_ok = 0;
+    uint64_t games_played = 0;
+    double t0;
+
+    if (!lc) return 1;
+    c = &lc->az;
+    chess_init();
+
+    /* ---- sanitise the sweep --------------------------------------------- */
+    if (!(lc->lo > 0.0))        lc->lo = 1e-6;
+    if (!(lc->hi > lc->lo))     lc->hi = lc->lo * 1e6;
+    if (lc->steps < 8)          lc->steps = 8;
+    if (lc->steps > 100000)     lc->steps = 100000;
+    if (lc->warm_games < 1)     lc->warm_games = 1;
+    if (!(lc->smooth >= 0.0) || lc->smooth >= 1.0) lc->smooth = 0.9;
+    if (!(lc->stop_factor >= 0.0)) lc->stop_factor = 0.0;
+    if (lc->plot_rows < 6)      lc->plot_rows = 18;
+    if (lc->plot_cols < 20)     lc->plot_cols = 62;
+    if (lc->plot_cols > 200)    lc->plot_cols = 200;
+    /* generations is irrelevant here but az_sanitise clamps warmup against it */
+    c->generations = 1;
+    c->warmup_gens = 0;
+    c->ema_decay   = 0.0f;       /* nothing is saved, so nothing to average   */
+    c->ema_h2h_games = 0;
+    az_sanitise(c);
+
+    /* ---- how many agents? the checkpoint decides ------------------------ */
+    if (lc->model) {
+        int probe_n = 0, probe_gen = 0;
+        if (!model_load(lc->model, NULL, NULL, NULL, NULL, &probe_n, &probe_gen)) {
+            fprintf(stderr,
+                "lrfind: cannot read model '%s'.\n"
+                "        model_load accepts MODEL_VERSION %u with widths "
+                "%d/%d/%d/%d only; an older checkpoint has different tensors in a\n"
+                "        different order and is refused rather than read as noise "
+                "(see net.h).\n",
+                lc->model, (unsigned)MODEL_VERSION,
+                NF_INPUT, NF_ACC, NF_HID, NF_PDIM);
+            return 1;
+        }
+        if (probe_n < 2) {
+            fprintf(stderr, "lrfind: model '%s' holds %d agents; need at least 2\n",
+                    lc->model, probe_n);
+            return 1;
+        }
+        c->n_agents = probe_n;
+        gen_loaded  = probe_gen;
+    }
+
+    n   = c->n_agents;
+    gpa = c->games_per_agent;
+    npairs_max = n * (gpa / 2);
+    nthreads = c->threads;
+    if (nthreads > npairs_max) nthreads = npairs_max;
+    if (nthreads < 1) nthreads = 1;
+
+    memset(&sh, 0, sizeof sh);
+
+    trunk      = (Trunk *)     calloc(1, sizeof(Trunk));
+    snap_trunk = (Trunk *)     calloc(1, sizeof(Trunk));
+    heads      = (Head *)      calloc((size_t)n, sizeof(Head));
+    snap_heads = (Head *)      calloc((size_t)n, sizeof(Head));
+    hypers     = (Hyper *)     calloc((size_t)n, sizeof(Hyper));
+    elo        = (float *)     calloc((size_t)n, sizeof(float));
+    hof        = (HofEntry *)  calloc((size_t)HOF_CAP, sizeof(HofEntry));
+    pairs      = (AZPair *)    calloc((size_t)npairs_max, sizeof(AZPair));
+    results    = (AZRes *)     calloc((size_t)npairs_max, sizeof(AZRes));
+    rank       = (EloRank *)   calloc((size_t)n, sizeof(EloRank));
+    wslot      = (int32_t *)   calloc((size_t)npairs_max, sizeof(int32_t));
+    bslot      = (int32_t *)   calloc((size_t)npairs_max, sizeof(int32_t));
+    hgrad      = (HeadGrad *)  calloc((size_t)n, sizeof(HeadGrad));
+    tgsum      = (TrunkGrad *) calloc(1, sizeof(TrunkGrad));
+    head_adam  = (Adam *)      calloc((size_t)n, sizeof(Adam));
+    workers    = (AZWorker *)  calloc((size_t)nthreads, sizeof(AZWorker));
+    tids       = (pthread_t *) calloc((size_t)nthreads, sizeof(pthread_t));
+    row        = (LrfRow *)    calloc((size_t)lc->steps, sizeof(LrfRow));
+
+    sh.batch     = (int32_t *) calloc((size_t)c->batch_size, sizeof(int32_t));
+    sh.batch_tmp = (int32_t *) calloc((size_t)c->batch_size, sizeof(int32_t));
+    sh.acount    = (int *)     calloc((size_t)n, sizeof(int));
+    sh.aoff      = (int *)     calloc((size_t)n, sizeof(int));
+    sh.tstart    = (int *)     calloc((size_t)nthreads + 1, sizeof(int));
+
+    if (!trunk || !snap_trunk || !heads || !snap_heads || !hypers || !elo ||
+        !hof || !pairs || !results || !rank || !wslot || !bslot || !hgrad ||
+        !tgsum || !head_adam || !workers || !tids || !row || !sh.batch ||
+        !sh.batch_tmp || !sh.acount || !sh.aoff || !sh.tstart) {
+        fprintf(stderr, "lrfind: out of memory\n");
+        goto done;
+    }
+    if (!azbuf_init(&sh.buf, c->buffer_positions)) {
+        fprintf(stderr, "lrfind: out of memory for a %d-position replay buffer\n",
+                c->buffer_positions);
+        goto done;
+    }
+
+    /* ---- weights: load, or initialise exactly as generation 1 does ------- */
+    if (lc->model) {
+        int cap = n, g2 = 0;
+        if (!model_load(lc->model, trunk, heads, hypers, elo, &cap, &g2)) {
+            fprintf(stderr, "lrfind: cannot read model '%s'\n", lc->model);
+            goto done;
+        }
+    } else {
+        nn_init(trunk, &heads[0], c->seed);
+        for (int i = 1; i < n; i++) {
+            Trunk scratch;
+            nn_init(&scratch, &heads[i],
+                    c->seed + 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1));
+        }
+        az_seed(master, c->seed ^ 0xD1B54A32D192ED03ull);
+        for (int i = 0; i < n; i++) {
+            az_hyper_init(&hypers[i]);
+            az_hyper_mutate(&hypers[i], master);
+            elo[i] = ELO_SEED;
+        }
+    }
+
+    /* ---- THE SNAPSHOT --------------------------------------------------- */
+    *snap_trunk = *trunk;
+    memcpy(snap_heads, heads, (size_t)n * sizeof(Head));
+
+    adam_init(&sh.trunk_adam, (int)TRUNK_NPARAM);
+    for (nadam = 0; nadam < n; nadam++) adam_init(&head_adam[nadam], (int)HEAD_NPARAM);
+    adam_ready = 1;
+
+    sh.cfg       = c;
+    sh.trunk     = trunk;
+    sh.heads     = heads;
+    sh.hypers    = hypers;
+    sh.elo       = elo;
+    sh.hof       = hof;
+    sh.pairs     = pairs;
+    sh.results   = results;
+    sh.npairs    = npairs_max;
+    sh.hgrad     = hgrad;
+    sh.tgsum     = tgsum;
+    sh.head_adam = head_adam;
+    sh.workers   = workers;
+    sh.nthreads  = nthreads;
+    sh.head_clip = (c->grad_clip_head > 0.0f) ? c->grad_clip_head : c->grad_clip;
+    sh.cap_sims  = c->cap_sims > 0 ? c->cap_sims : (c->sims / 5 > 2 ? c->sims / 5 : 2);
+    if (sh.cap_sims > c->sims) sh.cap_sims = c->sims;
+    sh.job       = JOB_IDLE;
+    sh.one_step  = 1;
+    atomic_init(&sh.next, 0);
+
+    bar_init(&sh.bar, nthreads);
+    bar_ready = 1;
+
+    for (nworkers_init = 0; nworkers_init < nthreads; nworkers_init++) {
+        AZWorker *w = &workers[nworkers_init];
+        w->sh  = &sh;
+        w->tid = nworkers_init;
+        mcts_init(&w->m, MAX_MOVES + 1 + c->sims * NODES_PER_SIM);
+        w->m.c_puct          = c->c_puct;
+        w->m.dirichlet_alpha = c->dirichlet_alpha;
+        w->m.dirichlet_eps   = c->dirichlet_eps;
+        w->tg       = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->tg_pol   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->tg_val   = (TrunkGrad *)calloc(1, sizeof(TrunkGrad));
+        w->hg_probe = (HeadGrad *) calloc(1, sizeof(HeadGrad));
+        if (!w->m.pool || !w->tg || !w->tg_pol || !w->tg_val || !w->hg_probe ||
+            !rec_init(&w->rec, c->max_plies)) {
+            fprintf(stderr, "lrfind: out of memory (worker %d)\n", nworkers_init);
+            nworkers_init++;
+            goto done;
+        }
+    }
+    for (nspawned = 1; nspawned < nthreads; nspawned++) {
+        if (pthread_create(&tids[nspawned], NULL, az_worker_main, &workers[nspawned]) != 0) {
+            fprintf(stderr, "lrfind: cannot create thread %d\n", nspawned);
+            goto done;
+        }
+    }
+
+    printf("chessrl lrfind -- learning-rate range test "
+           "(Smith 2015, arxiv 1506.01186)\n");
+    printf("  model        %s", lc->model ? lc->model : "(fresh nn_init)");
+    if (lc->model) printf("   generation %d", gen_loaded);
+    else           printf("   generation 0, seed %llu",
+                          (unsigned long long)c->seed);
+    printf("\n");
+    printf("  population   %d agents, %zu trunk + %zu head parameters each\n",
+           n, (size_t)TRUNK_NPARAM, (size_t)HEAD_NPARAM);
+    printf("  self-play    %d sims, cap %.2f x %d sims, start %s, "
+           "draw %.2f, max %d plies\n",
+           c->sims, (double)c->cap_frac, sh.cap_sims,
+           c->start_mode == AZ_START_CLASSICAL ? "classical" :
+           c->start_mode == AZ_START_960 ? "960" : "mixed",
+           (double)c->draw_penalty, c->max_plies);
+    printf("  objective    L = policy_CE + %.2f * value_MSE, wd %.3g, "
+           "clip %.3g trunk / %.3g head\n",
+           (double)c->value_coef, (double)c->weight_decay,
+           (double)c->grad_clip, (double)sh.head_clip);
+    printf("  sweep        %d steps, batch %d, lr %.3g -> %.3g geometric "
+           "(%.4f decades/step)\n",
+           lc->steps, c->batch_size, lc->lo, lc->hi,
+           (log10(lc->hi) - log10(lc->lo)) / (double)(lc->steps - 1));
+    printf("  threads      %d\n", nthreads);
+    fflush(stdout);
+
+    /* ---- 1. WARM THE BUFFER, WITH THE REAL SELF-PLAY PATH ---------------- */
+    t0 = now_sec();
+    {
+        const int per_round = npairs_max;
+        int rounds = (lc->warm_games + per_round - 1) / per_round;
+        if (rounds < 1) rounds = 1;
+        printf("\n  warming the replay buffer: %d round(s) x %d games ...",
+               rounds, per_round);
+        fflush(stdout);
+        for (int r = 0; r < rounds; r++) {
+            az_seed(master, c->seed + 0x2545F4914F6CDD1Dull * (uint64_t)(r + 1));
+            sh.npairs = build_pairings(&sh, rank, wslot, bslot, master);
+            memset(results, 0, (size_t)sh.npairs * sizeof(AZRes));
+            atomic_store(&sh.next, 0);
+            for (int t = 0; t < nthreads; t++) {
+                AZWorker *w = &workers[t];
+                az_seed(w->rng, c->seed
+                        + 0x9E3779B97F4A7C15ull * (uint64_t)(t + 1)
+                        + 0xBF58476D1CE4E5B9ull * (uint64_t)(r + 1));
+                st_zero(&w->st);
+                w->evals = 0;
+                w->rootv_sum = 0.0; w->rootv_n = 0;
+                w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
+                w->resign_checked = w->resign_would = w->resign_wrong = 0;
+                w->full_moves = w->all_moves = 0;
+            }
+            az_dispatch(&sh, JOB_SELFPLAY);
+            apply_elo(&sh);
+            for (int t = 0; t < nthreads; t++) games_played += workers[t].st.games;
+        }
+    }
+    {
+        const uint64_t have = azbuf_count(&sh.buf);
+        printf(" %llu games, %llu positions in %.1fs\n",
+               (unsigned long long)games_played, (unsigned long long)have,
+               now_sec() - t0);
+        if (have == 0) {
+            fprintf(stderr,
+                "lrfind: the replay buffer is EMPTY after %llu games. Nothing can "
+                "be measured.\n", (unsigned long long)games_played);
+            goto done;
+        }
+        {   /* Degenerate case: too little data to sample a batch from. */
+            const double epochs = (double)lc->steps * (double)c->batch_size /
+                                  (double)have;
+            printf("  buffer       %llu positions, batch %d -> %.1f passes over "
+                   "the buffer across the sweep\n",
+                   (unsigned long long)have, c->batch_size, epochs);
+            if ((uint64_t)c->batch_size > have) {
+                printf("  WARNING      the buffer holds FEWER positions (%llu) than "
+                       "one minibatch (%d).\n"
+                       "               Every batch is a resample of the same data; "
+                       "the curve measures\n"
+                       "               memorisation of %llu positions, not learning. "
+                       "Raise --warm-games.\n",
+                       (unsigned long long)have, c->batch_size,
+                       (unsigned long long)have);
+            } else if (epochs > 30.0) {
+                printf("  WARNING      %.0f passes over the buffer: the descent may "
+                       "be memorisation rather\n"
+                       "               than a learning rate that suits the task. "
+                       "Raise --warm-games or\n"
+                       "               lower --steps to check.\n", epochs);
+            }
+        }
+    }
+
+    /* ---- 2. THE SWEEP ---------------------------------------------------- */
+    t0 = now_sec();
+    {
+        const double lx0 = log10(lc->lo), lx1 = log10(lc->hi);
+        const double dx  = (lx1 - lx0) / (double)(lc->steps - 1);
+        double best_s = 1e300;
+        int stop_reason = 0;       /* 1 = non-finite, 2 = stop_factor         */
+
+        for (nsteps = 0; nsteps < lc->steps; nsteps++) {
+            const double lr = pow(10.0, lx0 + dx * (double)nsteps);
+            double lp = 0.0, lv = 0.0, hg = 0.0;
+            uint64_t ln = 0, hgn = 0;
+
+            sh.lr_now = (float)lr;
+            for (int t = 0; t < nthreads; t++) {
+                AZWorker *w = &workers[t];
+                w->l_pol = w->l_val = 0.0;
+                w->l_n = 0;
+                w->hgnorm_sum = 0.0;
+                w->hgnorm_n = w->hclip_n = 0;
+                w->probe = 0;
+            }
+            sh.gnorm_sum = 0.0;
+            sh.gnorm_n = sh.gclip_n = 0;
+
+            az_dispatch(&sh, JOB_LEARN);
+
+            for (int t = 0; t < nthreads; t++) {
+                lp  += workers[t].l_pol;
+                lv  += workers[t].l_val;
+                ln  += workers[t].l_n;
+                hg  += workers[t].hgnorm_sum;
+                hgn += workers[t].hgnorm_n;
+            }
+            row[nsteps].lr     = lr;
+            row[nsteps].nb     = (int)ln;
+            row[nsteps].pol    = ln ? lp / (double)ln : 0.0;
+            row[nsteps].val    = ln ? lv / (double)ln : 0.0;
+            row[nsteps].loss   = row[nsteps].pol + (double)c->value_coef * row[nsteps].val;
+            row[nsteps].gnorm  = sh.gnorm_n ? sh.gnorm_sum / (double)sh.gnorm_n : 0.0;
+            row[nsteps].hgnorm = hgn ? hg / (double)hgn : 0.0;
+            /* A finite loss is not enough.  relu(NaN) is 0 on every C
+             * implementation (NaN > 0 is false), so a network whose value
+             * trunk has gone non-finite still reports a perfectly ordinary
+             * loss while every gradient reaching the trunk is NaN and every
+             * optimiser step is garbage.  The gradient norm is the honest
+             * detector, so a step counts as usable only if BOTH are finite. */
+            row[nsteps].finite = ln > 0 && isfinite(row[nsteps].loss) &&
+                                 isfinite(row[nsteps].gnorm);
+
+            if (!row[nsteps].finite) { nsteps++; stop_reason = 1; break; }
+            if (row[nsteps].loss < best_s) best_s = row[nsteps].loss;
+            if (lc->stop_factor > 0.0 && row[nsteps].loss > lc->stop_factor * best_s) {
+                nsteps++; stop_reason = 2; break;
+            }
+        }
+        n_rows = nsteps;
+        printf("  sweep        %d step(s) in %.1fs%s\n", n_rows, now_sec() - t0,
+               stop_reason == 1 ? "   (stopped: the loss went non-finite)"
+             : stop_reason == 2 ? "   (stopped: --stop-factor exceeded)" : "");
+    }
+
+    /* ---- 3. RESTORE AND PROVE IT ---------------------------------------- */
+    *trunk = *snap_trunk;
+    memcpy(heads, snap_heads, (size_t)n * sizeof(Head));
+    restored_ok = (memcmp(trunk, snap_trunk, sizeof(Trunk)) == 0) &&
+                  (memcmp(heads, snap_heads, (size_t)n * sizeof(Head)) == 0);
+    printf("  weights      restored from the pre-sweep snapshot: %s"
+           "  (%zu trunk + %zu x %zu head floats compared)\n",
+           restored_ok ? "BIT-IDENTICAL" : "*** MISMATCH ***",
+           (size_t)TRUNK_NPARAM, (size_t)n, (size_t)HEAD_NPARAM);
+    if (!restored_ok) {
+        fprintf(stderr, "lrfind: the weight snapshot did not restore. Refusing to "
+                        "report a result.\n");
+        goto done;
+    }
+    printf("  model file   never written; lrfind opens no checkpoint for "
+           "writing\n");
+
+    /* ---- 4. ANALYSE ------------------------------------------------------ */
+    if (n_rows < 1) {
+        fprintf(stderr, "lrfind: no steps completed\n");
+        goto done;
+    }
+    lrf_smooth(row, n_rows, lc->smooth);
+    {
+        const int win = (n_rows / 40 > 1) ? n_rows / 40 : 1;
+        int i_min = lrf_argmin(row, n_rows, 0);
+        int i_minp = lrf_argmin(row, n_rows, 1);
+        int i_minv = lrf_argmin(row, n_rows, 2);
+        int i_steep = -1, i_div = -1, i_div4 = -1, i_nan = -1;
+        int n_finite = 0;
+        double s0 = 0.0, best_slope = 0.0;
+        double resid_sd = 0.0, sd_s = 0.0, depth = 0.0;
+        int have_s0 = 0, significant = 0;
+
+        for (int i = 0; i < n_rows; i++) {
+            if (row[i].finite && isfinite(row[i].s_tot)) {
+                n_finite++;
+                if (!have_s0) { s0 = row[i].s_tot; have_s0 = 1; }
+            } else if (i_nan < 0) i_nan = i;
+        }
+        for (int i = 0; i < n_rows; i++) {
+            if (!row[i].finite || !isfinite(row[i].s_tot)) continue;
+            const double sl = lrf_slope(row, n_rows, i, win);
+            if (i_steep < 0 || sl < best_slope) { best_slope = sl; i_steep = i; }
+        }
+        if (i_min >= 0) {
+            for (int i = i_min + 1; i < n_rows; i++) {
+                if (!row[i].finite || !isfinite(row[i].s_tot)) { i_div = i; break; }
+                if (have_s0 && row[i].s_tot > s0) { i_div = i; break; }
+            }
+            for (int i = i_min + 1; i < n_rows; i++) {
+                if (!row[i].finite || !isfinite(row[i].s_tot)) { i_div4 = i; break; }
+                if (row[i].s_tot > 4.0 * row[i_min].s_tot) { i_div4 = i; break; }
+            }
+        }
+
+        /* ---- the table ------------------------------------------------- */
+        {
+            int stride = n_rows / 24;
+            if (stride < 1) stride = 1;
+            printf("\n  step      lr      loss    policy    value   smoothed"
+                   "   |g|trunk   |g|head   n\n");
+            for (int i = 0; i < n_rows; i += stride) {
+                printf("  %4d  %9.3g  %8.4f  %7.4f  %7.4f  %9.4f  %8.3f  %8.3f  %4d\n",
+                       i, row[i].lr, row[i].loss, row[i].pol, row[i].val,
+                       row[i].s_tot, row[i].gnorm, row[i].hgnorm, row[i].nb);
+            }
+            if ((n_rows - 1) % stride != 0) {
+                const int i = n_rows - 1;
+                printf("  %4d  %9.3g  %8.4f  %7.4f  %7.4f  %9.4f  %8.3f  %8.3f  %4d\n",
+                       i, row[i].lr, row[i].loss, row[i].pol, row[i].val,
+                       row[i].s_tot, row[i].gnorm, row[i].hgnorm, row[i].nb);
+            }
+        }
+
+        /* ---- degenerate cases, said out loud --------------------------- */
+        printf("\n  READING THE CURVE   (smoothing: debiased EMA, beta = %.3f, "
+               "~%.0f-step window)\n", lc->smooth,
+               lc->smooth > 0.0 ? 1.0 / (1.0 - lc->smooth) : 1.0);
+
+        if (i_nan == 0) {
+            printf("\n  DEGENERATE: the FIRST step was already unusable at "
+                   "lr = %.3g:\n"
+                   "    loss               %g\n"
+                   "    trunk grad norm    %g\n"
+                   "  Nothing in this sweep is interpretable. Either the model is "
+                   "already broken --\n"
+                   "  note that a finite loss with a non-finite gradient means "
+                   "non-finite weights that\n"
+                   "  relu() is silently flattening to zero -- or --lo is far too "
+                   "high. No recommendation.\n",
+                   row[0].lr, row[0].loss, row[0].gnorm);
+            rc = 0;
+            goto report_done;
+        }
+        if (n_finite < 8) {
+            printf("\n  DEGENERATE: only %d finite step(s). Too few to read a "
+                   "curve from. No recommendation.\n", n_finite);
+            rc = 0;
+            goto report_done;
+        }
+
+        /* IS THERE A CURVE AT ALL?  A range test over a window that contains no
+         * usable rate produces a flat, noisy line, and every landmark read off
+         * it -- the minimum, the steepest point, the first crossing back above
+         * the start -- is then a reading of minibatch noise.  So the descent is
+         * tested against the noise before anything is reported: resid_sd is the
+         * spread of the RAW loss about its own smoothed curve, and an EMA with
+         * coefficient b reduces variance by (1-b)/(1+b), so 3 * sd_smoothed is
+         * the bar the descent has to clear. */
+        {
+            double rss = 0.0;
+            int rn = 0;
+            for (int i = 0; i < n_rows; i++) {
+                if (!row[i].finite || !isfinite(row[i].s_tot)) continue;
+                const double d = row[i].loss - row[i].s_tot;
+                rss += d * d;
+                rn++;
+            }
+            resid_sd = (rn > 1) ? sqrt(rss / (double)(rn - 1)) : 0.0;
+            sd_s  = resid_sd * sqrt((1.0 - lc->smooth) / (1.0 + lc->smooth));
+            depth = (i_min >= 0) ? s0 - row[i_min].s_tot : 0.0;
+            significant = (depth > 3.0 * sd_s);
+            printf("  noise floor          minibatch sd %.4f about the smoothed "
+                   "curve -> sd(smoothed) %.4f\n", resid_sd, sd_s);
+            printf("  descent depth        %.4f  (%.1f x sd(smoothed))%s\n",
+                   depth, sd_s > 0.0 ? depth / sd_s : 0.0,
+                   significant ? "" : "   NOT SIGNIFICANT");
+        }
+        if (!significant) {
+            printf("\n  DEGENERATE: the smoothed loss is FLAT to within the "
+                   "minibatch noise across the\n"
+                   "  whole of [%.3g, %.3g]. The minimum, the steepest point and "
+                   "the first crossing back\n"
+                   "  above the starting loss are all readings of noise here, not "
+                   "of a curve. Widen the\n"
+                   "  sweep, raise --warm-games, or raise --steps. No "
+                   "recommendation.\n", lc->lo, lc->hi);
+            rc = 0;
+            goto report_done;
+        }
+
+        printf("  min smoothed loss    lr = %-10.3g  loss %.4f   (step %d)\n",
+               row[i_min].lr, row[i_min].s_tot, i_min);
+        printf("  steepest descent     lr = %-10.3g  %.3f loss per decade "
+               "(step %d)\n", row[i_steep].lr, best_slope, i_steep);
+        if (i_div >= 0) {
+            printf("  divergence           lr = %-10.3g  %s (step %d)%s\n",
+                   row[i_div].lr,
+                   row[i_div].finite && isfinite(row[i_div].s_tot)
+                       ? "smoothed loss back above its starting value"
+                       : "smoothed loss went non-finite", i_div,
+                   i_div == n_rows - 1 ? "  [LAST STEP: this is a lower bound]" : "");
+        } else {
+            printf("  divergence           NOT REACHED anywhere in [%.3g, %.3g]. The "
+                   "smoothed loss never\n"
+                   "                       climbed back above its starting value, so "
+                   "this sweep gives NO\n"
+                   "                       upper bound on a usable rate. Re-run with "
+                   "a larger --hi.\n", lc->lo, lc->hi);
+        }
+        if (i_div4 >= 0)
+            printf("  4x-the-minimum       lr = %-10.3g (step %d)\n",
+                   row[i_div4].lr, i_div4);
+        else
+            printf("  4x-the-minimum       NOT REACHED in [%.3g, %.3g]\n",
+                   lc->lo, lc->hi);
+        /* The two terms of the objective do not have to want the same rate,
+         * and value_coef multiplies one of them, so the total-loss curve can
+         * be almost entirely the value head's curve.  Both are reported. */
+        printf("  policy term alone    lr(min) = %-10.3g -> min/10 = %-10.3g "
+               "(range %.4f nats)\n",
+               i_minp >= 0 ? row[i_minp].lr : 0.0,
+               i_minp >= 0 ? row[i_minp].lr / 10.0 : 0.0,
+               i_minp >= 0 ? row[0].s_pol - row[i_minp].s_pol : 0.0);
+        printf("  value term alone     lr(min) = %-10.3g -> min/10 = %-10.3g "
+               "(range %.4f, x%.2f coef)\n",
+               i_minv >= 0 ? row[i_minv].lr : 0.0,
+               i_minv >= 0 ? row[i_minv].lr / 10.0 : 0.0,
+               i_minv >= 0 ? row[0].s_val - row[i_minv].s_val : 0.0,
+               (double)c->value_coef);
+        if (i_min >= 0 && i_minp >= 0 && i_minv >= 0) {
+            const double dp = row[0].s_pol - row[i_minp].s_pol;
+            const double dv = (double)c->value_coef * (row[0].s_val - row[i_minv].s_val);
+            const double tot = dp + dv;
+            if (tot > 1e-9)
+                printf("  the descent is       %.0f%% value term, %.0f%% policy term\n",
+                       100.0 * dv / tot, 100.0 * dp / tot);
+        }
+
+        /* ---- the recommendation ---------------------------------------- */
+        printf("\n  RECOMMENDATION\n");
+        if (i_min == 0) {
+            printf("  NONE. The smoothed loss was already at its minimum at the "
+                   "BOTTOM of the sweep\n"
+                   "  (lr = %.3g): this sweep contains no descending region. "
+                   "Either --lo is already\n"
+                   "  too large, or the data carries no gradient signal. "
+                   "Nothing to recommend.\n", row[0].lr);
+        } else if (i_min >= n_rows - 1 - (n_rows / 50)) {
+            printf("  LOWER BOUND ONLY. The minimum sits at the TOP of the sweep "
+                   "(lr = %.3g), so\n"
+                   "  [%.3g, %.3g] does not contain the point where the rate stops "
+                   "helping. Re-run\n"
+                   "  with a larger --hi. On the evidence here a peak of %.3g is "
+                   "safe but may be low.\n",
+                   row[i_min].lr, lc->lo, lc->hi, row[i_min].lr / 10.0);
+        } else {
+            const double rec_min10 = row[i_min].lr / 10.0;
+            const double rec_steep = row[i_steep].lr;
+            const double rec = rec_min10;
+            printf("  RULE APPLIED: peak LR = lr(minimum smoothed loss) / 10.\n"
+                   "\n"
+                   "    lr(min)/10           %.3g   <- the recommendation\n"
+                   "    lr(steepest)         %.3g   (cross-check, does not bind)\n",
+                   rec_min10, rec_steep);
+            printf("\n  WHY THAT RULE. The minimum of a range-test curve is the "
+                   "rate at which the step\n"
+                   "  has grown large enough that the update stops reducing the "
+                   "loss -- it is an upper\n"
+                   "  bound, not a setting. The conventional margin is one decade "
+                   "below it (fastai's\n"
+                   "  lr_find default). Our schedule quotes the PEAK of a cosine "
+                   "decay, and a peak has\n"
+                   "  to keep working for the whole run on data that keeps moving, "
+                   "so the peak is the\n"
+                   "  right thing to compare against a range-test recommendation.\n"
+                   "  The steepest-descent point is reported but NOT used: it is a "
+                   "finite difference of\n"
+                   "  a noisy series, so it is a strictly noisier estimator than the "
+                   "argmin of the same\n"
+                   "  smoothed curve, and on a shallow descent it wanders by a "
+                   "decade between seeds.\n");
+            if (rec_steep < rec_min10 * 0.5)
+                printf("  NOTE: the steepest-descent point (%.3g) is well BELOW the "
+                       "recommendation. The\n"
+                       "  descent is shallow here; a conservative reading would take "
+                       "the lower number.\n", rec_steep);
+            if (i_div >= 0)
+                printf("  Smith's own upper bound for a CYCLICAL schedule is the "
+                       "divergence point, %.3g;\n"
+                       "  that is the max of a triangular range, not a fixed rate.\n",
+                       row[i_div].lr);
+            {   /* what is actually configured */
+                const double cur = (double)c->lr;
+                const double ratio = (cur > 0.0 && rec > 0.0) ? cur / rec : 0.0;
+                printf("\n  AGAINST THE CONFIGURED SCHEDULE (--lr %.3g cosine-"
+                       "decayed to %.3g)\n", cur, (double)c->lr_final);
+                printf("    configured peak / recommended peak = %.2fx "
+                       "(%.2f decades)\n", ratio,
+                       ratio > 0.0 ? log10(ratio) : 0.0);
+                if (i_div >= 0 && cur >= row[i_div].lr)
+                    printf("    the configured peak is AT OR ABOVE the measured "
+                           "divergence point. Too high.\n");
+                else if (i_min >= 0 && cur > row[i_min].lr)
+                    printf("    the configured peak is ABOVE the loss minimum: "
+                           "past the point where larger\n"
+                           "    steps stop helping. Too high.\n");
+                else if (ratio > 3.16)
+                    printf("    the configured peak is more than half a decade "
+                           "ABOVE the recommendation.\n");
+                else if (ratio > 0.0 && ratio < 0.316)
+                    printf("    the configured peak is more than half a decade "
+                           "BELOW the recommendation.\n");
+                else
+                    printf("    within half a decade of the recommendation: the "
+                           "configured peak is in range.\n");
+            }
+        }
+
+        lrf_plot(row, n_rows, lc->plot_rows, lc->plot_cols,
+                 i_min, i_steep, i_div);
+        rc = 0;
+
+    report_done:
+        /* ---- CSV --------------------------------------------------------- */
+        if (lc->csv) {
+            FILE *f = fopen(lc->csv, "w");
+            if (!f) {
+                fprintf(stderr, "lrfind: cannot write '%s': %s\n",
+                        lc->csv, strerror(errno));
+            } else {
+                fprintf(f, "step,lr,log10_lr,loss_total,loss_policy,loss_value,"
+                           "loss_smoothed,policy_smoothed,value_smoothed,"
+                           "grad_norm_trunk_preclip,grad_norm_head_preclip,"
+                           "batch_positions,finite\n");
+                for (int i = 0; i < n_rows; i++) {
+                    fprintf(f, "%d,%.10g,%.6f,", i, row[i].lr, log10(row[i].lr));
+                    if (row[i].finite)
+                        fprintf(f, "%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,",
+                                row[i].loss, row[i].pol, row[i].val,
+                                row[i].s_tot, row[i].s_pol, row[i].s_val);
+                    else
+                        fprintf(f, "nan,nan,nan,nan,nan,nan,");
+                    fprintf(f, "%.8g,%.8g,%d,%d\n",
+                            row[i].gnorm, row[i].hgnorm, row[i].nb, row[i].finite);
+                }
+                fclose(f);
+                printf("\n  csv          %s (%d rows)\n", lc->csv, n_rows);
+            }
+        }
+    }
+
+done:
+    if (nspawned > 0) {
+        sh.job = JOB_EXIT;
+        bar_wait(&sh.bar);
+        for (int t = 1; t < nspawned; t++) pthread_join(tids[t], NULL);
+    }
+    if (workers) {
+        for (int t = 0; t < nworkers_init; t++) {
+            mcts_free(&workers[t].m);
+            rec_free(&workers[t].rec);
+            free(workers[t].tg);
+            free(workers[t].tg_pol);
+            free(workers[t].tg_val);
+            free(workers[t].hg_probe);
+        }
+    }
+    if (bar_ready) bar_destroy(&sh.bar);
+    if (adam_ready) {
+        adam_free(&sh.trunk_adam);
+        for (int i = 0; i < nadam; i++) adam_free(&head_adam[i]);
+    }
+    azbuf_free(&sh.buf);
+    free(sh.tstart); free(sh.aoff); free(sh.acount);
+    free(sh.batch_tmp); free(sh.batch);
+    free(row); free(tids); free(workers); free(head_adam); free(tgsum);
+    free(hgrad); free(bslot); free(wslot); free(rank); free(results);
+    free(pairs); free(hof); free(elo); free(hypers);
+    free(snap_heads); free(heads); free(snap_trunk); free(trunk);
     return rc;
 }

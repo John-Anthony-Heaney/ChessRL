@@ -106,4 +106,34 @@ typedef struct {
 void az_default_cfg(AZCfg *c);
 int  az_run(AZCfg *c);
 
+/* ==========================================================================
+ *                    LEARNING-RATE RANGE TEST (Smith 2015)
+ * ==========================================================================
+ * https://arxiv.org/abs/1506.01186 section 3.3: fill a replay buffer with the
+ * real self-play distribution, snapshot the weights, then take `steps`
+ * optimiser steps on minibatches drawn from that buffer while the learning
+ * rate rises GEOMETRICALLY from `lo` to `hi`, and read the usable range off
+ * the loss curve.  The weights are restored afterwards and the restoration is
+ * asserted, so the test is read-only with respect to the model.
+ *
+ * `az` carries the ENTIRE self-play and learning configuration, unchanged, so
+ * the data the test learns from is the data training would have produced.
+ * az.lr / az.lr_final / az.steps_per_gen / az.generations are ignored: the
+ * sweep supplies the learning rate and the step count itself.                */
+typedef struct {
+    AZCfg       az;          /* self-play + optimiser config, used verbatim   */
+    const char *model;       /* checkpoint to test; NULL = fresh nn_init      */
+    double      lo, hi;      /* learning-rate sweep bounds, lo < hi           */
+    int         steps;       /* optimiser steps across the sweep              */
+    int         warm_games;  /* self-play games played to fill the buffer     */
+    double      smooth;      /* EMA coefficient for the smoothed loss, [0,1)  */
+    double      stop_factor; /* abandon the sweep once the smoothed loss is
+                              * this multiple of its best; <=0 disables       */
+    const char *csv;         /* per-step CSV output path, NULL = none         */
+    int         plot_rows, plot_cols;
+} AZLrFindCfg;
+
+void az_lrfind_default_cfg(AZLrFindCfg *c);
+int  az_lrfind(AZLrFindCfg *c);
+
 #endif /* AZ_H */

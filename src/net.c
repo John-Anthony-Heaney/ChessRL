@@ -260,7 +260,21 @@ void nn_move_key(const Position *p, Move m, MoveKey *k)
  * the norm does not remove.
  */
 
-/* Returns 1/sigma and writes the mean through mu_out. */
+/* Returns 1/sigma and writes the mean through mu_out.
+ *
+ * BOTH reductions are single serial chains and must stay that way: summing them
+ * four-wide would reassociate them and change the last bit of the result, which
+ * is how this file keeps nn_eval bit-identical across the batched and unbatched
+ * paths and across builds.  The batched path gets its width by running FOUR
+ * ROWS of the batch in the four lanes instead -- each lane is still the same
+ * serial chain -- which is the whole trick in nn_norm4_stats() below.
+ *
+ * contract(off) on the variance loop is deliberate: with contraction left to
+ * the compiler, `ss += d * d` became an fmaf at one call site and a mul+add at
+ * another purely because of how the surrounding function had been inlined, and
+ * the two differ in the last ULP.  Pinning it makes the result a property of
+ * this source rather than of the inliner's mood, and it costs nothing measurable
+ * (the multiply is off the critical path; the add's latency is the chain). */
 static inline float norm_stats(const float *restrict x, int n, float *mu_out)
 {
     float s = 0.0f;
@@ -268,7 +282,10 @@ static inline float norm_stats(const float *restrict x, int n, float *mu_out)
     const float mu = s / (float)n;
 
     float ss = 0.0f;
-    for (int i = 0; i < n; i++) { const float d = x[i] - mu; ss += d * d; }
+    {
+#pragma clang fp contract(off)
+        for (int i = 0; i < n; i++) { const float d = x[i] - mu; ss += d * d; }
+    }
 
     *mu_out = mu;
     return 1.0f / sqrtf(ss / (float)n + NN_EPS);
@@ -356,164 +373,471 @@ void nn_init(Trunk *t, Head *h, uint64_t seed)
 }
 
 /* ----------------------------------------------------------------- forward */
+/*
+ * THE FORWARD PASS IS BUILT FROM FOUR KERNELS -- gather, LayerNorm+relu,
+ * matvec, and the batched matvec -- and nn_eval() is those kernels applied to
+ * one position.  Three reasons it is written this way rather than as one
+ * straight-line function:
+ *
+ *   - nn_eval_batch() runs THE SAME kernels on each row of its batch, so its
+ *     result is bit-identical to nn_eval()'s at EVERY batch size, not just at
+ *     one.  The only exception is the optional Accelerate path, which is
+ *     documented as approximate where it is switched on.
+ *   - tools/profile.c compiles itself into this translation unit and times the
+ *     kernels one at a time.  A breakdown you can trust needs the timed code to
+ *     BE the shipped code rather than a copy of it that can drift.
+ *   - every width is a compile-time constant at every call site and the kernels
+ *     are always_inline, so what the compiler sees is the specialised loop.
+ *
+ * WHY THE KERNELS ARE NEON INTRINSICS AND NOT PLAIN C
+ * ---------------------------------------------------
+ * The plain-C matvec that used to be here relied on four accumulators and a
+ * comment claiming clang's SLP vectoriser would fold them into one NEON
+ * accumulator.  It does not.  What clang actually emitted for
+ * `s0 += w[i]*x[i]` x4 was an ld4 de-interleaving load feeding separate
+ * fmul.4s/fadd.4s pairs -- vector instructions, but with the de-interleave on
+ * the critical path and no fused multiply-add at all.  Measured on this M3 at
+ * the 128x128 shape it ran at 2.2-2.6 GFLOP/s against 14.9 for a hand-written
+ * vfmaq_f32 kernel with four output rows in flight.  Intrinsics also remove the
+ * compiler's freedom to regroup the sum, which is what makes the batched and
+ * unbatched paths agree bit for bit instead of nearly.
+ *
+ * EXACTNESS, PRECISELY
+ * --------------------
+ * Each output element is accumulated in ONE four-lane vector: lane k holds the
+ * sum over i == k (mod 4), and vaddvq_f32 reduces it as ((s0+s1)+(s2+s3)).
+ * That is the same grouping the old scalar source described, so the arithmetic
+ * this file performs is unchanged -- but the old BINARY had been auto-vectorised
+ * into sixteen partial sums and did not use FMA, so its last bit differs from
+ * this one's.  Measured over the 512-position profile corpus the difference is
+ * at most 1.2e-6 relative on the value and 2.4e-6 absolute on a logit: a float
+ * rounding change, not a change to what is computed.  The gradient check in
+ * tests/test_net.c (analytic against central differences) and the MCTS
+ * determinism tests are what say so.
+ */
+
+#if defined(__ARM_NEON) && !defined(NN_NO_NEON)
+#  define NN_NEON 1
+#  include <arm_neon.h>
+#else
+#  define NN_NEON 0
+#endif
+
+/* Accelerate is a system framework, not a dependency: it is used only when the
+ * build asks for it with -DUSE_ACCELERATE, only for the batched dense layers,
+ * and there is a portable NEON path underneath it that the tests exercise
+ * either way.  See the note above nn_eval_batch() for what it costs in
+ * exactness. */
+#if defined(USE_ACCELERATE)
+#  if defined(__has_include)
+#    if __has_include(<Accelerate/Accelerate.h>)
+#      define NN_ACCELERATE 1
+#    endif
+#  endif
+#endif
+#ifndef NN_ACCELERATE
+#  define NN_ACCELERATE 0
+#endif
+#if NN_ACCELERATE
+#  include <Accelerate/Accelerate.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define NN_INLINE static inline __attribute__((always_inline))
+#else
+#  define NN_INLINE static inline
+#endif
+
+/* Fwd is pure float storage, so an array of them is a matrix of stride
+ * NN_FWD_STRIDE floats: the batched path hands that stride straight to the
+ * kernels (and to sgemm) and never copies a row anywhere. */
+#define NN_FWD_STRIDE ((int)(sizeof(Fwd) / sizeof(float)))
+_Static_assert(sizeof(Fwd) % sizeof(float) == 0, "Fwd must be pure float storage");
+
+/* ------------------------------------------------------------ the kernels */
+
+/* acc = b (+ z) + the sum of the `nf` rows of Wm named by fidx, each n wide.
+ * THE sparse step: ~35 gathered rows, never a dense matmul.  `z` is the agent's
+ * style vector on the policy trunk and NULL on the value trunk; it is constant
+ * at both call sites, so the branch folds away.
+ *
+ * The adds are element-wise, so vectorising them cannot regroup anything and
+ * the result is exact whatever the vector width. */
+NN_INLINE void nn_gather(const float *restrict Wm, const float *restrict b,
+                         const float *restrict z, const uint16_t *restrict fidx,
+                         int nf, int n, float *restrict acc)
+{
+#if NN_NEON
+    if (z) for (int i = 0; i < n; i += 4)
+               vst1q_f32(acc + i, vaddq_f32(vld1q_f32(b + i), vld1q_f32(z + i)));
+    else   for (int i = 0; i < n; i += 4)
+               vst1q_f32(acc + i, vld1q_f32(b + i));
+
+    for (int f = 0; f < nf; f++) {
+        const float *restrict w = Wm + (size_t)fidx[f] * (size_t)n;
+        /* one row ahead: the next row's address is already known and the rows
+         * are ~35 scattered 512-byte lines, which no stride prefetcher finds */
+        if (f + 1 < nf) __builtin_prefetch(Wm + (size_t)fidx[f + 1] * (size_t)n, 0, 3);
+        for (int i = 0; i < n; i += 4)
+            vst1q_f32(acc + i, vaddq_f32(vld1q_f32(acc + i), vld1q_f32(w + i)));
+    }
+#else
+    if (z) for (int i = 0; i < n; i++) acc[i] = b[i] + z[i];
+    else   for (int i = 0; i < n; i++) acc[i] = b[i];
+
+    for (int f = 0; f < nf; f++) {
+        const float *restrict w = Wm + (size_t)fidx[f] * (size_t)n;
+        for (int i = 0; i < n; i++) acc[i] += w[i];
+    }
+#endif
+}
+
+/* y = relu(g * norm(x) + c) (+ skip), also writing xhat; returns 1/sigma.
+ *
+ * norm_stats' two reductions stay serial on purpose (see the comment there), so
+ * this is the one stage that does not vectorise: its cost is the latency of a
+ * 128-long chain of adds, twice.  The ELEMENT-WISE second pass below does
+ * vectorise, and that part is exact. */
+NN_INLINE float nn_norm_relu_gen(const float *restrict x, const float *restrict g,
+                                 const float *restrict c, const float *restrict skip,
+                                 int n, float *restrict xhat, float *restrict y)
+{
+    float mu;
+    const float r = norm_stats(x, n, &mu);
+#if NN_NEON
+    const float32x4_t vmu = vdupq_n_f32(mu), vr = vdupq_n_f32(r), z = vdupq_n_f32(0.0f);
+    for (int i = 0; i < n; i += 4) {
+        const float32x4_t xh = vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmu), vr);
+        vst1q_f32(xhat + i, xh);
+        float32x4_t a = vmaxq_f32(vfmaq_f32(vld1q_f32(c + i), vld1q_f32(g + i), xh), z);
+        if (skip) a = vaddq_f32(a, vld1q_f32(skip + i));
+        vst1q_f32(y + i, a);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        const float xh = (x[i] - mu) * r;
+        xhat[i] = xh;
+        const float a = g[i] * xh + c[i];
+        y[i] = skip ? (a > 0.0f ? a : 0.0f) + skip[i] : (a > 0.0f ? a : 0.0f);
+    }
+#endif
+    return r;
+}
+
+NN_INLINE float nn_norm_relu(const float *restrict x, const float *restrict g,
+                             const float *restrict c, int n,
+                             float *restrict xhat, float *restrict y)
+{
+    return nn_norm_relu_gen(x, g, c, NULL, n, xhat, y);
+}
+
+/* The residual block's variant: y = relu(g * norm(x) + c) + skip. */
+NN_INLINE float nn_norm_relu_add(const float *restrict x, const float *restrict g,
+                                 const float *restrict c, const float *restrict skip,
+                                 int n, float *restrict xhat, float *restrict y)
+{
+    return nn_norm_relu_gen(x, g, c, skip, n, xhat, y);
+}
+
+/* y[j] = dot(row j of Wm, x) + bias[j], bias optional.  Wm is output-major so
+ * the reduction runs over a contiguous span.
+ *
+ * Four output rows are in flight at once: the x vector is loaded once and used
+ * four times, which is what takes this off the load ports.  Measured at the
+ * 128x128 shape: 10.9 GFLOP/s one row at a time, 14.9 at four, against 2.2 for
+ * the plain-C loop this replaced. */
+NN_INLINE void nn_matvec(const float *restrict Wm, const float *restrict bias,
+                         const float *restrict x, int nout, int nin,
+                         float *restrict y)
+{
+#if NN_NEON
+    int j = 0;
+    for (; j + 4 <= nout; j += 4) {
+        const float *restrict w0 = Wm + (size_t)(j + 0) * (size_t)nin;
+        const float *restrict w1 = Wm + (size_t)(j + 1) * (size_t)nin;
+        const float *restrict w2 = Wm + (size_t)(j + 2) * (size_t)nin;
+        const float *restrict w3 = Wm + (size_t)(j + 3) * (size_t)nin;
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        for (int i = 0; i < nin; i += 4) {
+            const float32x4_t xv = vld1q_f32(x + i);
+            a0 = vfmaq_f32(a0, vld1q_f32(w0 + i), xv);
+            a1 = vfmaq_f32(a1, vld1q_f32(w1 + i), xv);
+            a2 = vfmaq_f32(a2, vld1q_f32(w2 + i), xv);
+            a3 = vfmaq_f32(a3, vld1q_f32(w3 + i), xv);
+        }
+        if (bias) {
+            y[j + 0] = vaddvq_f32(a0) + bias[j + 0];
+            y[j + 1] = vaddvq_f32(a1) + bias[j + 1];
+            y[j + 2] = vaddvq_f32(a2) + bias[j + 2];
+            y[j + 3] = vaddvq_f32(a3) + bias[j + 3];
+        } else {
+            y[j + 0] = vaddvq_f32(a0);
+            y[j + 1] = vaddvq_f32(a1);
+            y[j + 2] = vaddvq_f32(a2);
+            y[j + 3] = vaddvq_f32(a3);
+        }
+    }
+    for (; j < nout; j++) {
+        const float *restrict w = Wm + (size_t)j * (size_t)nin;
+        float32x4_t a = vdupq_n_f32(0.0f);
+        for (int i = 0; i < nin; i += 4) a = vfmaq_f32(a, vld1q_f32(w + i), vld1q_f32(x + i));
+        const float s = vaddvq_f32(a);
+        y[j] = bias ? s + bias[j] : s;
+    }
+#else
+    for (int j = 0; j < nout; j++) {
+        const float *restrict w = Wm + (size_t)j * (size_t)nin;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int i = 0; i < nin; i += 4) {
+            s0 += w[i + 0] * x[i + 0];
+            s1 += w[i + 1] * x[i + 1];
+            s2 += w[i + 2] * x[i + 2];
+            s3 += w[i + 3] * x[i + 3];
+        }
+        const float s = (s0 + s1) + (s2 + s3);
+        y[j] = bias ? s + bias[j] : s;
+    }
+#endif
+}
+
+/* The same product for `nb` positions at once: y[b][j] = dot(row j, x[b]).
+ * Rows of x and y are strided (they usually live inside an array of Fwd), so
+ * nothing is ever copied to call this.
+ *
+ * Four weight rows x four positions per pass: sixteen accumulators fed by eight
+ * loads, which is where the arithmetic intensity comes from -- each weight
+ * vector is used four times instead of once.  Every accumulator is still one
+ * lane-wise chain over i reduced by vaddvq_f32, exactly as in nn_matvec, so
+ * this is bit-identical to calling nn_matvec on each row.  Measured at 128x128:
+ * 24.3 GFLOP/s against 14.9 unbatched. */
+NN_INLINE void nn_matvec_batch(const float *restrict Wm, const float *restrict bias,
+                               const float *restrict x, int ldx, int nb,
+                               int nout, int nin, float *restrict y, int ldy)
+{
+#if NN_NEON
+    int j = 0;
+    for (; j + 4 <= nout; j += 4) {
+        const float *w0 = Wm + (size_t)(j + 0) * (size_t)nin;
+        const float *w1 = Wm + (size_t)(j + 1) * (size_t)nin;
+        const float *w2 = Wm + (size_t)(j + 2) * (size_t)nin;
+        const float *w3 = Wm + (size_t)(j + 3) * (size_t)nin;
+        int b = 0;
+        for (; b + 4 <= nb; b += 4) {
+            const float *x0 = x + (size_t)(b + 0) * (size_t)ldx;
+            const float *x1 = x + (size_t)(b + 1) * (size_t)ldx;
+            const float *x2 = x + (size_t)(b + 2) * (size_t)ldx;
+            const float *x3 = x + (size_t)(b + 3) * (size_t)ldx;
+            float32x4_t a[4][4];
+            for (int r = 0; r < 4; r++)
+                for (int cc = 0; cc < 4; cc++) a[r][cc] = vdupq_n_f32(0.0f);
+            for (int i = 0; i < nin; i += 4) {
+                const float32x4_t v0 = vld1q_f32(x0 + i), v1 = vld1q_f32(x1 + i);
+                const float32x4_t v2 = vld1q_f32(x2 + i), v3 = vld1q_f32(x3 + i);
+                const float32x4_t u0 = vld1q_f32(w0 + i), u1 = vld1q_f32(w1 + i);
+                const float32x4_t u2 = vld1q_f32(w2 + i), u3 = vld1q_f32(w3 + i);
+                a[0][0] = vfmaq_f32(a[0][0], u0, v0); a[0][1] = vfmaq_f32(a[0][1], u0, v1);
+                a[0][2] = vfmaq_f32(a[0][2], u0, v2); a[0][3] = vfmaq_f32(a[0][3], u0, v3);
+                a[1][0] = vfmaq_f32(a[1][0], u1, v0); a[1][1] = vfmaq_f32(a[1][1], u1, v1);
+                a[1][2] = vfmaq_f32(a[1][2], u1, v2); a[1][3] = vfmaq_f32(a[1][3], u1, v3);
+                a[2][0] = vfmaq_f32(a[2][0], u2, v0); a[2][1] = vfmaq_f32(a[2][1], u2, v1);
+                a[2][2] = vfmaq_f32(a[2][2], u2, v2); a[2][3] = vfmaq_f32(a[2][3], u2, v3);
+                a[3][0] = vfmaq_f32(a[3][0], u3, v0); a[3][1] = vfmaq_f32(a[3][1], u3, v1);
+                a[3][2] = vfmaq_f32(a[3][2], u3, v2); a[3][3] = vfmaq_f32(a[3][3], u3, v3);
+            }
+            for (int r = 0; r < 4; r++)
+                for (int cc = 0; cc < 4; cc++) {
+                    const float s = vaddvq_f32(a[r][cc]);
+                    y[(size_t)(b + cc) * (size_t)ldy + j + r] = bias ? s + bias[j + r] : s;
+                }
+        }
+        for (; b < nb; b++)
+            nn_matvec(Wm + (size_t)j * (size_t)nin, bias ? bias + j : NULL,
+                      x + (size_t)b * (size_t)ldx, 4, nin,
+                      y + (size_t)b * (size_t)ldy + j);
+    }
+    for (; j < nout; j++)
+        for (int b = 0; b < nb; b++)
+            nn_matvec(Wm + (size_t)j * (size_t)nin, bias ? bias + j : NULL,
+                      x + (size_t)b * (size_t)ldx, 1, nin,
+                      y + (size_t)b * (size_t)ldy + j);
+#else
+    for (int b = 0; b < nb; b++)
+        nn_matvec(Wm, bias, x + (size_t)b * (size_t)ldx, nout, nin,
+                  y + (size_t)b * (size_t)ldy);
+#endif
+}
+
+/* --------------------------------------------------------------- nn_eval */
 
 void nn_eval(const Trunk *t, const Head *h, const uint16_t *fidx, int nf, Fwd *fw)
 {
+    /* the policy trunk:  acc -> h1 -> (residual block) -> h2 -> q */
     float acc[NF_ACC];
-    float *restrict h1 = fw->h1;
-    float *restrict h2 = fw->h2;
-    float *restrict q  = fw->q;
-
-    {   /* acc = b0 + z */
-        const float *restrict b0 = t->b0;
-        const float *restrict zz = h->z;
-        for (int i = 0; i < NF_ACC; i++) acc[i] = b0[i] + zz[i];
-    }
-
-    {   /* acc += sum of the W0 rows named by the active features.
-         * THE sparse step: ~35 gathered rows, never a dense matmul. */
-        const float *restrict W0 = t->W0;
-        for (int f = 0; f < nf; f++) {
-            const float *restrict w = W0 + (size_t)fidx[f] * NF_ACC;
-            for (int i = 0; i < NF_ACC; i++) acc[i] += w[i];
-        }
-    }
-
-    {   /* h1 = relu(g0 * norm(acc) + c0) */
-        float mu;
-        const float r = norm_stats(acc, NF_ACC, &mu);
-        fw->r1 = r;
-        float *restrict x1 = fw->x1;
-        const float *restrict g0 = t->g0;
-        const float *restrict c0 = t->c0;
-        for (int i = 0; i < NF_ACC; i++) {
-            const float xh = (acc[i] - mu) * r;
-            x1[i] = xh;
-            const float a = g0[i] * xh + c0[i];
-            h1[i] = a > 0.0f ? a : 0.0f;
-        }
-    }
+    nn_gather(t->W0, t->b0, h->z, fidx, nf, NF_ACC, acc);
+    fw->r1 = nn_norm_relu(acc, t->g0, t->c0, NF_ACC, fw->x1, fw->h1);
 
     float z2[NF_HID];
-    {   /* z2 = W1.h1 + b1 */
-        const float *restrict W1 = t->W1;
-        const float *restrict b1 = t->b1;
-        for (int j = 0; j < NF_HID; j++) {
-            const float *restrict w = W1 + (size_t)j * NF_ACC;
-            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (int i = 0; i < NF_ACC; i += 4) {
-                s0 += w[i + 0] * h1[i + 0];
-                s1 += w[i + 1] * h1[i + 1];
-                s2 += w[i + 2] * h1[i + 2];
-                s3 += w[i + 3] * h1[i + 3];
-            }
-            z2[j] = ((s0 + s1) + (s2 + s3)) + b1[j];
-        }
+    nn_matvec(t->W1, t->b1, fw->h1, NF_HID, NF_ACC, z2);
+    fw->r2 = nn_norm_relu_add(z2, t->g1, t->c1, fw->h1, NF_HID, fw->x2, fw->h2);
+
+    nn_matvec(h->Wp, NULL, fw->h2, NF_PDIM, NF_HID, fw->q);
+
+    /* THE VALUE TRUNK.  A second sparse gather over the same ~35 active
+     * features into its own accumulator.  Nothing on this path is shared with
+     * the policy, so nothing on it is shaped by the policy loss -- which is the
+     * entire point. */
+    float av[NF_VACC];
+    nn_gather(t->W0v, t->b0v, NULL, fidx, nf, NF_VACC, av);
+    fw->rv0 = nn_norm_relu(av, t->g0v, t->c0v, NF_VACC, fw->xv0, fw->hv0);
+
+    float zv[NF_VHID];
+    nn_matvec(h->Wvh, h->bvh, fw->hv0, NF_VHID, NF_VACC, zv);
+    fw->rv = nn_norm_relu(zv, h->gv, h->cv, NF_VHID, fw->xv, fw->hv);
+
+    nn_matvec(h->Wv, h->bv, fw->hv, 1, NF_VHID, &fw->raw_v);
+    fw->v = tanhf(fw->raw_v);
+}
+
+/* ----------------------------------------------------------- nn_eval_batch */
+/*
+ * WHY THE SIGNATURE IS WHAT IT IS
+ * -------------------------------
+ * `heads` is an array of POINTERS, one per row, because different agents play
+ * different games: a batch assembled across games has a different head per row
+ * and a batch assembled inside one search has the same head in every row.  Both
+ * have to work, and the second has to be fast, so the code walks maximal RUNS
+ * of equal head pointers and batches the per-head layers over each run.  A
+ * caller that sorts its batch by head therefore gets one run and the fastest
+ * path; a caller that does not still gets a fully batched trunk, which is 77%
+ * of the arithmetic.
+ *
+ * `fidx` is an array of pointers too, so nothing has to be copied into a
+ * rectangular buffer first -- the feature lists live wherever the caller keeps
+ * them and are different lengths anyway.
+ *
+ * `out` must be an array of nbatch Fwd, and it is both the output AND the
+ * working storage: h1, h2, hv0 and hv are read back out of it as GEMM inputs at
+ * stride NN_FWD_STRIDE, so a batched evaluation copies nothing.  That is also
+ * why there is no workspace argument: the only things not already in Fwd are
+ * acc, z2, av and zv, which the tiling keeps on the stack (40 KB at
+ * NN_BATCH_TILE = 32; the default pthread stack on macOS is 512 KB).
+ *
+ * EXACTNESS.  Without Accelerate every row goes through the same kernels
+ * nn_eval() uses, with the same lane-wise accumulation, so
+ *
+ *     nn_eval_batch(t, &h, 1, &fidx, &nf, &fw)   ==   nn_eval(t, h, fidx, nf, &fw)
+ *
+ * bit for bit, and so does every row of every larger batch: tests/test_net.c
+ * asserts exactly that over hundreds of positions at nine batch sizes.  WITH
+ * -DUSE_ACCELERATE the two trunk GEMMs go to cblas_sgemm, whose blocking and
+ * use of FMA regroup each sum, and the results are then equal only to about
+ * 1e-6 relative -- the test asserts that bound instead.  A caller that needs
+ * bit-reproducible search (the MCTS determinism tests) must either build
+ * without USE_ACCELERATE or keep the batch composition fixed, because sgemm's
+ * summation order is a function of the batch size.
+ */
+
+#define NN_BATCH_TILE 32
+
+static void nn_eval_tile(const Trunk *t, const Head *const *heads, int nb,
+                         const uint16_t *const *fidx, const int *nf, Fwd *out)
+{
+    float acc[NN_BATCH_TILE * NF_ACC];
+    float z2 [NN_BATCH_TILE * NF_HID];
+    float av [NN_BATCH_TILE * NF_VACC];
+    float zv [NN_BATCH_TILE * NF_VHID];
+
+    /* 1. the sparse gather and the first LayerNorm, per position (the gather is
+     *    per-position by nature and the norm's reduction is serial). */
+    for (int b = 0; b < nb; b++) {
+        nn_gather(t->W0, t->b0, heads[b]->z, fidx[b], nf[b], NF_ACC, acc + b * NF_ACC);
+        out[b].r1 = nn_norm_relu(acc + b * NF_ACC, t->g0, t->c0, NF_ACC,
+                                 out[b].x1, out[b].h1);
     }
 
-    {   /* h2 = relu(g1 * norm(z2) + c1) + h1   -- the residual block */
-        float mu;
-        const float r = norm_stats(z2, NF_HID, &mu);
-        fw->r2 = r;
-        float *restrict x2 = fw->x2;
-        const float *restrict g1 = t->g1;
-        const float *restrict c1 = t->c1;
-        for (int j = 0; j < NF_HID; j++) {
-            const float xh = (z2[j] - mu) * r;
-            x2[j] = xh;
-            const float a = g1[j] * xh + c1[j];
-            h2[j] = (a > 0.0f ? a : 0.0f) + h1[j];
+    /* 2. the residual block's matrix, shared by the whole batch: the one place
+     *    where this is a matrix-MATRIX product for every caller. */
+#if NN_ACCELERATE
+    for (int b = 0; b < nb; b++) memcpy(z2 + b * NF_HID, t->b1, sizeof t->b1);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nb, NF_HID, NF_ACC,
+                1.0f, out[0].h1, NN_FWD_STRIDE, t->W1, NF_ACC, 1.0f, z2, NF_HID);
+#else
+    nn_matvec_batch(t->W1, t->b1, out[0].h1, NN_FWD_STRIDE, nb,
+                    NF_HID, NF_ACC, z2, NF_HID);
+#endif
+
+    /* 3. LayerNorm 2 + the skip connection, per position. */
+    for (int b = 0; b < nb; b++)
+        out[b].r2 = nn_norm_relu_add(z2 + b * NF_HID, t->g1, t->c1, out[b].h1,
+                                     NF_HID, out[b].x2, out[b].h2);
+
+    /* 4. the policy projection -- per AGENT, so batched over runs of equal head. */
+    for (int b0 = 0; b0 < nb; ) {
+        int b1 = b0 + 1;
+        while (b1 < nb && heads[b1] == heads[b0]) b1++;
+        const int run = b1 - b0;
+        if (run > 1) {
+#if NN_ACCELERATE
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, run, NF_PDIM, NF_HID,
+                        1.0f, out[b0].h2, NN_FWD_STRIDE, heads[b0]->Wp, NF_HID,
+                        0.0f, out[b0].q, NN_FWD_STRIDE);
+#else
+            nn_matvec_batch(heads[b0]->Wp, NULL, out[b0].h2, NN_FWD_STRIDE, run,
+                            NF_PDIM, NF_HID, out[b0].q, NN_FWD_STRIDE);
+#endif
+        } else {
+            nn_matvec(heads[b0]->Wp, NULL, out[b0].h2, NF_PDIM, NF_HID, out[b0].q);
         }
+        b0 = b1;
     }
 
-    {   /* q = Wp.h2 */
-        const float *restrict Wp = h->Wp;
-        for (int k = 0; k < NF_PDIM; k++) {
-            const float *restrict w = Wp + (size_t)k * NF_HID;
-            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (int j = 0; j < NF_HID; j += 4) {
-                s0 += w[j + 0] * h2[j + 0];
-                s1 += w[j + 1] * h2[j + 1];
-                s2 += w[j + 2] * h2[j + 2];
-                s3 += w[j + 3] * h2[j + 3];
-            }
-            q[k] = (s0 + s1) + (s2 + s3);
-        }
+    /* 5. the value trunk: its own gather and norm, shared weights, per position. */
+    for (int b = 0; b < nb; b++) {
+        nn_gather(t->W0v, t->b0v, NULL, fidx[b], nf[b], NF_VACC, av + b * NF_VACC);
+        out[b].rv0 = nn_norm_relu(av + b * NF_VACC, t->g0v, t->c0v, NF_VACC,
+                                  out[b].xv0, out[b].hv0);
     }
 
-    {   /* THE VALUE TRUNK.  A second sparse gather over the same ~35 active
-         * features, into its own 64-wide accumulator.  Nothing on this path is
-         * shared with the policy, so nothing on it is shaped by the policy
-         * loss -- which is the entire point. */
-        float av[NF_VACC];
-        {
-            const float *restrict b0v = t->b0v;
-            for (int i = 0; i < NF_VACC; i++) av[i] = b0v[i];
-            const float *restrict W0v = t->W0v;
-            for (int f = 0; f < nf; f++) {
-                const float *restrict w = W0v + (size_t)fidx[f] * NF_VACC;
-                for (int i = 0; i < NF_VACC; i++) av[i] += w[i];
-            }
-        }
-        float mu0;
-        const float r0 = norm_stats(av, NF_VACC, &mu0);
-        fw->rv0 = r0;
-        float *restrict xv0 = fw->xv0;
-        float *restrict hv0 = fw->hv0;
-        {
-            const float *restrict g0v = t->g0v;
-            const float *restrict c0v = t->c0v;
-            for (int i = 0; i < NF_VACC; i++) {
-                const float xh = (av[i] - mu0) * r0;
-                xv0[i] = xh;
-                const float a = g0v[i] * xh + c0v[i];
-                hv0[i] = a > 0.0f ? a : 0.0f;
-            }
-        }
+    /* 6. the value head's hidden layer -- per agent again. */
+    for (int b0 = 0; b0 < nb; ) {
+        int b1 = b0 + 1;
+        while (b1 < nb && heads[b1] == heads[b0]) b1++;
+        const int run = b1 - b0;
+        if (run > 1)
+            nn_matvec_batch(heads[b0]->Wvh, heads[b0]->bvh, out[b0].hv0, NN_FWD_STRIDE,
+                            run, NF_VHID, NF_VACC, zv + b0 * NF_VHID, NF_VHID);
+        else
+            nn_matvec(heads[b0]->Wvh, heads[b0]->bvh, out[b0].hv0, NF_VHID, NF_VACC,
+                      zv + b0 * NF_VHID);
+        b0 = b1;
+    }
 
-        /* the value head's own hidden layer, then the scalar */
-        float zv[NF_VHID];
-        const float *restrict Wvh = h->Wvh;
-        const float *restrict bvh = h->bvh;
-        for (int k = 0; k < NF_VHID; k++) {
-            const float *restrict w = Wvh + (size_t)k * NF_VACC;
-            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (int i = 0; i < NF_VACC; i += 4) {
-                s0 += w[i + 0] * hv0[i + 0];
-                s1 += w[i + 1] * hv0[i + 1];
-                s2 += w[i + 2] * hv0[i + 2];
-                s3 += w[i + 3] * hv0[i + 3];
-            }
-            zv[k] = ((s0 + s1) + (s2 + s3)) + bvh[k];
-        }
-
-        float mu;
-        const float r = norm_stats(zv, NF_VHID, &mu);
-        fw->rv = r;
-        float *restrict xv = fw->xv;
-        float *restrict hv = fw->hv;
-        const float *restrict gv = h->gv;
-        const float *restrict cv = h->cv;
-        for (int k = 0; k < NF_VHID; k++) {
-            const float xh = (zv[k] - mu) * r;
-            xv[k] = xh;
-            const float a = gv[k] * xh + cv[k];
-            hv[k] = a > 0.0f ? a : 0.0f;
-        }
-
-        const float *restrict wv = h->Wv;
-        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-        for (int k = 0; k < NF_VHID; k += 4) {
-            s0 += wv[k + 0] * hv[k + 0];
-            s1 += wv[k + 1] * hv[k + 1];
-            s2 += wv[k + 2] * hv[k + 2];
-            s3 += wv[k + 3] * hv[k + 3];
-        }
-        fw->raw_v = ((s0 + s1) + (s2 + s3)) + h->bv[0];
-        fw->v = tanhf(fw->raw_v);
+    /* 7. the last norm and the scalar output.  32 wide and 32 MACs: per row. */
+    for (int b = 0; b < nb; b++) {
+        const Head *h = heads[b];
+        out[b].rv = nn_norm_relu(zv + b * NF_VHID, h->gv, h->cv, NF_VHID,
+                                 out[b].xv, out[b].hv);
+        nn_matvec(h->Wv, h->bv, out[b].hv, 1, NF_VHID, &out[b].raw_v);
+        out[b].v = tanhf(out[b].raw_v);
     }
 }
 
+void nn_eval_batch(const Trunk *t, const Head *const *heads, int nbatch,
+                   const uint16_t *const *fidx, const int *nf, Fwd *out)
+{
+    for (int base = 0; base < nbatch; base += NN_BATCH_TILE) {
+        int nb = nbatch - base;
+        if (nb > NN_BATCH_TILE) nb = NN_BATCH_TILE;
+        nn_eval_tile(t, heads + base, nb, fidx + base, nf + base, out + base);
+    }
+}
+
+/* The per-move logits.  NF_PDIM is 32, so each move is five 32-float embedding
+ * rows summed and dotted with q -- 192 flops against ~1.4 KB of scattered
+ * embedding rows, which makes this stage load-bound rather than FLOP-bound.
+ * Two lanes of 4 cover the 32 in eight loads per row; the accumulation is the
+ * same lane-wise chain the matvec uses, reduced by vaddvq_f32. */
 void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *logits)
 {
     if (n <= 0) return;
@@ -533,6 +857,17 @@ void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *
         const float *restrict er = h->Epromo + (size_t)k.promo * NF_PDIM;
         const float *restrict ex = h->Ecap   + (size_t)k.cap   * NF_PDIM;
 
+#if NN_NEON
+        float32x4_t a = vdupq_n_f32(0.0f);
+        for (int i = 0; i < NF_PDIM; i += 4) {
+            float32x4_t e = vaddq_f32(vld1q_f32(ef + i), vld1q_f32(et + i));
+            e = vaddq_f32(e, vld1q_f32(ec + i));
+            e = vaddq_f32(e, vld1q_f32(er + i));
+            e = vaddq_f32(e, vld1q_f32(ex + i));
+            a = vfmaq_f32(a, vld1q_f32(q + i), e);
+        }
+        logits[m] = vaddvq_f32(a) + Bft[(size_t)k.from * 64 + k.to];
+#else
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         for (int i = 0; i < NF_PDIM; i += 4) {
             s0 += q[i + 0] * (ef[i + 0] + et[i + 0] + ec[i + 0] + er[i + 0] + ex[i + 0]);
@@ -541,6 +876,7 @@ void nn_logits(const Head *h, const Fwd *fw, const MoveKey *keys, int n, float *
             s3 += q[i + 3] * (ef[i + 3] + et[i + 3] + ec[i + 3] + er[i + 3] + ex[i + 3]);
         }
         logits[m] = ((s0 + s1) + (s2 + s3)) + Bft[(size_t)k.from * 64 + k.to];
+#endif
     }
 }
 
