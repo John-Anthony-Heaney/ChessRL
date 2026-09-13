@@ -18,6 +18,9 @@
 
 enum { AZ_START_CLASSICAL = 0, AZ_START_960 = 1, AZ_START_MIXED = 2 };
 
+/* Whose positions enter the replay buffer in an asymmetric game. */
+enum { AZ_ASYM_REC_BOTH = 0, AZ_ASYM_REC_STRONG = 1 };
+
 typedef struct {
     /* population */
     int   n_agents;
@@ -100,6 +103,38 @@ typedef struct {
      * cap_frac >= 1 disables it (every move is a full search).              */
     float cap_frac;
     int   cap_sims;          /* 0 = derive as max(2, sims / 5)               */
+
+    /* ======================================================================
+     *                 ASYMMETRIC SEARCH BUDGETS IN SELF-PLAY
+     * ======================================================================
+     * docs/ASYMMETRY.md has the motivation and the measurements.  In short:
+     * when both sides of a self-play game are equally strong, material is
+     * handed straight back and never converts into a result, so the value
+     * head's own labels contain almost no relationship between material and
+     * the outcome (docs/TACTICS.md: two pawns down is worth -0.036).  In
+     * `asym_frac` of games one side searches the full `sims` budget and the
+     * other searches `sims / asym_ratio`.  The side with the full budget is
+     * chosen so that White and Black hold it exactly equally often.
+     *
+     * A SIMULATION BUDGET IS NOT CHESS KNOWLEDGE.  Nothing here looks at the
+     * position: the same code runs unchanged on any game the MCTS supports,
+     * and it expresses no opinion about which pieces or squares are worth
+     * anything.  docs/FROM_SCRATCH.md forbids evaluation, not compute, and
+     * the network, the reward and the targets are all untouched.
+     *
+     * Anchor games are never made asymmetric: their whole purpose is to
+     * measure the population against a player of fixed strength, and
+     * handicapping either side would move the ruler.
+     *
+     * Default 0 (off), so it can be measured rather than assumed.            */
+    float asym_frac;         /* fraction of self-play games run unequal      */
+    float asym_ratio;        /* the weak side searches sims / asym_ratio     */
+    /* WHOSE MOVES BECOME TRAINING DATA in an asymmetric game.  The weak
+     * side's policy target comes from a smaller search, so it is lower
+     * quality; but dropping it also drops every losing label, which risks
+     * teaching the value head that it is always winning.  Both are measured
+     * in docs/ASYMMETRY.md rather than assumed.                             */
+    int   asym_record;       /* AZ_ASYM_REC_*                                */
 
     /* population dynamics */
     float elite_frac;

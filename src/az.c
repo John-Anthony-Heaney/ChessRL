@@ -460,7 +460,12 @@ typedef struct {
 /* id >= 0: live agent index.
  * ANCHOR_ID_BASE < id < 0: hall-of-fame entry -(id + 1).
  * id <= ANCHOR_ID_BASE:    permanent anchor ANCHOR_ID_BASE - id. */
-typedef struct { int32_t white, black; } AZPair;
+/* A pairing.  `strong` is the ASYMMETRIC SEARCH BUDGET assignment for this
+ * game: -1 means both sides search the same budget (the historical
+ * behaviour and the default), WHITE or BLACK means that side gets the full
+ * `sims` and the other gets `sims / asym_ratio`.  See az.h and
+ * docs/ASYMMETRY.md. */
+typedef struct { int32_t white, black; int8_t strong; } AZPair;
 typedef struct { int16_t result, reason; } AZRes;
 
 #define IS_ANCHOR(id)  ((id) <= ANCHOR_ID_BASE)
@@ -777,6 +782,11 @@ typedef struct {
     int        side;
     int32_t    id;
     int        full;           /* this move gets the full budget + root noise */
+    /* ASYMMETRIC SEARCH BUDGETS.  `weak` is a property of the SIDE TO MOVE in
+     * the search just opened, so it is recomputed every move; pr.strong is
+     * the property of the game.  Both are -1/0 when asymmetry is off. */
+    int        weak;           /* the side to move is on the reduced budget  */
+    int        nsims;          /* the budget this move actually searched     */
     int        resign_on, check_game, resign_live;
     int        consec[2];
     int        would_resign, resigned;
@@ -816,6 +826,17 @@ typedef struct {
     uint64_t  resign_checked, resign_would, resign_wrong;
 
     uint64_t  full_moves, all_moves; /* playout-cap randomisation accounting  */
+
+    /* ASYMMETRIC SEARCH BUDGETS.  Everything needed to check that the knob
+     * did what it claims: how many games actually ran unequal, whether the
+     * full budget landed on White and Black equally often, how much the
+     * strong side actually scored (the whole point -- if it does not win,
+     * material still does not predict the result), and how the recorded
+     * positions split between the two sides. */
+    uint64_t  asym_games, asym_white_strong, asym_moves, asym_sims_sum;
+    double    asym_strong_pts;
+    uint64_t  rec_strong, rec_weak;
+    uint64_t  recorded;              /* positions actually committed to the buffer */
 
     /* ANCHOR SCORES.  The single most honest progress signal inside training:
      * the raw fraction of a point the LIVE population takes per game against a
@@ -1042,6 +1063,11 @@ static void az_slot_newgame(AZWorker *w, AZSlot *s)
      * not shift the random stream of any game that has no anchor in it. */
     s->anchor_game = IS_ANCHOR(s->pr.white) || IS_ANCHOR(s->pr.black);
     if (s->anchor_game) s->resign_on = s->check_game = s->resign_live = 0;
+    /* build_pairings() already refuses to hand an anchor game an unequal
+     * budget; this is the second lock on the same door, because an anchor
+     * whose strength moved would silently invalidate every rating. */
+    if (s->anchor_game) s->pr.strong = -1;
+    s->weak = 0;
     s->consec[0] = s->consec[1] = 0;
     s->would_resign = -1;
     s->resigned     = -1;
@@ -1142,7 +1168,18 @@ static void az_slot_begin_move(AZWorker *w, AZSlot *s)
      * Nothing here is chess-specific: it is a statement about where simulation
      * budget buys training signal, and it applies unchanged to any game. */
     s->full = !(c->cap_frac < 1.0f) || (az_u01(s->rng) < c->cap_frac);
-    const int nsims = s->full ? c->sims : sh->cap_sims;
+    int nsims = s->full ? c->sims : sh->cap_sims;
+
+    /* ASYMMETRIC SEARCH BUDGETS.  The weak side searches the same tree with
+     * the same network over a smaller budget.  Applied to the playout cap's
+     * budget as well as the full one, so the two knobs compose instead of
+     * one silently cancelling the other. */
+    s->weak = (s->pr.strong >= 0 && s->side != (int)s->pr.strong);
+    if (s->weak) {
+        nsims = (int)((float)nsims / c->asym_ratio + 0.5f);
+        if (nsims < 2) nsims = 2;
+    }
+    s->nsims = nsims;
 
     if (!mcts_begin(&s->m, sh->trunk, s->h, g, nsims, s->full, s->rng)) {
         s->state = SL_ENDGAME;                    /* the search saw game over */
@@ -1166,6 +1203,7 @@ static void az_slot_after_search(AZWorker *w, AZSlot *s)
     if (!s->anchor_game) {
         w->all_moves++;
         if (s->full) w->full_moves++;
+        if (s->pr.strong >= 0) { w->asym_moves++; w->asym_sims_sum += (uint64_t)s->nsims; }
     }
 
     const int nl = gen_legal(&g->pos, s->list);
@@ -1180,8 +1218,14 @@ static void az_slot_after_search(AZWorker *w, AZSlot *s)
         w->tgt_ent_n++;
     }
 
-    /* ---- record: features, the visit-count policy target, the mover ------ */
-    if (s->full && !IS_REF(s->id) && !s->anchor_game && r->n < r->npos_cap &&
+    /* ---- record: features, the visit-count policy target, the mover ------
+     * ASYMMETRIC SEARCH BUDGETS, --asym-record strong: the weak side's
+     * policy target came out of a smaller search, so it is a weaker label.
+     * Dropping it also drops every losing outcome label from these games,
+     * which is a value-head bias hazard, so which of the two is better is
+     * measured in docs/ASYMMETRY.md rather than argued about here.        */
+    const int skip_weak = (s->weak && sh->cfg->asym_record == AZ_ASYM_REC_STRONG);
+    if (s->full && !skip_weak && !IS_REF(s->id) && !s->anchor_game && r->n < r->npos_cap &&
         r->nk + (uint64_t)n <= r->nk_cap && n <= REC_MAX_MOVES) {
         AZPos *p = &r->pos[r->n];
         p->nf     = (uint8_t)nn_features(&g->pos, p->fidx);
@@ -1197,6 +1241,8 @@ static void az_slot_after_search(AZWorker *w, AZSlot *s)
         }
         r->nk += (uint64_t)n;
         r->n++;
+        w->recorded++;
+        if (s->pr.strong >= 0) { if (s->weak) w->rec_weak++; else w->rec_strong++; }
     }
 
     /* ---- resignation ---------------------------------------------------- */
@@ -1273,6 +1319,18 @@ static void az_slot_endgame(AZWorker *w, AZSlot *s)
         sh->results[s->idx].reason = (int16_t)reason;
         s->state = SL_NEWGAME;
         return;
+    }
+
+    /* ---- asymmetric-budget accounting ----------------------------------
+     * Scored from the STRONG side's view.  If this number is not well above
+     * 0.5 the intervention has not done its job, because material can only
+     * start predicting the result once the side that wins it keeps it.   */
+    if (s->pr.strong >= 0) {
+        const double sw = (result == GR_WHITE_WIN) ? 1.0
+                        : (result == GR_BLACK_WIN) ? 0.0 : 0.5;
+        w->asym_games++;
+        if ((int)s->pr.strong == WHITE) { w->asym_white_strong++; w->asym_strong_pts += sw; }
+        else                            { w->asym_strong_pts += 1.0 - sw; }
     }
 
     /* ---- label every recorded ply from THAT ply's mover's view ---------- */
@@ -1953,6 +2011,47 @@ static int build_pairings(AZShared *sh, EloRank *rank, int32_t *wslot,
             sh->anchor_games++;
         }
     }
+
+    /* ---- ASYMMETRIC SEARCH BUDGETS -------------------------------------
+     * Assigned here, once per generation, on the finished pairing list, for
+     * three reasons.  (1) Anchor pairings are already placed, so they can be
+     * excluded: an anchor is a ruler of fixed strength and handicapping
+     * either side of one would move the ruler.  (2) The count is exact --
+     * Bresenham over the eligible pairings gives round(frac * eligible)
+     * games, not a binomial draw around it.  (3) The colour alternates on
+     * the asymmetric ordinal, so White and Black hold the full budget
+     * EXACTLY equally often (to within one game), rather than on average.
+     *
+     * The rotation phase is drawn from the generation's master stream
+     * because the pairing list is built rank-ordered before the window
+     * shuffle, so a fixed stride would keep landing on the same part of the
+     * population.  Nothing here reads the board: it is a compute schedule.
+     */
+    for (int t = 0; t < np; t++) sh->pairs[t].strong = -1;
+    if (c->asym_frac > 0.0f) {
+        int elig = 0;
+        for (int t = 0; t < np; t++)
+            if (!IS_ANCHOR(sh->pairs[t].white) && !IS_ANCHOR(sh->pairs[t].black))
+                elig++;
+        if (elig > 0) {
+            int want = (int)((double)c->asym_frac * (double)elig + 0.5);
+            if (want > elig) want = elig;
+            if (want > 0) {
+                const int phase = (int)(az_next(rng) % (uint64_t)elig);
+                int j = 0;
+                for (int t = 0; t < np; t++) {
+                    if (IS_ANCHOR(sh->pairs[t].white) ||
+                        IS_ANCHOR(sh->pairs[t].black)) continue;
+                    const int k = (j + phase) % elig;
+                    j++;
+                    const long a0 = ((long)k       * (long)want) / (long)elig;
+                    const long a1 = ((long)(k + 1) * (long)want) / (long)elig;
+                    if (a0 == a1) continue;          /* a symmetric game */
+                    sh->pairs[t].strong = (int8_t)((a0 & 1L) ? BLACK : WHITE);
+                }
+            }
+        }
+    }
     return np;
 }
 
@@ -2149,6 +2248,11 @@ typedef struct {
 
     /* playout cap randomisation */
     double full_search_frac, recorded_per_game;
+
+    /* asymmetric search budgets */
+    uint64_t asym_games, asym_white_strong;
+    double   asym_game_frac, asym_strong_score, asym_white_share;
+    double   asym_mean_sims, asym_rec_strong_share;
 } AZGen;
 
 static void jnum(FILE *f, double x)
@@ -2389,6 +2493,26 @@ static void write_telemetry(FILE *f, const AZShared *sh, const AZStats *st,
     fprintf(f, ",\"full_search_frac\":");     jnum(f, gs->full_search_frac);
     fprintf(f, ",\"recorded_per_game\":");    jnum(f, gs->recorded_per_game);
 
+    /* ---- asymmetric search budgets -------------------------------------
+     * asym_strong_score is the headline: the fraction of a point the side
+     * that held the full budget actually took.  At 0.5 the handicap did
+     * nothing and the distribution trap is untouched.                     */
+    fprintf(f, ",\"asym_frac\":");             jnum(f, c->asym_frac);
+    fprintf(f, ",\"asym_ratio\":");            jnum(f, c->asym_ratio);
+    fprintf(f, ",\"asym_weak_sims\":%d",
+            c->asym_frac > 0.0f
+              ? ((int)((float)c->sims / c->asym_ratio + 0.5f) < 2
+                   ? 2 : (int)((float)c->sims / c->asym_ratio + 0.5f))
+              : c->sims);
+    fprintf(f, ",\"asym_record\":\"%s\"",
+            c->asym_record == AZ_ASYM_REC_STRONG ? "strong" : "both");
+    fprintf(f, ",\"asym_games\":%llu", (unsigned long long)gs->asym_games);
+    fprintf(f, ",\"asym_game_frac\":");        jnum(f, gs->asym_game_frac);
+    fprintf(f, ",\"asym_white_strong_share\":"); jnum(f, gs->asym_white_share);
+    fprintf(f, ",\"asym_strong_score\":");     jnum(f, gs->asym_strong_score);
+    fprintf(f, ",\"asym_mean_sims\":");        jnum(f, gs->asym_mean_sims);
+    fprintf(f, ",\"asym_recorded_strong_share\":"); jnum(f, gs->asym_rec_strong_share);
+
     fprintf(f, ",\"draw_penalty\":");         jnum(f, c->draw_penalty);
     fprintf(f, ",\"best_agent\":{\"i\":%d,\"elo\":", gs->best_i);
     jnum(f, gs->elo_best);
@@ -2470,6 +2594,13 @@ void az_default_cfg(AZCfg *c)
     c->warmup_gens      = 0;
     c->cap_frac         = 1.0f;
     c->cap_sims         = 0;      /* 0 = derive as max(2, sims / 5) */
+
+    /* ASYMMETRIC SEARCH BUDGETS.  Off, and measured before it is defaulted
+     * on -- see docs/ASYMMETRY.md.  asym_ratio is only consulted when
+     * asym_frac > 0, so 4 here is a parameter default, not a behaviour. */
+    c->asym_frac        = 0.0f;
+    c->asym_ratio       = 4.0f;
+    c->asym_record      = AZ_ASYM_REC_BOTH;
 
     /* The EMA is different: it costs one extra copy of the weights and cannot
      * make the live network worse, because it is never trained from.  It is on
@@ -2554,6 +2685,13 @@ static void az_sanitise(AZCfg *c)
     if (c->cap_frac > 1.0f)       c->cap_frac = 1.0f;
     if (c->cap_sims < 0)          c->cap_sims = 0;
     if (c->cap_sims > c->sims)    c->cap_sims = c->sims;
+    if (!(c->asym_frac >= 0.0f))  c->asym_frac = 0.0f;
+    if (c->asym_frac > 1.0f)      c->asym_frac = 1.0f;
+    /* A ratio at or below 1 is not an asymmetry; it would hand the "weak"
+     * side the same budget or more and quietly measure nothing. */
+    if (!(c->asym_ratio >= 1.0f)) c->asym_ratio = 1.0f;
+    if (c->asym_ratio <= 1.0f)    c->asym_frac  = 0.0f;
+    if (c->asym_record != AZ_ASYM_REC_STRONG) c->asym_record = AZ_ASYM_REC_BOTH;
     if (!(c->elite_frac > 0.0f) || c->elite_frac > 1.0f) c->elite_frac = 0.25f;
     if (!(c->cull_frac >= 0.0f) || c->cull_frac > 0.9f)  c->cull_frac = 0.20f;
     if (c->hof_every < 1)         c->hof_every = 10;
@@ -2828,6 +2966,15 @@ int az_run(AZCfg *c)
                (double)c->value_mix, c->warmup_gens, (double)c->ema_decay,
                c->ema_h2h_games, (double)c->cap_frac, sh.cap_sims,
                (double)sh.head_clip);
+        if (c->asym_frac > 0.0f) {
+            int ws = (int)((float)c->sims / c->asym_ratio + 0.5f);
+            if (ws < 2) ws = 2;
+            printf("            ASYMMETRIC BUDGETS: %.0f%% of games at %d vs %d sims "
+                   "(ratio %.2f), recording %s side\n",
+                   (double)c->asym_frac * 100.0, c->sims, ws,
+                   (double)c->asym_ratio,
+                   c->asym_record == AZ_ASYM_REC_STRONG ? "the STRONG" : "EACH");
+        }
         printf("            resign %.2f (%.0f%% checked), elite %.0f%%, cull %.0f%%, "
                "hof every %d (%d%% of games), seed %llu\n",
                (double)c->resign_threshold, (double)c->resign_check_frac * 100.0,
@@ -2926,6 +3073,11 @@ int az_run(AZCfg *c)
             w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
             w->resign_checked = w->resign_would = w->resign_wrong = 0;
             w->full_moves = w->all_moves = 0;
+            w->asym_games = w->asym_white_strong = 0;
+            w->asym_moves = w->asym_sims_sum = 0;
+            w->asym_strong_pts = 0.0;
+            w->rec_strong = w->rec_weak = 0;
+            w->recorded = 0;
             memset(w->anch_score, 0, sizeof w->anch_score);
             memset(w->anch_n, 0, sizeof w->anch_n);
             w->anch_cal_score = 0.0;
@@ -2938,6 +3090,8 @@ int az_run(AZCfg *c)
             double rv = 0.0, te = 0.0;
             uint64_t rvn = 0, ten = 0, rchk = 0, rwld = 0, rwrong = 0;
             uint64_t fm = 0, am = 0, brows = 0, chit = 0, cmiss = 0;
+            uint64_t ag = 0, aws = 0, amv = 0, asum = 0, rs = 0, rw = 0, nrec = 0;
+            double   apts = 0.0;
             gs.batch_rounds = 0;
             memset(gs.batch_hist, 0, sizeof gs.batch_hist);
             for (int t = 0; t < nthreads; t++) {
@@ -2950,6 +3104,14 @@ int az_run(AZCfg *c)
                 rwrong += workers[t].resign_wrong;
                 fm += workers[t].full_moves;
                 am += workers[t].all_moves;
+                ag   += workers[t].asym_games;
+                aws  += workers[t].asym_white_strong;
+                amv  += workers[t].asym_moves;
+                asum += workers[t].asym_sims_sum;
+                rs   += workers[t].rec_strong;
+                rw   += workers[t].rec_weak;
+                nrec += workers[t].recorded;
+                apts += workers[t].asym_strong_pts;
                 gs.batch_rounds += workers[t].batch_rounds;
                 brows           += workers[t].batch_rows;
                 chit            += workers[t].cache_hits;
@@ -2971,7 +3133,16 @@ int az_run(AZCfg *c)
             gs.cache_hit_rate = (chit + cmiss)
                           ? (double)chit / (double)(chit + cmiss) : 0.0;
             gs.full_search_frac  = am ? (double)fm / (double)am : 0.0;
-            gs.recorded_per_game = st.games ? (double)fm / (double)st.games : 0.0;
+            /* Positions actually committed, not full-budget moves: with
+             * --asym-record strong the two differ. */
+            gs.recorded_per_game = st.games ? (double)nrec / (double)st.games : 0.0;
+            gs.asym_games        = ag;
+            gs.asym_white_strong = aws;
+            gs.asym_game_frac    = st.games ? (double)ag / (double)st.games : 0.0;
+            gs.asym_strong_score = ag ? apts / (double)ag : 0.0;
+            gs.asym_white_share  = ag ? (double)aws / (double)ag : 0.0;
+            gs.asym_mean_sims    = amv ? (double)asum / (double)amv : 0.0;
+            gs.asym_rec_strong_share = (rs + rw) ? (double)rs / (double)(rs + rw) : 0.0;
             gs.rootv_mean     = rvn ? rv / (double)rvn : 0.0;
             gs.target_entropy = ten ? te / (double)ten : 0.0;
             gs.evals_per_move = rvn ? (double)gs.evals / (double)rvn : 0.0;
@@ -3980,6 +4151,11 @@ int az_lrfind(AZLrFindCfg *lc)
                 w->tgt_ent_sum = 0.0; w->tgt_ent_n = 0;
                 w->resign_checked = w->resign_would = w->resign_wrong = 0;
                 w->full_moves = w->all_moves = 0;
+            w->asym_games = w->asym_white_strong = 0;
+            w->asym_moves = w->asym_sims_sum = 0;
+            w->asym_strong_pts = 0.0;
+            w->rec_strong = w->rec_weak = 0;
+            w->recorded = 0;
             }
             az_dispatch(&sh, JOB_SELFPLAY);
             apply_elo(&sh);

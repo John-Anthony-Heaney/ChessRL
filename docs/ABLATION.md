@@ -349,3 +349,34 @@ silently classical-only. This file does not fix it — `src/` is owned elsewhere
 # Results
 
 <!-- ablate.py appends results below this line -->
+
+### `asym-frac` -- 2026-09-13 02:23:16Z
+
+fraction of self-play games played with unequal simulation budgets.  3 levels x 5 seeds = 15 runs, compute-matched at 238,110,720 network evaluations per run.
+Evaluation: 800 games against `random`, raw policy head, argmax, colour-reversed pairs, evaluation seed 20260911 common to every model.
+Outcome variable: external score vs the reference opponent (`--metric score`).
+Command: `python3 py/ablate.py --factor asym-frac --levels 0,0.25,0.5 --seeds 5 --out runs/ablation_asym_frac.json`
+
+| level | generations | games/run | n seeds | mean | seed SD | 95% CI | min | max |
+| --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: |
+| 0.0 | 128 | 12,288 | 5 | 0.6238 | 0.0263 | 0.5911 - 0.6564 | 0.5869 | 0.6569 |
+| 0.25 | 141 | 13,536 | 5 | 0.6181 | 0.0218 | 0.5911 - 0.6451 | 0.5938 | 0.6438 |
+| 0.5 | 158 | 15,168 | 5 | 0.6040 | 0.0253 | 0.5726 - 0.6354 | 0.5769 | 0.6400 |
+
+| comparison | difference | in Elo | Cohen's d | Welch p | permutation p | Holm p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.0 vs 0.25 | +0.0056 | +4 | +0.23 | 0.7226 | 0.7222 | 0.8333 |
+| 0.0 vs 0.5 | +0.0198 | +14 | +0.80 | 0.2611 | 0.2778 | 0.8333 |
+| 0.25 vs 0.5 | +0.0141 | +10 | +0.58 | 0.3721 | 0.3413 | 0.8333 |
+
+* **Pooled within-level (seed) SD: 0.0245 score points = 18.0 Elo.**
+* Between-level spread: 0.0198 = 14.5 Elo -- 0.80x the seed SD.
+* Omnibus permutation test across all levels: p = 0.4433.
+* Minimum detectable effect at n=5, alpha=0.05, power=0.80: **0.0496 score points = 36 Elo**.
+* Evaluation SE per match: 0.0075, i.e. 31% of the seed SD.
+* Not matched: total self-play games varies 1.2x across levels -- levels see different amounts of EXPERIENCE (the price of matching on evaluations).
+* Not matched: total optimiser steps varies 1.2x across levels -- levels take different numbers of gradient steps on the same data.
+* Not matched: hall-of-fame snapshots varies 1.2x across levels -- the frozen-opponent pool differs in size.
+* Not matched: generations varies 1.2x across levels -- the cosine LR schedule is stretched over a different number of generations (its SHAPE in fraction-of-training is identical).
+
+**Verdict: `asym-frac` indistinguishable from seed noise at this sample size.**  omnibus permutation p = 0.4433, no pairwise comparison survives Holm correction.  The largest between-level difference is 0.0198, which is 0.80x the pooled seed SD (0.0245) and 0.40x the minimum detectable effect (0.0496).  An effect smaller than the MDE would have been missed more often than not.

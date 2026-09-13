@@ -112,6 +112,8 @@ BASE_CONFIG = {
     "sims": 160,
     "cap-frac": 1.0,
     "cap-sims": 0,            # 0 => max(2, sims/5)
+    "asym-frac": 0.0,         # asymmetric search budgets, off
+    "asym-ratio": 4.0,
     "draw-penalty": -0.1,
     "cpuct": 1.4,
     "lr": 2e-3,
@@ -196,6 +198,17 @@ FACTORS = {
         "cap-frac", "cap-frac", float,
         "fraction of moves given the full sim budget (playout cap randomisation)",
         [0.25, 0.5, 1.0], changes_cost_per_game=True),
+    # ASYMMETRIC SEARCH BUDGETS -- docs/ASYMMETRY.md.  An asymmetric game is
+    # cheaper than a symmetric one (one side searches sims/ratio), so this
+    # must match on evaluations, not on games.
+    "asym-frac": Factor(
+        "asym-frac", "asym-frac", float,
+        "fraction of self-play games played with unequal simulation budgets",
+        [0.0, 0.25, 0.5], changes_cost_per_game=True),
+    "asym-ratio": Factor(
+        "asym-ratio", "asym-ratio", float,
+        "how much less the handicapped side searches (only with asym-frac > 0)",
+        [2.0, 4.0, 8.0], changes_cost_per_game=True),
 }
 
 
@@ -585,12 +598,30 @@ def calibrate(runs_dir=None, overrides=None):
 # ==========================================================================
 
 def effective_sims(cfg):
-    """Average simulations per move once playout-cap randomisation is applied."""
+    """Average simulations per move once playout-cap randomisation AND
+    asymmetric search budgets are applied.
+
+    ASYMMETRY CHANGES THE COST OF A GAME, so it has to appear here or the
+    comparison is not compute-matched.  In an asymmetric game one side
+    searches the whole budget and the other searches budget/ratio, and each
+    plays half the moves, so the game costs (1 + 1/ratio)/2 of a symmetric
+    one.  `asym_frac` of games are asymmetric, hence the mixture below.
+    src/az.c rounds the weak budget and floors it at 2; that is reproduced so
+    the plan's evaluation count matches what the trainer will actually do."""
     sims = float(cfg["sims"])
     cap_frac = float(cfg["cap-frac"])
     cap_sims = float(cfg["cap-sims"]) or max(2.0, sims / 5.0)
     cap_sims = min(cap_sims, sims)
-    return cap_frac * sims + (1.0 - cap_frac) * cap_sims
+    eff = cap_frac * sims + (1.0 - cap_frac) * cap_sims
+
+    af = float(cfg.get("asym-frac", 0.0) or 0.0)
+    ar = float(cfg.get("asym-ratio", 4.0) or 4.0)
+    if af <= 0.0 or ar <= 1.0:
+        return eff
+    weak_full = max(2.0, float(int(sims / ar + 0.5)))
+    weak_cap = max(2.0, float(int(cap_sims / ar + 0.5)))
+    weak_eff = cap_frac * weak_full + (1.0 - cap_frac) * weak_cap
+    return (1.0 - af) * eff + af * 0.5 * (eff + weak_eff)
 
 
 def games_per_gen(cfg):

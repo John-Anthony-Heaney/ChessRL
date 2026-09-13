@@ -186,6 +186,10 @@ static int cmd_az(int argc, char **argv)
     c.value_mix        = (float)opt_num(argc, argv, "--value-mix",    c.value_mix);
     c.ema_decay        = (float)opt_num(argc, argv, "--ema-decay",    c.ema_decay);
     c.cap_frac         = (float)opt_num(argc, argv, "--cap-frac",     c.cap_frac);
+    /* ASYMMETRIC SEARCH BUDGETS -- docs/ASYMMETRY.md.  A simulation budget is
+     * not chess knowledge, so this stays inside docs/FROM_SCRATCH.md. */
+    c.asym_frac        = (float)opt_num(argc, argv, "--asym-frac",    c.asym_frac);
+    c.asym_ratio       = (float)opt_num(argc, argv, "--asym-ratio",   c.asym_ratio);
     c.draw_penalty     = (float)opt_num(argc, argv, "--draw-penalty", c.draw_penalty);
     c.c_puct           = (float)opt_num(argc, argv, "--cpuct",        c.c_puct);
     c.dirichlet_alpha  = (float)opt_num(argc, argv, "--dir-alpha",    c.dirichlet_alpha);
@@ -221,6 +225,18 @@ static int cmd_az(int argc, char **argv)
         fprintf(stderr, "error: --agents >= 2, --gens >= 1, --games-per-agent >= 1, "
                         "--threads >= 1, --sims >= 2, --batch >= 1\n");
         return 2;
+    }
+    {   /* --asym-record both|strong: whose moves enter the replay buffer in
+         * an asymmetric game. */
+        const char *ar = opt_str(argc, argv, "--asym-record", NULL);
+        if (ar) {
+            if      (!strcmp(ar, "both"))   c.asym_record = AZ_ASYM_REC_BOTH;
+            else if (!strcmp(ar, "strong")) c.asym_record = AZ_ASYM_REC_STRONG;
+            else {
+                fprintf(stderr, "error: --asym-record must be both|strong\n");
+                return 2;
+            }
+        }
     }
     {   /* --start classical|960|mixed */
         const char *sm = opt_str(argc, argv, "--start", NULL);
@@ -814,6 +830,15 @@ static int usage(void)
 "    --cap-frac X          fraction of moves given the full sim budget AND\n"
 "                          recorded for training         (default 1.0 = every)\n"
 "    --cap-sims N          budget for the other moves    (default sims/5)\n"
+"    --asym-frac F         fraction of self-play games played with UNEQUAL\n"
+"                          simulation budgets.  One side (White and Black\n"
+"                          equally often) searches --sims, the other\n"
+"                          --sims / --asym-ratio.  Same network, same\n"
+"                          reward, same targets: a budget is not chess\n"
+"                          knowledge.  See docs/ASYMMETRY.md (default 0)\n"
+"    --asym-ratio R        how much less the weak side searches (default 4)\n"
+"    --asym-record S       both|strong -- whose moves become training data\n"
+"                          in those games                     (default both)\n"
 "    --draw-penalty X --buffer N --max-plies N --opening-plies N\n"
 "    --temp-start X --temp-end X --cpuct X --dir-alpha X --dir-eps X\n"
 "    --resign X --resign-check X --elite F --cull F --mutate-sigma X\n"
@@ -841,6 +866,7 @@ static int usage(void)
 "    --plot-rows N --plot-cols N\n"
 "    --current-lr X --current-lr-final X   the schedule to compare against\n"
 "    plus the az self-play knobs: --agents --sims --cap-frac --cap-sims\n"
+"                                 --asym-frac --asym-ratio --asym-record\n"
 "    --start --draw-penalty --value-coef --value-mix --wd --clip --clip-head\n"
 "    --buffer --max-plies --cpuct --dir-alpha --dir-eps --temp-start --temp-end\n"
 "    --resign --resign-check --games-per-agent --threads --seed\n"
