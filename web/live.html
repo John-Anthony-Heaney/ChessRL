@@ -726,9 +726,16 @@ const SPEC = {
 
 /* Keys folded into a composite chart and therefore not charted on their own. */
 const COMPOSITES = [
-  { id: "elo", keys: ["elo_best", "elo_mean", "elo_p10"],
+  /* The ANCHORED rating leads: it is pinned to fixed opponents that cannot drift,
+     so it stops rising when the agent stops improving.  See docs/RATING.md. */
+  { id: "elo_anchored", keys: ["elo_anchored_best", "elo_anchored_mean", "elo_anchored_p10"],
     names: ["best", "mean", "p10"], vars: ["--s1", "--s2", "--s7"],
     dashes: [null, null, [2, 2]] },
+  /* The legacy self-referential rating, kept only so older runs stay comparable.
+     It inflates: measured at +0.176/generation with the weights frozen. */
+  { id: "elo", keys: ["elo_best", "elo_mean", "elo_p10"],
+    names: ["best (inflated)", "mean", "p10"], vars: ["--s4", "--s5", "--s7"],
+    dashes: [[4, 3], [4, 3], [2, 2]] },
 ];
 const FOLDED = new Set();
 COMPOSITES.forEach((c) => c.keys.forEach((k) => FOLDED.add(k)));
@@ -1126,9 +1133,17 @@ function renderHeader() {
   const gps = num(f["gps"]);
   tileEls.gps.textContent = gps == null ? "—" : gps.toFixed(1);
   tileEls.games.textContent = FMT.int(state.sumGames);
-  const elo = num(f["elo_best"]);
-  tileEls.elo.innerHTML = elo == null ? "—" : FMT.elo(elo) +
-    (num(f["elo_mean"]) != null ? ' <small>/ ' + FMT.elo(f["elo_mean"]) + "</small>" : "");
+  /* Headline the anchored rating; fall back to the legacy one only for older runs
+     that predate it, and label it when we do. */
+  const anc = num(f["elo_anchored_best"]);
+  if (anc != null) {
+    tileEls.elo.innerHTML = FMT.elo(anc) +
+      (num(f["elo_anchored_mean"]) != null
+        ? ' <small>/ ' + FMT.elo(f["elo_anchored_mean"]) + "</small>" : "");
+  } else {
+    const elo = num(f["elo_best"]);
+    tileEls.elo.innerHTML = elo == null ? "—" : FMT.elo(elo) + ' <small>(legacy)</small>';
+  }
 }
 
 const statusEl = $("status"), statusText = $("statustext");
